@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from array import array
 
 from sglang.srt.environ import envs
@@ -227,6 +228,38 @@ def match_prefix_for_req(
     return match_result
 
 
+def gamma_boost(work: float, gamma: float) -> float:
+    """Gamma-boost priority boost (UniBoost, Li et al., ICML 2026, Eq. 2).
+
+    b(w) = -ln(1 - exp(-gamma * w)) / gamma, strictly decreasing in w: small
+    remaining work gets a large boost, large work gets none. Combined with
+    geometric_bin, b(bin_size) is the maximum boost any request can receive,
+    which bounds how far a newcomer may jump ahead of an already-waiting
+    request (the anti-starvation property).
+    """
+    x = gamma * work
+    if x <= 0:
+        # Unreachable from _sort_by_boost (work >= 1 is binned to >= bin_size
+        # and gamma is validated > 0); kept for direct callers.
+        return float("inf")
+    v = -math.expm1(-x)  # 1 - exp(-x), in (0, 1]
+    if v >= 1.0:
+        # x large: 1 - exp(-x) rounds to 1.0 and the boost underflows to 0.
+        return 0.0
+    return -math.log(v) / gamma
+
+
+def geometric_bin(work: int, bin_size: int) -> int:
+    """Quantize work to the geometric ladder {k, 2k, 4k, ...} (Eq. 8).
+
+    q(u) = k * 2^floor(log2(max(u, k) / k)); u <= k floors to k. This caps the
+    boost at b(k), makes priority change only at bin boundaries, and leaves
+    all requests with u <= k tied at the max boost (FCFS among them via the
+    arrival stamp).
+    """
+    return bin_size * 2 ** math.floor(math.log2(max(work, bin_size) / bin_size))
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -234,6 +267,7 @@ class CacheAwarePolicy(Enum):
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
     HRRN = "hrrn"  # highest response ratio next, token-based aging
     SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
+    BOOST = "boost"  # gamma-boosted arrival time (anti-starvation)
 
 
 class CacheAgnosticPolicy(Enum):
@@ -255,6 +289,8 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        boost_gamma: float = 1e-4,
+        boost_bin_size: int = 256,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -262,6 +298,8 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.boost_gamma = boost_gamma
+        self.boost_bin_size = boost_bin_size
         self._shortest_prefill_calls = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
@@ -308,6 +346,15 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_hrrn(
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
+            elif policy == CacheAwarePolicy.BOOST:
+                SchedulePolicy._sort_by_boost(
+                    waiting_queue,
+                    temporary_deprioritized,
+                    self.boost_gamma,
+                    self.boost_bin_size,
+                    self.enable_priority_scheduling,
+                    self.priority_sign,
+                )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                 SchedulePolicy._sort_by_shortest_prefill(
                     waiting_queue, temporary_deprioritized
@@ -344,6 +391,7 @@ class SchedulePolicy:
             in (
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
+                CacheAwarePolicy.BOOST,
             )
             and len(waiting_queue) > 128
         ):
@@ -370,6 +418,11 @@ class SchedulePolicy:
                 if policy_enum == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                     raise ValueError(
                         "Experimental shortest-prefill-first requires prefix caching"
+                    )
+                if policy_enum == CacheAwarePolicy.BOOST:
+                    logger.warning(
+                        "schedule_policy=boost requires prefix caching; "
+                        "falling back to fcfs"
                     )
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
@@ -537,6 +590,47 @@ class SchedulePolicy:
             return (-ratio_delta, rid)
 
         waiting_queue.sort(key=_key)
+
+    @staticmethod
+    def _sort_by_boost(
+        waiting_queue: List[Req],
+        temporary_deprioritized: Set[int],
+        gamma: float,
+        bin_size: int,
+        enable_priority_scheduling: bool = False,
+        priority_sign: int = -1,
+    ) -> None:
+        """Gamma-boosted arrival ordering (UniBoost, Li et al., ICML 2026, Sec. 2).
+
+        phi(r) = A(r) - b_gamma(q(u(r))), served in ascending phi.
+        A(r): token-clock stamp at first queue entry (survives retraction).
+        u(r): uncached work = input + generated - matched prefix tokens
+              (device + host hits; retracted requests charged for re-prefill).
+        q():  geometric binning at bin_size; caps max boost at b_gamma(bin_size).
+
+        Anti-starvation: a newcomer can only jump ahead by its boost, which is
+        bounded by b_gamma(bin_size) clock-tokens; requests older than that are
+        unreachable — bounded displacement, converging to FCFS.
+        """
+
+        def key(r: Req):
+            u = SchedulePolicy._shortest_prefill_work(r)
+            w = geometric_bin(u, bin_size)
+            # None = never stamped (synthetic reqs); treat as oldest.
+            arrival = (
+                r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
+            )
+            phi = arrival - gamma_boost(w, gamma)
+            if r.rid in temporary_deprioritized:
+                # In-batch dedup followers still go last, same as lpm.
+                group, rank = 1, 0.0
+            else:
+                group, rank = 0, phi
+            if enable_priority_scheduling:
+                return (r.priority * priority_sign, group, rank, r.rid)
+            return (group, rank, r.rid)
+
+        waiting_queue.sort(key=key)
 
     @staticmethod
     def _sort_by_dfs_weight(
@@ -855,7 +949,7 @@ class PrefillAdder:
         radix COW headroom or locked-but-evictable bytes — that residual is
         backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
         over-admission crashes under pressure, make this more conservative (e.g.
-        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
+        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`). """
         if self._mamba_slot_cost and not req.kv.holds_mamba:
             return self._mamba_slot_cost
         return 0

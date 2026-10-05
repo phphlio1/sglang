@@ -93,9 +93,22 @@ class Schedule(msgspec.Struct):
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "boost",
             ],
         ),
     ] = "fcfs"
+    boost_gamma: A[
+        float,
+        Arg(
+            help="Gamma for the boost schedule policy. Larger gamma gives stronger anti-starvation (more FCFS-like); smaller gamma favors short uncached work (more locality-driven).",
+        ),
+    ] = 1e-4
+    boost_bin_size: A[
+        int,
+        Arg(
+            help="Geometric bin size k for the boost schedule policy's work quantization; the max boost is b_gamma(k), so this bounds how far a newcomer may jump ahead. Power of two recommended.",
+        ),
+    ] = 256
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

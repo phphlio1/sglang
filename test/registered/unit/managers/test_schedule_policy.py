@@ -1,9 +1,16 @@
+import math
 import unittest
 from array import array
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
+from sglang.srt.managers.schedule_policy import (
+    CacheAgnosticPolicy,
+    CacheAwarePolicy,
+    SchedulePolicy,
+    gamma_boost,
+    geometric_bin,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -22,6 +29,16 @@ def _make_req(rid, origin_input_text, origin_input_ids, sampling_params=None, **
         sampling_params,
         **kwargs,
     )
+
+
+def _make_boost_req(rid, uncached, *, arrival, cached=0, output=0):
+    """Req with u(r) = uncached (cached prefix + generated tokens charged in)."""
+    req = _make_req(rid, "", list(range(uncached + cached)))
+    req.num_matched_prefix_tokens = cached
+    if output:
+        req.output_ids.extend([0] * output)
+    req.boost_arrival_tokens = arrival
+    return req
 
 
 class TestSchedulePolicyHRRN(CustomTestCase):
@@ -225,6 +242,260 @@ class TestShortestPrefillFirst(CustomTestCase):
                 256,
             )
         )
+
+
+class TestGammaBoostMath(CustomTestCase):
+    """gamma_boost numerics (UniBoost Eq. 2): the expm1-stable form must stay
+    finite and monotone across the whole gamma*work domain the scheduler can
+    reach, including the underflow end where the boost is exactly 0."""
+
+    def test_strictly_decreasing_in_work(self):
+        # Monotone non-increasing across the whole ladder (the tail underflows
+        # to exactly 0.0); strictly decreasing wherever the boost is nonzero.
+        for gamma in (1e-5, 1e-4, 1e-3, 1.0):
+            works = [2.0**i for i in range(0, 30)]
+            boosts = [gamma_boost(w, gamma) for w in works]
+            for larger, smaller in zip(boosts, boosts[1:]):
+                self.assertGreaterEqual(larger, smaller)
+                if larger > 0.0:
+                    self.assertGreater(larger, smaller)
+
+    def test_finite_and_nonnegative_across_gamma_work_domain(self):
+        # gamma*work spans 1e-8 .. 800+ (float64: 1 - exp(-40) already rounds
+        # to 1.0, so anything past x=40 exercises the underflow guard).
+        for gamma in (1e-8, 1e-5, 1e-4, 1e-2, 1.0):
+            for work in (1e-4, 1e-1, 1.0, 10.0, 1e3, 1e6, 8e6, 1e9):
+                value = gamma_boost(work, gamma)
+                self.assertTrue(math.isfinite(value), (gamma, work, value))
+                self.assertGreaterEqual(value, 0.0)
+
+    def test_large_gamma_work_underflows_to_exact_zero(self):
+        self.assertEqual(gamma_boost(8_000_000.0, 1e-4), 0.0)
+        self.assertEqual(gamma_boost(100.0, 1.0), 0.0)
+
+    def test_smaller_gamma_gives_larger_boost(self):
+        # gamma -> 0+ diverges: -ln(1 - exp(-gamma*w))/gamma ~ -ln(gamma*w)/gamma.
+        self.assertGreater(gamma_boost(256.0, 1e-8), gamma_boost(256.0, 1e-4))
+        self.assertGreater(gamma_boost(256.0, 1e-4), gamma_boost(256.0, 1e-2))
+
+    def test_nonpositive_gamma_work_is_infinite(self):
+        # Unreachable from the sort (u >= 1, gamma validated > 0) but pinned
+        # so direct callers cannot silently get a finite boost for free work.
+        self.assertEqual(gamma_boost(0.0, 1e-4), float("inf"))
+        self.assertEqual(gamma_boost(5.0, -1.0), float("inf"))
+
+    def test_max_boost_under_quantization_is_b_of_bin_size(self):
+        # q(u) >= k always, and b is decreasing, so b(q(u)) <= b(k): the bin
+        # size caps the boost. Equality exactly on the u <= k floor.
+        k, gamma = 256, 1e-4
+        ceiling = gamma_boost(k, gamma)
+        for u in (1, k, k + 1, 2 * k, 3 * k, 100_000, 250_000, 262_144):
+            self.assertLessEqual(gamma_boost(geometric_bin(u, k), gamma), ceiling)
+        self.assertEqual(gamma_boost(geometric_bin(k, k), gamma), ceiling)
+        self.assertEqual(gamma_boost(geometric_bin(1, k), gamma), ceiling)
+
+
+class TestGeometricBin(CustomTestCase):
+    """geometric_bin (UniBoost Eq. 8): exact {k, 2k, 4k, ...} ladder with the
+    u <= k floor, for power-of-two and arbitrary bin sizes."""
+
+    def test_exact_ladder_power_of_two_k(self):
+        k = 256
+        cases = {
+            0: 256,
+            1: 256,
+            255: 256,
+            256: 256,
+            257: 256,
+            511: 256,
+            512: 512,
+            513: 512,
+            1023: 512,
+            1024: 1024,
+            1025: 1024,
+            100_000: 65_536,
+            250_000: 131_072,
+        }
+        for u, expected in cases.items():
+            self.assertEqual(geometric_bin(u, k), expected, (k, u))
+
+    def test_exact_ladder_arbitrary_k(self):
+        k = 100
+        cases = {1: 100, 100: 100, 101: 100, 199: 100, 200: 200, 399: 200, 400: 400}
+        for u, expected in cases.items():
+            self.assertEqual(geometric_bin(u, k), expected, (k, u))
+
+    def test_every_output_is_on_the_ladder(self):
+        for k in (1, 3, 256, 1000):
+            ladder = {k * 2**j for j in range(0, 20)}
+            for u in list(range(0, 4 * k + 3)) + [100_000, 262_144]:
+                self.assertIn(geometric_bin(u, k), ladder, (k, u))
+
+
+class TestBoostSort(CustomTestCase):
+    """_sort_by_boost: phi(r) = A(r) - b_gamma(q(u(r))), ascending.
+
+    The two headline properties, both derived from the formula rather than
+    mirrored from the implementation:
+      - locality: a small-work newcomer still jumps ahead of a large-work
+        older request (the point of the boost);
+      - starvation bound: it can only do so while its arrival stamp is below
+        b_gamma(k) - b_gamma(q(u_cold)) -- after that the old request is
+        unreachable, so wait is bounded by b_gamma(k) clock-tokens.
+    """
+
+    GAMMA_K = (1e-4, 256)
+
+    def sort_rids(self, reqs, deprioritized=frozenset(), gamma=1e-4, bin_size=256):
+        queue = list(reqs)
+        SchedulePolicy._sort_by_boost(queue, set(deprioritized), gamma, bin_size)
+        return [r.rid for r in queue]
+
+    def test_locality_hot_jumps_ahead_of_older_cold(self):
+        # Hand-checked anchors, gamma=1e-4 k=256: b(256) = 36779,
+        # b(q(100_000)) = b(65536) ~= 14.3. phi_hot = 500 - 36779 = -36279
+        # < phi_cold = -14.3 despite arriving 500 clock-tokens later.
+        cold = _make_boost_req("cold", 100_000, arrival=0)
+        hot = _make_boost_req("hot", 256, arrival=500)
+        self.assertEqual(
+            self.sort_rids([cold, hot], gamma=1e-4, bin_size=256), ["hot", "cold"]
+        )
+
+    def test_starvation_bound_cold_becomes_unreachable(self):
+        for gamma in (5e-5, 1e-4, 2e-4):
+            for u_cold in (100_000, 250_000):
+                with self.subTest(gamma=gamma, u_cold=u_cold):
+                    k = 256
+                    # Newest arrival that can still beat the cold req.
+                    bound = gamma_boost(k, gamma) - gamma_boost(
+                        geometric_bin(u_cold, k), gamma
+                    )
+                    self.assertGreater(bound, 0)
+                    arrivals = [
+                        0,
+                        int(bound * 0.5),
+                        int(bound * 0.9),
+                        int(bound * 1.1),
+                        int(bound * 2),
+                        int(bound * 10),
+                    ]
+                    reqs = [_make_boost_req("cold", u_cold, arrival=0)]
+                    reqs += [
+                        _make_boost_req(f"hot{a}", 256, arrival=a) for a in arrivals
+                    ]
+                    order = self.sort_rids(reqs, gamma=gamma, bin_size=k)
+                    cold_at = order.index("cold")
+                    # Every hot below the bound is ahead of the cold; every
+                    # hot above it is behind; each class is FCFS (equal boost).
+                    ahead = [f"hot{a}" for a in arrivals if a < bound]
+                    behind = [f"hot{a}" for a in arrivals if a > bound]
+                    self.assertEqual(order[:cold_at], ahead)
+                    self.assertEqual(order[cold_at + 1 :], behind)
+
+    def test_large_gamma_converges_to_fcfs_by_arrival(self):
+        # gamma=1.0 with w >= 256: 1 - exp(-256) rounds to 1.0, so every boost
+        # is exactly 0 and phi = A -- pure arrival order regardless of work.
+        reqs = [
+            _make_boost_req("new_short", 256, arrival=900),
+            _make_boost_req("old_huge", 250_000, arrival=100),
+            _make_boost_req("mid", 5_000, arrival=500),
+        ]
+        self.assertEqual(
+            self.sort_rids(reqs, gamma=1.0), ["old_huge", "mid", "new_short"]
+        )
+
+    def test_small_gamma_converges_to_shortest_uncached_work(self):
+        # gamma=1e-9: boost differences (~ln(2)/gamma ~ 7e8 tokens) dominate
+        # any arrival differences, so ordering is ascending uncached work.
+        reqs = [
+            _make_boost_req("big_new", 4_096, arrival=1_000_000),
+            _make_boost_req("small_old", 256, arrival=0),
+            _make_boost_req("mid", 1_024, arrival=500_000),
+        ]
+        self.assertEqual(
+            self.sort_rids(reqs, gamma=1e-9), ["small_old", "mid", "big_new"]
+        )
+
+    def test_retracted_output_tokens_are_charged_as_work(self):
+        # A retracted req re-queues with matched=0 and its generated tokens
+        # must count into u(r) (they are re-prefilled), or it would keep a
+        # small-work boost it no longer deserves.
+        replay = _make_boost_req("replay", 100, arrival=0, output=900)
+        fresh = _make_boost_req("fresh", 500, arrival=0)
+        self.assertEqual(self.sort_rids([replay, fresh]), ["fresh", "replay"])
+
+    def test_in_batch_dedup_followers_sort_last(self):
+        follower = _make_boost_req("follower", 256, arrival=0)
+        other = _make_boost_req("other", 250_000, arrival=1_000_000)
+        self.assertEqual(
+            self.sort_rids([follower, other], deprioritized={"follower"}),
+            ["other", "follower"],
+        )
+
+    def test_priority_scheduling_is_the_primary_key(self):
+        # Same composition contract as _sort_by_priority_and_fcfs: priority
+        # first, then the boost key. Default sign: higher value first.
+        low_boost_star = _make_boost_req("low_boost_star", 256, arrival=0)
+        low_boost_star.priority = 1
+        high_boost_dog = _make_boost_req("high_boost_dog", 250_000, arrival=10**9)
+        high_boost_dog.priority = 5
+        queue = [low_boost_star, high_boost_dog]
+        SchedulePolicy._sort_by_boost(
+            queue, set(), 1e-4, 256, enable_priority_scheduling=True, priority_sign=-1
+        )
+        self.assertEqual([r.rid for r in queue], ["high_boost_dog", "low_boost_star"])
+
+    def test_retraction_reset_keeps_the_arrival_stamp(self):
+        # reset_for_retract clears the cache-match state but must keep the
+        # first-entry stamp, or retracted reqs lose their seniority on requeue.
+        req = _make_boost_req("retracted", 100, arrival=1234)
+        req.reset_for_retract()
+        self.assertEqual(req.boost_arrival_tokens, 1234)
+        self.assertEqual(req.retraction_count, 1)
+        self.assertEqual(req.num_matched_prefix_tokens, 0)
+
+    def test_calc_priority_dispatches_boost(self):
+        policy = SchedulePolicy(
+            policy="boost",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            boost_gamma=1e-4,
+            boost_bin_size=256,
+        )
+        cold = _make_boost_req("cold", 100_000, arrival=0)
+        hot = _make_boost_req("hot", 256, arrival=500)
+        queue = [cold, hot]
+        with patch.object(policy, "_compute_prefix_matches", return_value=set()):
+            policy.calc_priority(queue)
+        self.assertEqual([r.rid for r in queue], ["hot", "cold"])
+
+    def test_large_queue_falls_back_to_fcfs_like_lpm(self):
+        # Cost parity with lpm/hrrn: past 128 waiting reqs the active policy
+        # is FCFS and the expensive match+sort pass is skipped.
+        policy = SchedulePolicy(
+            policy="boost",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        small = [_make_boost_req(f"r{i}", 256, arrival=0) for i in range(128)]
+        large = small + [_make_boost_req("r129", 256, arrival=0)]
+        self.assertIs(policy._determine_active_policy(small), CacheAwarePolicy.BOOST)
+        self.assertIs(policy._determine_active_policy(large), CacheAgnosticPolicy.FCFS)
+
+    def test_boost_without_prefix_cache_degrades_to_fcfs_with_warning(self):
+        with self.assertLogs("sglang.srt.managers.schedule_policy", level="WARNING"):
+            policy = SchedulePolicy(
+                policy="boost",
+                tree_cache=RadixCache.create_simulated(disable=True),
+                enable_hierarchical_cache=True,
+                enable_priority_scheduling=False,
+                schedule_low_priority_values_first=False,
+            )
+        self.assertIs(policy.policy, CacheAgnosticPolicy.FCFS)
 
 
 if __name__ == "__main__":

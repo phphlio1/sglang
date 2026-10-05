@@ -44,6 +44,8 @@ POSITIONAL_FIELD_ORDER = (
     "max_prefill_tokens",
     "prefill_max_requests",
     "schedule_policy",
+    "boost_gamma",
+    "boost_bin_size",
     "enable_priority_scheduling",
     "disable_priority_preemption",
     "default_priority_value",

@@ -1415,6 +1415,11 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
+        # Token-clock stamp at FIRST waiting_queue entry. Stamped once and never
+        # re-stamped on retraction re-adds (unlike arrival_processed_tokens above),
+        # so boost seniority survives retract -> requeue cycles.
+        self.boost_arrival_tokens: Optional[int] = None
+
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(
             self.cache_request_handle,

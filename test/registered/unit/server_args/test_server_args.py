@@ -4041,5 +4041,51 @@ class TestLazyReexports(CustomTestCase):
             server_args_module.NotAThing
 
 
+class TestBoostPolicyArgs(CustomTestCase):
+    # A real (mini) config.json, same shape as test_resolution_declarations:
+    # `model_path="dummy"` takes the resolution pipeline's early return, which
+    # leaves the defaults (served_model_name, chunked_prefill_size) unfilled
+    # that check_server_args assumes are set.
+    _MINI_CONFIG = {
+        "architectures": ["LlamaForCausalLM"],
+        "model_type": "llama",
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "num_hidden_layers": 2,
+        "vocab_size": 128,
+        "max_position_embeddings": 2048,
+    }
+
+    def _checked(self, **kwargs):
+        path = tempfile.mkdtemp(prefix="boost_policy_args_")
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        with open(os.path.join(path, "config.json"), "w") as handle:
+            json.dump(self._MINI_CONFIG, handle)
+        # resolve_once() persists env side effects process-wide (it sets
+        # SGLANG_USE_CUDA_IPC_TRANSPORT from the resolved mm transport); a
+        # later test in this file reads that var as "user-set".
+        self.addCleanup(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear)
+        args = ServerArgs(model_path=path, **kwargs)
+        args.resolve_once()
+        args.check_server_args()
+        return args
+
+    def test_boost_gamma_must_be_positive(self):
+        with self.assertRaisesRegex(AssertionError, "boost_gamma must be > 0"):
+            self._checked(schedule_policy="boost", boost_gamma=0.0)
+
+    def test_boost_bin_size_must_be_at_least_one(self):
+        with self.assertRaisesRegex(AssertionError, "boost_bin_size must be >= 1"):
+            self._checked(schedule_policy="boost", boost_bin_size=0)
+
+    def test_boost_defaults_and_other_policies_are_untouched(self):
+        # The gate fires only for policy=boost: defaults are valid there, and
+        # an inert gamma left at a bad value must not break other policies.
+        self._checked(schedule_policy="boost")
+        self._checked(schedule_policy="lpm", boost_gamma=0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
