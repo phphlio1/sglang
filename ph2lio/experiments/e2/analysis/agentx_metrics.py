@@ -47,6 +47,7 @@ from starvation import (
     compute_starvation_metrics,
     jains_fairness_index,
     ols_slope,
+    spearman_rank_correlation,
 )
 
 QUEUE_TIME_FAMILY_CANDIDATES = (
@@ -86,28 +87,58 @@ def _metric_value(record: dict, tag: str) -> float | None:
     return entry.get("value")
 
 
-def extract_per_request(records: list[dict]) -> dict:
-    """Aligned per-request arrays (error records excluded from latency stats).
+def _metric_seconds(record: dict, tag: str) -> float | None:
+    """Latency metric converted to seconds (this export writes milliseconds).
 
-    Records missing any of the five tags are dropped entirely so every array
-    stays index-aligned (TTFT/cached/ISL joins must not mis-pair).
+    The unit field is per-metric; an unrecognized unit returns None so the
+    record drops out visibly (n_complete) instead of silently mis-scaling.
     """
-    ok = [r for r in records if not r.get("error")]
+    entry = record.get("metrics", {}).get(tag)
+    if entry is None or entry.get("value") is None:
+        return None
+    unit = entry.get("unit", "ms")
+    if unit == "ms":
+        return entry["value"] / 1000.0
+    if unit == "s":
+        return entry["value"]
+    return None
+
+
+def extract_per_request(records: list[dict]) -> dict:
+    """Aligned per-request arrays (profiling-phase, non-error records only).
+
+    Warmup-phase records are excluded: they are cache-cold first prefills
+    sent before the measurement window and skew the latency tail. Records
+    missing any of the four core tags are dropped entirely so every array
+    stays index-aligned. The cache-read tag is optional: this export
+    carries it only when the server runs --enable-cache-report, which the
+    E2 pinned config does not -- cached_tokens is all-zero there and the
+    per-request cache classification comes from the schedule-eval log
+    (queue_wait_per_request block) instead.
+    """
     rows = []
-    for r in ok:
-        ttft = _metric_value(r, "time_to_first_token")
-        lat = _metric_value(r, "request_latency")
+    n_error = 0
+    n_phase_excluded = 0
+    for r in records:
+        if r.get("error"):
+            n_error += 1
+            continue
+        if (r.get("metadata", {}) or {}).get("benchmark_phase") != "profiling":
+            n_phase_excluded += 1
+            continue
+        ttft = _metric_seconds(r, "time_to_first_token")
+        lat = _metric_seconds(r, "request_latency")
         isl = _metric_value(r, "input_sequence_length")
         osl = _metric_value(r, "output_sequence_length")
-        cached = _metric_value(r, "usage_prompt_cache_read_tokens")
-        if None in (ttft, lat, isl, osl, cached):
+        if None in (ttft, lat, isl, osl):
             continue
-        rows.append((ttft, lat, isl, osl, int(cached)))
+        cached = _metric_value(r, "usage_prompt_cache_read_tokens")
+        rows.append((ttft, lat, int(isl), int(osl), int(cached or 0)))
 
     ttft_s = [r[0] for r in rows]
     lat_s = [r[1] for r in rows]
-    isl = [int(r[2]) for r in rows]
-    osl = [int(r[3]) for r in rows]
+    isl = [r[2] for r in rows]
+    osl = [r[3] for r in rows]
     cached = [r[4] for r in rows]
 
     tpot_s = [
@@ -116,7 +147,8 @@ def extract_per_request(records: list[dict]) -> dict:
 
     return {
         "n_records": len(records),
-        "n_error": len(records) - len(ok),
+        "n_error": n_error,
+        "n_phase_excluded": n_phase_excluded,
         "n_complete": len(rows),
         "ttft_s": ttft_s,
         "latency_s": lat_s,
@@ -321,6 +353,24 @@ def _queue_wait_class_stats(
     }
 
 
+def _is_num(value) -> bool:
+    return isinstance(value, (int, float))
+
+
+def _ttft_stats(ttfts_s: list[float]) -> dict:
+    """Mean/P95/P99/max TTFT for one cache class, in seconds."""
+    if not ttfts_s:
+        return {"n": 0, "mean_s": None, "p95_s": None, "p99_s": None, "max_s": None}
+    ordered = sorted(ttfts_s)
+    return {
+        "n": len(ordered),
+        "mean_s": sum(ordered) / len(ordered),
+        "p95_s": _percentile(ordered, 95),
+        "p99_s": _percentile(ordered, 99),
+        "max_s": ordered[-1],
+    }
+
+
 def _retraction_count(run_dir: Path, eval_records: list[dict] | None) -> dict:
     """Retractions during the profiling window.
 
@@ -416,6 +466,20 @@ def compute_queue_wait_per_request(
         [r.get("input_len") or 0 for r in eval_records],
     )
 
+    # Cold-class TTFT and the cache/TTFT correlation: with no client-side
+    # cache-read tag in this export level, the eval log is the only
+    # per-request source that pairs cache classification with latency.
+    cold_ttft = _ttft_stats([r["ttft_s"] for r in cold if _is_num(r.get("ttft_s"))])
+    warm_ttft = _ttft_stats([r["ttft_s"] for r in warm if _is_num(r.get("ttft_s"))])
+    ttft_pairs = [
+        (r.get("matched_prefix_tokens_first_admission") or 0, r["ttft_s"])
+        for r in eval_records
+        if _is_num(r.get("ttft_s"))
+    ]
+    ttft_cache_corr = spearman_rank_correlation(
+        [p[0] for p in ttft_pairs], [p[1] for p in ttft_pairs]
+    )
+
     block = {
         "available": True,
         "n_records": len(eval_records),
@@ -423,6 +487,9 @@ def compute_queue_wait_per_request(
         "cold_class": cold_stats,
         "warm_class": warm_stats,
         "cold_warm_queue_wait_gap": gap,
+        "cold_class_ttft": cold_ttft,
+        "warm_class_ttft": warm_ttft,
+        "ttft_cache_correlation": ttft_cache_corr,
         "starvation_slope": {
             "slope_s_per_arrival": slope,
             "r_squared": r_squared,
@@ -460,6 +527,7 @@ def compute_metrics(run_dir: Path, starvation_threshold_s: float) -> dict:
         "run_dir": str(run_dir),
         "n_records": per_req["n_records"],
         "n_error_records": per_req["n_error"],
+        "n_warmup_excluded_records": per_req["n_phase_excluded"],
         "n_complete_records": per_req["n_complete"],
     }
 
