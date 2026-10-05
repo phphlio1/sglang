@@ -1420,6 +1420,13 @@ class Req(ReqDllmMixin):
         # so boost seniority survives retract -> requeue cycles.
         self.boost_arrival_tokens: Optional[int] = None
 
+        # Schedule-eval log bookkeeping (--log-schedule-eval-path): first entry
+        # and first admission are stamp-once (they must survive retraction),
+        # last admission is last-write-wins. See observability/schedule_eval_log.py.
+        self.first_queue_entry_time: Optional[float] = None
+        self.matched_prefix_tokens_first_admission: Optional[int] = None
+        self.matched_prefix_tokens_last_admission: Optional[int] = None
+
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(
             self.cache_request_handle,

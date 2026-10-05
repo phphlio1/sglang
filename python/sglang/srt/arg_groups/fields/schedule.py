@@ -109,6 +109,12 @@ class Schedule(msgspec.Struct):
             help="Geometric bin size k for the boost schedule policy's work quantization; the max boost is b_gamma(k), so this bounds how far a newcomer may jump ahead. Power of two recommended.",
         ),
     ] = 256
+    log_schedule_eval_path: A[
+        Optional[str],
+        Arg(
+            help="Absolute path of a .jsonl file to append one per-request schedule-evaluation record per finished request (rid, queue wait, ttft, cache classification, retractions). Off by default.",
+        ),
+    ] = None
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

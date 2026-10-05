@@ -306,6 +306,10 @@ from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
 )
+from sglang.srt.observability.schedule_eval_log import (
+    ScheduleEvalLogger,
+    stamp_admission_prefix_matches,
+)
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
     SCHEDULER_STAGE_IDLE,
@@ -643,6 +647,9 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+
+        # Opt-in per-request schedule eval log (--log-schedule-eval-path)
+        self.maybe_init_schedule_eval_logger()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1384,6 +1391,19 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            boost_gamma=get_schedule().boost_gamma,
+            boost_bin_size=get_schedule().boost_bin_size,
+        )
+
+    def maybe_init_schedule_eval_logger(self):
+        """Opt-in per-request schedule eval log; None (zero cost) when off."""
+        path = get_schedule().log_schedule_eval_path
+        if path is None:
+            self.schedule_eval_logger: Optional[ScheduleEvalLogger] = None
+            return
+        self.schedule_eval_logger = ScheduleEvalLogger(
+            path=path,
+            policy=self.schedule_policy,
             boost_gamma=get_schedule().boost_gamma,
             boost_bin_size=get_schedule().boost_bin_size,
         )
@@ -3286,6 +3306,9 @@ class Scheduler(
             # Boost seniority stamps once; retract -> requeue keeps the original.
             if req.boost_arrival_tokens is None:
                 req.boost_arrival_tokens = self.processed_tokens_counter
+            # First queue entry for the schedule-eval log; survives retraction.
+            if req.first_queue_entry_time is None:
+                req.first_queue_entry_time = req.time_stats.wait_queue_entry_time
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -4095,6 +4118,7 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        stamp_admission_prefix_matches(can_run_list)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -4803,6 +4827,10 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        # Opt-in schedule eval log: one line per req finished in this batch.
+        if self.schedule_eval_logger is not None:
+            self.schedule_eval_logger.log_finished_batch(batch.reqs)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -5975,6 +6003,8 @@ def run_scheduler_process(
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
             scheduler.metrics_reporter._shutdown_fpm()
+            if scheduler.schedule_eval_logger is not None:
+                scheduler.schedule_eval_logger.close()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
