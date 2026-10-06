@@ -296,21 +296,61 @@ def load_run_meta(run_dir: Path) -> dict:
     return json.loads(path.read_text())
 
 
-def load_schedule_eval_records(run_dir: Path) -> list[dict] | None:
-    """This run's per-request schedule-eval records, or None when absent.
+def first_profiling_scrape_s(run_dir: Path) -> float | None:
+    """Epoch seconds of the first PROFILING-phase metrics scrape, else None.
+
+    The eval log's warmup cut: schedule-eval records whose arrival_wall_s
+    precedes this timestamp arrived during the benchmark's warmup phase and
+    must not pollute this run's block (validated to match the client-side
+    warmup request count exactly on all 11 matrix runs).
+    """
+    path = run_dir / "server_metrics_export.jsonl"
+    if not path.exists():
+        return None
+    for line in path.open():
+        rec = json.loads(line)
+        if rec.get("benchmark_phase") == "profiling" and rec.get("timestamp_ns"):
+            return rec["timestamp_ns"] / 1e9
+    return None
+
+
+def load_schedule_eval_records(run_dir: Path) -> tuple[list[dict] | None, int]:
+    """This run's per-request schedule-eval records and the warmup drop count.
+
+    Returns (records, n_dropped); records is None only when the snapshot is
+    absent, with n_dropped 0.
 
     The snapshot schedule_eval.jsonl may carry earlier runs' records from a
     reused server; run_meta.json's schedule_eval.offset_lines slices those
-    off so only this run's requests are analyzed.
+    off. The remaining records are then cut to the profiling window: the
+    offset slice cannot do this, because warmup-phase requests of THIS run
+    append after the offset too (fresh-boot servers have offset 0 and still
+    see warmup traffic). Records are dropped when their arrival_wall_s
+    predates the first profiling scrape, or their rid is a harness
+    health-check probe.
     """
     path = run_dir / "schedule_eval.jsonl"
     if not path.exists():
-        return None
+        return None, 0
     block = load_run_meta(run_dir).get("schedule_eval") or {}
     offset = block.get("offset_lines")
     offset = offset if isinstance(offset, int) and offset >= 0 else 0
-    records = [json.loads(line) for line in path.open() if line.strip()]
-    return records[offset:]
+    records = [json.loads(line) for line in path.open() if line.strip()][offset:]
+
+    cut_s = first_profiling_scrape_s(run_dir)
+    if cut_s is None:
+        # No profiling scrapes to align with (missing export or non-standard
+        # run): keep everything post-offset rather than guessing.
+        return records, 0
+    kept = []
+    for r in records:
+        if str(r.get("rid", "")).startswith("HEALTH_CHECK_"):
+            continue
+        arrived = r.get("arrival_wall_s")
+        if isinstance(arrived, (int, float)) and arrived < cut_s:
+            continue
+        kept.append(r)
+    return kept, len(records) - len(kept)
 
 
 def load_profiling_series(run_dir: Path, family: str) -> list[float] | None:
@@ -521,7 +561,7 @@ def compute_metrics(run_dir: Path, starvation_threshold_s: float) -> dict:
     aggregate = load_aggregate(run_dir)
     per_req = extract_per_request(records)
     meta = load_run_meta(run_dir)
-    eval_records = load_schedule_eval_records(run_dir)
+    eval_records, eval_warmup_dropped = load_schedule_eval_records(run_dir)
 
     result = {
         "run_dir": str(run_dir),
@@ -529,6 +569,9 @@ def compute_metrics(run_dir: Path, starvation_threshold_s: float) -> dict:
         "n_error_records": per_req["n_error"],
         "n_warmup_excluded_records": per_req["n_phase_excluded"],
         "n_complete_records": per_req["n_complete"],
+        # Eval-log-side warmup cut (arrival-wall based); should track
+        # n_warmup_excluded_records (client-side phase tag).
+        "n_warmup_excluded_eval_records": eval_warmup_dropped,
     }
 
     if meta:

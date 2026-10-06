@@ -7,9 +7,9 @@
 # Modes:
 #   run_e2.sh smoke                     pipeline smoke test (NOT a valid benchmark)
 #   run_e2.sh policy <policy> [conc]    one official (policy, concurrency) point
-#   run_e2.sh sweep [conc...]           all 6 policies (fcfs lpm hrrn dfs-weight
-#                                       lof boost), each at the given
-#                                       concurrencies (default: $CONCURRENCY)
+#   run_e2.sh sweep [conc...]           all 6 policies (fcfs fcfs-match lpm
+#                                       hrrn dfs-weight boost), each at the
+#                                       given concurrencies (default: $CONCURRENCY)
 #   run_e2.sh array                     Slurm array mode: SLURM_ARRAY_TASK_ID
 #                                       0..5 maps to the 6 policies
 #
@@ -64,6 +64,20 @@ STOP_SERVER="${STOP_SERVER:-auto}"          # auto | always | never
 # Boost arm hyperparameters (paper defaults; larger gamma = more FCFS-like).
 BOOST_GAMMA="${BOOST_GAMMA:-1e-4}"
 BOOST_BIN_SIZE="${BOOST_BIN_SIZE:-256}"
+# gamma-Ada arm (Task 8): 1 = server adapts boost_gamma online from the
+# admission wait tail (gamma0 = BOOST_GAMMA); arms log to a distinct eval
+# file and run label so they never mix with static-gamma cells.
+BOOST_ADAPTIVE_GAMMA="${BOOST_ADAPTIVE_GAMMA:-0}"
+# Dataset subsetting for policy mode (Task-4 targeted regime): empty = the
+# full dataset (official matrix points); N = first N entries in scan order
+# (same subset for every policy/seed, so arms stay comparable).
+NUM_DATASET_ENTRIES="${NUM_DATASET_ENTRIES:-}"
+# Trajectory resume window (Task-4 targeted regime): empty = scenario default
+# [0.0, 1.0]; set to restrict where sessions resume within each trajectory.
+# Early turns carry seconds-scale think-times (late turns carry minutes-scale
+# agent-work gaps), so a small window is the arrival-density lever at c8.
+TRAJECTORY_START_MIN_RATIO="${TRAJECTORY_START_MIN_RATIO:-}"
+TRAJECTORY_START_MAX_RATIO="${TRAJECTORY_START_MAX_RATIO:-}"
 # ============================================================================
 
 AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800  # first run reconstructs the dataset cache
@@ -72,13 +86,13 @@ export AIPERF_DATASET_CONFIGURATION_TIMEOUT AIPERF_SERVICE_PROFILE_CONFIGURE_TIM
 
 SCENARIO="inferencex-agentx-mvp"
 DATASET="semianalysis_cc_traces_weka_062126_256k"
-POLICIES=(fcfs lpm hrrn dfs-weight boost)
+POLICIES=(fcfs fcfs-match lpm hrrn dfs-weight boost)
 
 log()  { printf '[e2 %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die()  { printf '[e2 ERROR] %s\n' "$*" >&2; exit 2; }
 
 valid_policy() {
-  case "$1" in fcfs|lpm|hrrn|dfs-weight|boost) return 0 ;; *) return 1 ;; esac
+  case "$1" in fcfs|fcfs-match|lpm|hrrn|dfs-weight|boost) return 0 ;; *) return 1 ;; esac
 }
 
 # --- Server lifecycle --------------------------------------------------------
@@ -99,7 +113,9 @@ server_policy() {
 # (policy, gamma, k) so a reused server keeps appending to one file, which
 # the per-run line offset then slices.
 requested_eval_path() {  # $1 = policy
-  if [[ "$1" == "boost" ]]; then
+  if [[ "$1" == "boost" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
+    printf '%s/schedule_eval_ada_k%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_BIN_SIZE}"
+  elif [[ "$1" == "boost" ]]; then
     printf '%s/schedule_eval_g%s_k%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}"
   else
     printf '%s/%s/schedule_eval.jsonl' "${OUTPUT_DIR}" "$1"
@@ -162,10 +178,12 @@ server_start() {  # $1 = policy
   log "server healthy: policy=$(server_policy)"
 }
 
-ensure_server() {  # $1 = policy
+ensure_server() {  # $1 = policy; sets SERVER_FRESH_BOOT (1 = this run booted)
+  SERVER_FRESH_BOOT=1
   if server_healthy; then
     if policy_params_match "$1"; then
       log "reusing running server (full policy spec matches: $1)"
+      SERVER_FRESH_BOOT=0
       return
     fi
     log "running server's policy spec does not match ${1}; restarting"
@@ -257,13 +275,14 @@ PY
 
 write_run_meta() {  # $1 = run_dir, $2 = policy, $3 = concurrency,
                     # $4/$5/$6 = schedule-eval path / pre-run offset / records
+                    # $7 = server_fresh_boot (1 = this run booted the server)
   local sglang_commit
   sglang_commit="$(git -C "${E2_DIR}/../../.." rev-parse HEAD 2>/dev/null || echo unknown)"
   curl -sf "${SGLANG_URL}/server_info" > "$1/server_info.json" 2>/dev/null \
     || curl -sf "${SGLANG_URL}/get_server_info" > "$1/server_info.json"
   python3 - "$1/run_meta.json" "$2" "$3" "$MODEL" "$TOKENIZER" "$SGLANG_URL" \
       "$sglang_commit" "$(cat "$1/command.txt" | tr '\n' ' ')" \
-      "$4" "$5" "$6" <<'PY'
+      "$4" "$5" "$6" "$7" <<'PY'
 import json, sys, time
 from pathlib import Path
 
@@ -283,6 +302,29 @@ meta = {
     # Boost arm knobs (from env; ensure_server verified them against /server_info).
     "boost_gamma": float(__import__("os").environ.get("BOOST_GAMMA", "1e-4")),
     "boost_bin_size": int(__import__("os").environ.get("BOOST_BIN_SIZE", "256")),
+    # gamma-Ada arm: true = boost_gamma above is the initial gamma (gamma0)
+    # and the server adapts it online from the admission wait tail.
+    "boost_adaptive_gamma": __import__("os").environ.get("BOOST_ADAPTIVE_GAMMA", "0") == "1",
+    # Dataset subsetting: null = full dataset (official matrix point); N = the
+    # first N entries in scan order (targeted-regime runs; same subset across
+    # arms since the mmap cache is keyed by seed only).
+    "num_dataset_entries": (
+        int(__import__("os").environ["NUM_DATASET_ENTRIES"])
+        if __import__("os").environ.get("NUM_DATASET_ENTRIES")
+        else None
+    ),
+    # Trajectory resume window (null = scenario default [0.0, 1.0]; the
+    # targeted regime restricts it for arrival density -- see run_e2.sh).
+    "trajectory_start_min_ratio": (
+        float(__import__("os").environ["TRAJECTORY_START_MIN_RATIO"])
+        if __import__("os").environ.get("TRAJECTORY_START_MIN_RATIO")
+        else None
+    ),
+    "trajectory_start_max_ratio": (
+        float(__import__("os").environ["TRAJECTORY_START_MAX_RATIO"])
+        if __import__("os").environ.get("TRAJECTORY_START_MAX_RATIO")
+        else None
+    ),
     # Per-request schedule-eval log: slice the snapshot from offset_lines to
     # isolate this run's records (a reused server appends across runs).
     "schedule_eval": {
@@ -290,6 +332,9 @@ meta = {
         "offset_lines": int(sys.argv[10]),
         "records": int(sys.argv[11]),
     },
+    # Server protocol: 1 = this run booted a fresh server (cold radix cache);
+    # 0 = it reused a running server whose cache carries earlier runs.
+    "server_fresh_boot": sys.argv[12] == "1",
     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
 }
 Path(sys.argv[1]).write_text(json.dumps(meta, indent=2) + "\n")
@@ -305,8 +350,10 @@ mode_smoke() {
   ensure_server "${SMOKE_POLICY}"
   eval_path="$(requested_eval_path "${SMOKE_POLICY}")"
   eval_offset=$(schedule_eval_lines "${eval_path}")
-  run_aiperf "${run_dir}" "${CONCURRENCY}" "${SMOKE_DURATION}" \
-    --num-dataset-entries "${NUM_ENTRIES}" --unsafe-override
+  local smoke_flags=(--num-dataset-entries "${NUM_ENTRIES}" --unsafe-override)
+  [[ -n "${TRAJECTORY_START_MIN_RATIO}" ]] && smoke_flags+=(--trajectory-start-min-ratio "${TRAJECTORY_START_MIN_RATIO}")
+  [[ -n "${TRAJECTORY_START_MAX_RATIO}" ]] && smoke_flags+=(--trajectory-start-max-ratio "${TRAJECTORY_START_MAX_RATIO}")
+  run_aiperf "${run_dir}" "${CONCURRENCY}" "${SMOKE_DURATION}" "${smoke_flags[@]}"
   if [[ -f "${eval_path}" ]]; then
     cp "${eval_path}" "${run_dir}/schedule_eval.jsonl"
     log "schedule-eval: +$(( $(schedule_eval_lines "${eval_path}") - eval_offset )) records -> ${run_dir}/schedule_eval.jsonl"
@@ -317,7 +364,9 @@ mode_smoke() {
 }
 
 run_label() {  # $1 = policy, $2 = concurrency; boost arms carry gamma/k
-  if [[ "$1" == "boost" ]]; then
+  if [[ "$1" == "boost" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
+    printf 'c%s_gada_k%s' "$2" "${BOOST_BIN_SIZE}"
+  elif [[ "$1" == "boost" ]]; then
     printf 'c%s_g%s_k%s' "$2" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}"
   else
     printf 'c%s' "$2"
@@ -327,7 +376,7 @@ run_label() {  # $1 = policy, $2 = concurrency; boost arms carry gamma/k
 mode_policy() {  # $1 = policy, $2 = concurrency (optional)
   local policy="$1" conc="${2:-${CONCURRENCY}}"
   valid_policy "${policy}" || die "policy must be one of: ${POLICIES[*]} (got '${policy}')"
-  echo "=== E2 policy run: policy=${policy} concurrency=${conc} duration=${DURATION}s seed=${SEED} ==="
+  echo "=== E2 policy run: policy=${policy} concurrency=${conc} duration=${DURATION}s seed=${SEED}${NUM_DATASET_ENTRIES:+ entries=${NUM_DATASET_ENTRIES}} ==="
   local run_dir
   run_dir="$(new_run_dir "${OUTPUT_DIR}/${policy}" "$(run_label "${policy}" "${conc}")")"
   ensure_server "${policy}"
@@ -336,7 +385,11 @@ mode_policy() {  # $1 = policy, $2 = concurrency (optional)
   local eval_path eval_offset eval_records
   eval_path="$(requested_eval_path "${policy}")"
   eval_offset=$(schedule_eval_lines "${eval_path}")
-  run_aiperf "${run_dir}" "${conc}" "${DURATION}"
+  local extra_flags=()
+  [[ -n "${NUM_DATASET_ENTRIES}" ]] && extra_flags+=(--num-dataset-entries "${NUM_DATASET_ENTRIES}")
+  [[ -n "${TRAJECTORY_START_MIN_RATIO}" ]] && extra_flags+=(--trajectory-start-min-ratio "${TRAJECTORY_START_MIN_RATIO}")
+  [[ -n "${TRAJECTORY_START_MAX_RATIO}" ]] && extra_flags+=(--trajectory-start-max-ratio "${TRAJECTORY_START_MAX_RATIO}")
+  run_aiperf "${run_dir}" "${conc}" "${DURATION}" "${extra_flags[@]}"
   eval_records=$(( $(schedule_eval_lines "${eval_path}") - eval_offset ))
   if [[ -f "${eval_path}" ]]; then
     cp "${eval_path}" "${run_dir}/schedule_eval.jsonl"
@@ -344,7 +397,7 @@ mode_policy() {  # $1 = policy, $2 = concurrency (optional)
   else
     eval_records=0
   fi
-  write_run_meta "${run_dir}" "${policy}" "${conc}" "${eval_path}" "${eval_offset}" "${eval_records}"
+  write_run_meta "${run_dir}" "${policy}" "${conc}" "${eval_path}" "${eval_offset}" "${eval_records}" "${SERVER_FRESH_BOOT}"
   post_run_diagnostics "${run_dir}" 256000
   python3 "${METRICS_SCRIPT}" "${run_dir}"
   finish_server
@@ -385,7 +438,8 @@ Usage: $0 <mode> [args]
   array                    Slurm array mode (SLURM_ARRAY_TASK_ID 0..5 -> policies)
 Env knobs: SGLANG_URL MODEL TOKENIZER CONCURRENCY DURATION SEED OUTPUT_DIR
            SMOKE_POLICY SMOKE_DURATION NUM_ENTRIES HEALTH_TIMEOUT STOP_SERVER
-           BOOST_GAMMA BOOST_BIN_SIZE
+           BOOST_GAMMA BOOST_BIN_SIZE NUM_DATASET_ENTRIES
+           TRAJECTORY_START_MIN_RATIO TRAJECTORY_START_MAX_RATIO
 EOF
     exit 2 ;;
 esac

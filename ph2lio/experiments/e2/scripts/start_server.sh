@@ -8,7 +8,7 @@
 # /get_server_info and record it into each run directory.
 #
 # Usage:
-#   scripts/start_server.sh <policy>     # policy in: fcfs lpm hrrn dfs-weight lof boost
+#   scripts/start_server.sh <policy>     # policy in: fcfs fcfs-match lpm hrrn dfs-weight lof boost
 #   scripts/start_server.sh --stop
 #
 # Boost-policy knobs (env): BOOST_GAMMA (default 1e-4), BOOST_BIN_SIZE
@@ -40,6 +40,9 @@ HOST="0.0.0.0"
 # Boost-policy hyperparameters (paper defaults; larger gamma = more FCFS-like).
 BOOST_GAMMA="${BOOST_GAMMA:-1e-4}"
 BOOST_BIN_SIZE="${BOOST_BIN_SIZE:-256}"
+# gamma-Ada (Task 8): 1 = adapt boost_gamma online from the admission wait
+# tail (gamma0 = BOOST_GAMMA); off by default, static-gamma path untouched.
+BOOST_ADAPTIVE_GAMMA="${BOOST_ADAPTIVE_GAMMA:-0}"
 LOG_SCHEDULE_EVAL_PATH="${LOG_SCHEDULE_EVAL_PATH:-}"
 
 SERVER_FLAGS=(
@@ -77,8 +80,8 @@ fi
 
 POLICY="${1:?usage: start_server.sh <policy> | --stop}"
 case "$POLICY" in
-  fcfs|lpm|hrrn|dfs-weight|lof|boost) ;;
-  *) echo "ERROR: policy must be one of: fcfs lpm hrrn dfs-weight lof boost (got '$POLICY')" >&2; exit 2 ;;
+  fcfs|fcfs-match|lpm|hrrn|dfs-weight|lof|boost) ;;
+  *) echo "ERROR: policy must be one of: fcfs fcfs-match lpm hrrn dfs-weight lof boost (got '$POLICY')" >&2; exit 2 ;;
 esac
 
 # Policy-specific flags (E2 additions only; the pinned serving config above
@@ -86,6 +89,7 @@ esac
 POLICY_FLAGS=()
 if [[ "${POLICY}" == "boost" ]]; then
   POLICY_FLAGS+=(--boost-gamma "${BOOST_GAMMA}" --boost-bin-size "${BOOST_BIN_SIZE}")
+  [[ "${BOOST_ADAPTIVE_GAMMA}" == "1" ]] && POLICY_FLAGS+=(--boost-adaptive-gamma)
 fi
 if [[ -n "${LOG_SCHEDULE_EVAL_PATH}" ]]; then
   POLICY_FLAGS+=(--log-schedule-eval-path "${LOG_SCHEDULE_EVAL_PATH}")
@@ -107,7 +111,7 @@ export FLASHINFER_EXTRA_CUDAFLAGS="-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK"
 
 echo "Starting SGLang server  model=${MODEL}  policy=${POLICY}  port=${PORT}"
 if [[ "${POLICY}" == "boost" ]]; then
-  echo "boost: gamma=${BOOST_GAMMA}  bin_size=${BOOST_BIN_SIZE}"
+  echo "boost: gamma=${BOOST_GAMMA}  bin_size=${BOOST_BIN_SIZE}  adaptive=${BOOST_ADAPTIVE_GAMMA}"
 fi
 if [[ -n "${LOG_SCHEDULE_EVAL_PATH}" ]]; then
   echo "schedule-eval log: ${LOG_SCHEDULE_EVAL_PATH} (reset on boot)"
