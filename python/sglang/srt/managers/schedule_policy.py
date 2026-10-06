@@ -33,12 +33,12 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
-from collections import Counter
+from collections import Counter, deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence, Set, Union
 
 import torch
 
@@ -260,6 +260,97 @@ def geometric_bin(work: int, bin_size: int) -> int:
     return bin_size * 2 ** math.floor(math.log2(max(work, bin_size) / bin_size))
 
 
+def _percentile(sorted_vals: Sequence[float], p: float) -> float:
+    """Linear-interpolated percentile; same definition as the analysis-side
+    gamma-hat estimator, so runtime and offline gammas agree."""
+    if len(sorted_vals) == 1:
+        return float(sorted_vals[0])
+    k = (len(sorted_vals) - 1) * p / 100.0
+    f, c = math.floor(k), math.ceil(k)
+    if f == c:
+        return float(sorted_vals[int(k)])
+    return sorted_vals[f] + (k - f) * (sorted_vals[c] - sorted_vals[f])
+
+
+class AdaptiveBoostGamma:
+    """Adaptive gamma for the boost policy (gamma-Ada).
+
+    gamma_hat = ln(0.05/0.01) / (w99 - w95) = ln 5 / tail_width, over the
+    last WINDOW first-admission waits measured in clock tokens (processed-
+    token counter minus the stamp-once boost arrival stamp). Fatter wait
+    tail -> smaller gamma_hat -> larger boosts (locality/LAS-ward); thin
+    tail -> larger gamma_hat (FCFS-ward). The estimate is EMA-smoothed
+    (BETA) and clipped to [GAMMA_MIN, GAMMA_MAX]. Off by default;
+    see --boost-adaptive-gamma.
+    """
+
+    WINDOW = 2048
+    MIN_SAMPLES = 64
+    BETA = 0.2
+    GAMMA_MIN = 3e-7
+    GAMMA_MAX = 1e-3
+    LN5 = math.log(5.0)
+    # Trajectory log lines: at most one per LOG_MIN_UPDATES updates, or on a
+    # >= LOG_REL_CHANGE move since the last logged gamma.
+    LOG_MIN_UPDATES = 64
+    LOG_REL_CHANGE = 0.25
+
+    def __init__(
+        self, gamma0: float, window: int = WINDOW, min_samples: int = MIN_SAMPLES
+    ) -> None:
+        self._waits: deque = deque(maxlen=window)
+        self._min_samples = min_samples
+        self._gamma = min(max(gamma0, self.GAMMA_MIN), self.GAMMA_MAX)
+        self._updates_since_log = 0
+        self._last_logged_gamma = self._gamma
+
+    @property
+    def gamma(self) -> float:
+        return self._gamma
+
+    def record_admissions(self, waits: Iterable[int]) -> Optional[float]:
+        """Feed first-admission waits (clock tokens); returns the updated
+        gamma when this call applied an update, None while the window is
+        still filling below min_samples."""
+        self._waits.extend(max(0, int(w)) for w in waits)
+        if len(self._waits) < self._min_samples:
+            return None
+        ordered = sorted(self._waits)
+        # delta == 0 (no tail spread) -> gamma_hat -> inf -> GAMMA_MAX: the
+        # degenerate thin tail is maximally FCFS-ward, not an error.
+        delta = _percentile(ordered, 99) - _percentile(ordered, 95)
+        gamma_hat = self.LN5 / delta if delta > 0 else float("inf")
+        gamma_hat = min(max(gamma_hat, self.GAMMA_MIN), self.GAMMA_MAX)
+        gamma = min(
+            max(
+                (1.0 - self.BETA) * self._gamma + self.BETA * gamma_hat,
+                self.GAMMA_MIN,
+            ),
+            self.GAMMA_MAX,
+        )
+        self._maybe_log(gamma, gamma_hat, delta, len(ordered))
+        self._gamma = gamma
+        return gamma
+
+    def _maybe_log(self, gamma: float, gamma_hat: float, delta: float, n: int) -> None:
+        self._updates_since_log += 1
+        rel = abs(gamma - self._last_logged_gamma) / self._last_logged_gamma
+        if (
+            self._updates_since_log >= self.LOG_MIN_UPDATES
+            or rel >= self.LOG_REL_CHANGE
+        ):
+            logger.info(
+                "boost adaptive gamma: gamma=%.3e (gamma_hat=%.3e, "
+                "tail w99-w95=%.0f tokens, n=%d)",
+                gamma,
+                gamma_hat,
+                delta,
+                n,
+            )
+            self._updates_since_log = 0
+            self._last_logged_gamma = gamma
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -274,6 +365,11 @@ class CacheAgnosticPolicy(Enum):
     """Scheduling policies that are not aware of the tree cache."""
 
     FCFS = "fcfs"  # first come first serve
+    # FCFS ordering with the sort-time prefix match forced on: populates
+    # num_matched_prefix_tokens/prefix_indices for caches whose
+    # supports_fast_match_prefix() is False (every current implementation),
+    # where plain fcfs leaves them zero. Ordering is identical to fcfs.
+    FCFS_MATCH = "fcfs-match"
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
@@ -291,6 +387,7 @@ class SchedulePolicy:
         schedule_low_priority_values_first: bool,
         boost_gamma: float = 1e-4,
         boost_bin_size: int = 256,
+        boost_adaptive_gamma: bool = False,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -300,6 +397,13 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self.boost_gamma = boost_gamma
         self.boost_bin_size = boost_bin_size
+        # gamma-Ada; None unless boost + --boost-adaptive-gamma (off by
+        # default, so the fixed-gamma path is bit-identical to before).
+        self.adaptive_gamma: Optional[AdaptiveBoostGamma] = (
+            AdaptiveBoostGamma(boost_gamma)
+            if boost_adaptive_gamma and self.policy == CacheAwarePolicy.BOOST
+            else None
+        )
         self._shortest_prefill_calls = 0
 
         # It is used to find the matching prefix for in-batch prefix caching.
@@ -316,16 +420,23 @@ class SchedulePolicy:
         # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
         # set it in _compute_prefix_matches; do the same full match for
         # cache-agnostic policies when the radix supports it, so the load
-        # snapshot has it. Skip on decode (never prefills).
+        # snapshot has it. Skip on decode (never prefills). fcfs-match forces
+        # the match on regardless: it is the metric-visible reference arm for
+        # caches where supports_fast_match_prefix() is False (there the plain
+        # cache-agnostic branch never fires and admission reports zero matched
+        # tokens even though init_next_round_input re-matches at admission).
         if (
             not isinstance(policy, CacheAwarePolicy)
-            and self.tree_cache.supports_fast_match_prefix()
+            and (
+                policy == CacheAgnosticPolicy.FCFS_MATCH
+                or self.tree_cache.supports_fast_match_prefix()
+            )
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
                 match_prefix_for_req(self.tree_cache, r, include_req=True)
 
-        if self.policy == CacheAgnosticPolicy.FCFS:
+        if self.policy in (CacheAgnosticPolicy.FCFS, CacheAgnosticPolicy.FCFS_MATCH):
             if self.enable_priority_scheduling:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
@@ -336,6 +447,8 @@ class SchedulePolicy:
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
             )
+            for r in waiting_queue:
+                r.in_batch_dedup_pending = r.rid in temporary_deprioritized
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(
                     waiting_queue, temporary_deprioritized
@@ -369,6 +482,11 @@ class SchedulePolicy:
             else:
                 raise ValueError(f"Unknown CacheAware Policy: {policy=}")
         else:
+            # No in-batch dedup classification on this path (agnostic policy or
+            # the >128-queue fallback); clear stale flags so a first-admission
+            # stamp never reads an earlier sort's verdict.
+            for r in waiting_queue:
+                r.in_batch_dedup_pending = False
             if policy == CacheAgnosticPolicy.FCFS:
                 pass
             elif policy == CacheAgnosticPolicy.LOF:
@@ -399,10 +517,22 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
+    def record_admission_waits(self, waits: List[int]) -> Optional[float]:
+        """Feed first-admission waits (clock tokens) to gamma-Ada; returns the
+        updated gamma when it moved (the caller mirrors it into the eval log),
+        None on every other path. No-op unless boost + adaptive gamma."""
+        if self.adaptive_gamma is None:
+            return None
+        gamma = self.adaptive_gamma.record_admissions(waits)
+        if gamma is not None:
+            self.boost_gamma = gamma
+        return gamma
+
     def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
         policy = self._determine_active_policy(waiting_queue)
         return (
             isinstance(policy, CacheAwarePolicy)
+            or policy == CacheAgnosticPolicy.FCFS_MATCH
             or self.tree_cache.supports_fast_match_prefix()
         )
 
@@ -429,9 +559,16 @@ class SchedulePolicy:
             return policy_enum
         except ValueError:
             try:
-                return CacheAgnosticPolicy(policy)
+                agnostic_enum = CacheAgnosticPolicy(policy)
             except ValueError:
                 raise ValueError(f"Unknown schedule_policy: {policy=}")
+            if agnostic_enum == CacheAgnosticPolicy.FCFS_MATCH and tree_cache.disable:
+                logger.warning(
+                    "schedule_policy=fcfs-match requires prefix caching; "
+                    "falling back to fcfs"
+                )
+                return CacheAgnosticPolicy.FCFS
+            return agnostic_enum
 
     def _compute_prefix_matches(
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
@@ -949,7 +1086,7 @@ class PrefillAdder:
         radix COW headroom or locked-but-evictable bytes — that residual is
         backstopped by the fail-loud RuntimeError in `alloc_req_slots`. FIXME: if
         over-admission crashes under pressure, make this more conservative (e.g.
-        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`). """
+        multiply by `MAMBA_STATE_PER_REQ_PREFIX_CACHE`)."""
         if self._mamba_slot_cost and not req.kv.holds_mamba:
             return self._mamba_slot_cost
         return 0

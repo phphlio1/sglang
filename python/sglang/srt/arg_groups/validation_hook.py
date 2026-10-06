@@ -200,13 +200,18 @@ def check_server_args(server_args: Any):
     if cfg.schedule_policy == "boost":
         assert cfg.boost_gamma > 0, "boost_gamma must be > 0"
         assert cfg.boost_bin_size >= 1, "boost_bin_size must be >= 1"
+    if cfg.boost_adaptive_gamma:
+        assert cfg.schedule_policy == "boost", (
+            "--boost-adaptive-gamma requires --schedule-policy boost"
+        )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",
+            "fcfs-match",
             "lof",
             "boost",
         ], (
-            f"To use priority scheduling, schedule_policy must be 'fcfs', 'lof', or 'boost'. '{cfg.schedule_policy}' is not supported."
+            f"To use priority scheduling, schedule_policy must be 'fcfs', 'fcfs-match', 'lof', or 'boost'. '{cfg.schedule_policy}' is not supported."
         )
         if cfg.default_priority_value is None:
             logger.warning(

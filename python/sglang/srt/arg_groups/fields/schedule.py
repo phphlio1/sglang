@@ -87,6 +87,7 @@ class Schedule(msgspec.Struct):
                 "lpm",
                 "random",
                 "fcfs",
+                "fcfs-match",
                 "dfs-weight",
                 "lof",
                 "priority",
@@ -109,6 +110,12 @@ class Schedule(msgspec.Struct):
             help="Geometric bin size k for the boost schedule policy's work quantization; the max boost is b_gamma(k), so this bounds how far a newcomer may jump ahead. Power of two recommended.",
         ),
     ] = 256
+    boost_adaptive_gamma: A[
+        bool,
+        Arg(
+            help="Adapt boost_gamma online from the admission wait tail (gamma-Ada): gamma_hat = ln5/(w99-w95) over the last 2048 first-admission waits in clock tokens, EMA-smoothed (beta 0.2) and clipped to [3e-7, 1e-3]. Fatter tail -> smaller gamma (stronger locality bias); thinner tail -> larger gamma (more FCFS-like). Requires --schedule-policy boost; off by default.",
+        ),
+    ] = False
     log_schedule_eval_path: A[
         Optional[str],
         Arg(

@@ -46,6 +46,7 @@ POSITIONAL_FIELD_ORDER = (
     "schedule_policy",
     "boost_gamma",
     "boost_bin_size",
+    "boost_adaptive_gamma",
     "log_schedule_eval_path",
     "enable_priority_scheduling",
     "disable_priority_preemption",

@@ -1,17 +1,20 @@
 import math
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
+    AdaptiveBoostGamma,
     CacheAgnosticPolicy,
     CacheAwarePolicy,
     SchedulePolicy,
     gamma_boost,
     geometric_bin,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -496,6 +499,192 @@ class TestBoostSort(CustomTestCase):
                 schedule_low_priority_values_first=False,
             )
         self.assertIs(policy.policy, CacheAgnosticPolicy.FCFS)
+
+
+class TestFcfsMatch(CustomTestCase):
+    """fcfs-match: FCFS ordering with the sort-time prefix match forced on.
+
+    The arm exists because every current cache returns False from
+    supports_fast_match_prefix(), so plain fcfs never populates
+    num_matched_prefix_tokens and the eval log reports zero matched tokens
+    even though admission re-matches. The contract under test: identical
+    ordering to fcfs, with the match populated.
+    """
+
+    def _policy(self, name, tree_cache):
+        return SchedulePolicy(
+            policy=name,
+            tree_cache=tree_cache,
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def _cache_with_shared_prefix(self):
+        cache = RadixCache.create_simulated()
+        cache.insert(InsertParams(key=RadixKey(token_ids=array("q", list(range(64))))))
+        return cache
+
+    def test_populates_match_without_reordering(self):
+        # cold arrives first and shares nothing; warm arrives second and
+        # extends the cached 64-token prefix. FCFS order must keep cold first
+        # while warm's match becomes visible -- the exact ordering-vs-metric
+        # separation the arm exists to measure.
+        for name in ("fcfs", "fcfs-match"):
+            with self.subTest(policy=name):
+                cache = self._cache_with_shared_prefix()
+                cold = _make_req("cold", "x" * 80, [100 + i for i in range(80)])
+                warm = _make_req("warm", "y", list(range(64)) + [7, 8, 9])
+                queue = [cold, warm]
+                with patch(
+                    "sglang.srt.managers.schedule_policy.get_disagg",
+                    return_value=SimpleNamespace(disaggregation_mode="none"),
+                ):
+                    self._policy(name, cache).calc_priority(queue)
+
+                self.assertEqual([r.rid for r in queue], ["cold", "warm"])
+                self.assertEqual(cold.num_matched_prefix_tokens, 0)
+                expected = 64 if name == "fcfs-match" else 0
+                self.assertEqual(warm.num_matched_prefix_tokens, expected)
+
+    def test_falls_back_to_fcfs_without_prefix_cache(self):
+        # Same degradation contract as boost: no prefix cache, no match arm.
+        with self.assertLogs("sglang.srt.managers.schedule_policy", level="WARNING"):
+            policy = self._policy(
+                "fcfs-match", RadixCache.create_simulated(disable=True)
+            )
+        self.assertIs(policy.policy, CacheAgnosticPolicy.FCFS)
+
+
+class TestInBatchDedupStamping(CustomTestCase):
+    """calc_priority's in_batch_dedup_pending stamp, read at first admission
+    by stamp_admission_prefix_matches to exempt dedup followers in the
+    overtaking-invariant check. Per-sort last-write-wins, cleared off the
+    cache-aware path so a first-admission stamp never reads a stale verdict.
+    """
+
+    def test_cache_aware_sort_stamps_the_verdict(self):
+        policy = SchedulePolicy(
+            policy="boost",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        follower = _make_boost_req("follower", 256, arrival=0)
+        other = _make_boost_req("other", 4_096, arrival=10)
+        queue = [follower, other]
+        with patch.object(policy, "_compute_prefix_matches", return_value={"follower"}):
+            policy.calc_priority(queue)
+        self.assertIs(follower.in_batch_dedup_pending, True)
+        self.assertIs(other.in_batch_dedup_pending, False)
+
+    def test_agnostic_path_clears_stale_verdicts(self):
+        # Past the 128-queue fallback the active policy is FCFS and the sort
+        # does not classify dedup; a flag left from an earlier sort would
+        # exempt a non-follower from the invariant bound.
+        policy = SchedulePolicy(
+            policy="boost",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        queue = [_make_boost_req(f"r{i}", 256, arrival=0) for i in range(129)]
+        queue[0].in_batch_dedup_pending = True  # stale from an earlier sort
+        policy.calc_priority(queue)
+        self.assertFalse(any(r.in_batch_dedup_pending for r in queue))
+
+
+class TestAdaptiveBoostGamma(CustomTestCase):
+    # window/min_samples shrunk per instance so the estimator math stays
+    # testable without 2048 admissions; the formulas are window-agnostic.
+    LN5 = math.log(5.0)
+
+    def test_estimator_math_and_ema(self):
+        # waits = {0, 1000, ..., 99000}: linear-interpolated p95 = 94050,
+        # p99 = 98010, so tail width = 3960 and gamma_hat = ln5/3960. One
+        # update from gamma0 applies the 0.2 EMA weight to that estimate.
+        # Guards the percentile definition (nearest-rank would give 95000 /
+        # 98000 -> width 3000) and the beta placement (weighting the old
+        # value instead of the estimate changes the result).
+        adaptive = AdaptiveBoostGamma(gamma0=1e-4, window=128, min_samples=64)
+        waits = list(range(0, 100_000, 1000))
+        gamma = adaptive.record_admissions(waits)
+        expected = 0.8 * 1e-4 + 0.2 * (self.LN5 / 3960.0)
+        self.assertIsNotNone(gamma)
+        self.assertAlmostEqual(gamma, expected, delta=expected * 1e-12)
+        self.assertAlmostEqual(adaptive.gamma, expected, delta=expected * 1e-12)
+
+    def test_clip_bounds(self):
+        # Degenerate tails clip, never saturate past the bounds: an all-equal
+        # window (width 0) is the maximally thin tail -> GAMMA_MAX; a huge
+        # spread is the fat tail -> GAMMA_MIN. The floor 3e-7 is the task's
+        # corrected value (1e-5 would clip off the c16 equilibrium gamma).
+        thin = AdaptiveBoostGamma(gamma0=1e-4, window=16, min_samples=8)
+        for _ in range(200):
+            thin_gamma = thin.record_admissions([1000] * 16)
+        self.assertLessEqual(thin_gamma, AdaptiveBoostGamma.GAMMA_MAX)
+        self.assertGreater(thin_gamma, 9.9e-4)
+
+        fat = AdaptiveBoostGamma(gamma0=1e-4, window=16, min_samples=8)
+        for _ in range(200):
+            fat_gamma = fat.record_admissions([0] * 15 + [10**12])
+        self.assertGreaterEqual(fat_gamma, AdaptiveBoostGamma.GAMMA_MIN)
+        self.assertLess(fat_gamma, 3.05e-7)
+
+    def test_direction_load_step_burst(self):
+        # The corrected direction: a fat wait tail -> smaller gamma (stronger
+        # boosts, locality/LAS-ward); a thin tail after the load step ends ->
+        # gamma recovers (FCFS-ward). An inverted estimator goes red here.
+        adaptive = AdaptiveBoostGamma(gamma0=1e-4, window=16, min_samples=8)
+        for _ in range(40):
+            fat_gamma = adaptive.record_admissions([0] * 15 + [50_000_000])
+        self.assertLess(fat_gamma, 1e-6)
+        for _ in range(40):
+            thin_gamma = adaptive.record_admissions([1000] * 16)
+        self.assertGreater(thin_gamma, 5e-4)
+        self.assertLess(fat_gamma, 1e-4, "fat tail must push gamma below gamma0")
+        self.assertGreater(thin_gamma, fat_gamma, "recovery must raise gamma")
+
+    def test_warmup_returns_none_below_min_samples(self):
+        # Below min_samples percentiles are noise; the caller must be able to
+        # skip (no gamma move, no eval-log mutation) until the window fills.
+        adaptive = AdaptiveBoostGamma(gamma0=1e-4, window=16, min_samples=8)
+        self.assertIsNone(adaptive.record_admissions([5] * 7))
+        self.assertEqual(adaptive.gamma, 1e-4)
+        self.assertIsNotNone(adaptive.record_admissions([5]))
+
+    def test_schedule_policy_wiring(self):
+        # boost + flag -> the window feeds rebind the live sort's gamma;
+        # without the flag, or on another policy, gamma-Ada stays off (the
+        # fixed-gamma path must be bit-identical to before).
+        def make(policy="boost", **kw):
+            return SchedulePolicy(
+                policy=policy,
+                tree_cache=RadixCache.create_simulated(),
+                enable_hierarchical_cache=True,
+                enable_priority_scheduling=False,
+                schedule_low_priority_values_first=False,
+                boost_gamma=1e-4,
+                boost_bin_size=256,
+                **kw,
+            )
+
+        on = make(boost_adaptive_gamma=True)
+        self.assertIsNotNone(on.adaptive_gamma)
+        gamma = on.record_admission_waits(list(range(0, 70_000, 700)))
+        self.assertIsNotNone(gamma)
+        self.assertNotEqual(gamma, 1e-4)
+        self.assertEqual(on.boost_gamma, gamma)
+
+        off = make()
+        self.assertIsNone(off.adaptive_gamma)
+        self.assertIsNone(off.record_admission_waits(list(range(0, 70_000, 700))))
+        self.assertEqual(off.boost_gamma, 1e-4)
+
+        other = make(policy="fcfs", boost_adaptive_gamma=True)
+        self.assertIsNone(other.adaptive_gamma)
 
 
 if __name__ == "__main__":

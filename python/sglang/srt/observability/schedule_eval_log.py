@@ -35,11 +35,19 @@ def stamp_admission_prefix_matches(reqs: Iterable[Req]) -> None:
 
     First admission is stamp-once (a first-attempt hit rate; the client-side
     cache-read metric conflates re-processed hits after retraction); the last
-    admission is refreshed on every one.
+    admission is refreshed on every one. The device/host split and the
+    in-batch-dedup follower verdict freeze with the first admission too:
+    ``prefix_indices``/``host_hit_length`` at this point come from
+    ``init_next_round_input``'s re-match (policy-independent), so the split
+    shows the real reuse even under policies that leave
+    ``num_matched_prefix_tokens`` at zero.
     """
     for req in reqs:
         if req.matched_prefix_tokens_first_admission is None:
             req.matched_prefix_tokens_first_admission = req.num_matched_prefix_tokens
+            req.device_matched_prefix_tokens_first_admission = len(req.prefix_indices)
+            req.host_hit_prefix_tokens_first_admission = req.host_hit_length
+            req.in_batch_dedup_follower_first_admission = req.in_batch_dedup_pending
         req.matched_prefix_tokens_last_admission = req.num_matched_prefix_tokens
 
 
@@ -139,6 +147,15 @@ class ScheduleEvalLogger:
             ),
             "matched_prefix_tokens_last_admission": (
                 req.matched_prefix_tokens_last_admission
+            ),
+            "device_matched_prefix_tokens_first_admission": (
+                req.device_matched_prefix_tokens_first_admission
+            ),
+            "host_hit_prefix_tokens_first_admission": (
+                req.host_hit_prefix_tokens_first_admission
+            ),
+            "in_batch_dedup_follower_first_admission": (
+                req.in_batch_dedup_follower_first_admission
             ),
             "num_retractions": req.retraction_count,
             "boost_arrival_tokens": req.boost_arrival_tokens,

@@ -1427,6 +1427,17 @@ class Req(ReqDllmMixin):
         self.matched_prefix_tokens_first_admission: Optional[int] = None
         self.matched_prefix_tokens_last_admission: Optional[int] = None
 
+        # In-batch dedup classification from the most recent sort
+        # (_compute_prefix_matches): True while the request is a deprioritized
+        # follower. Last-write-wins per sort; the *_first_admission copy below
+        # freezes the verdict at first admission for the eval log.
+        self.in_batch_dedup_pending: bool = False
+        self.in_batch_dedup_follower_first_admission: Optional[bool] = None
+        # Device/host split of matched_prefix_tokens_first_admission: prefix
+        # tokens served from KV pages vs re-loaded from a host/hierarchical tier.
+        self.device_matched_prefix_tokens_first_admission: Optional[int] = None
+        self.host_hit_prefix_tokens_first_admission: Optional[int] = None
+
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(
             self.cache_request_handle,
