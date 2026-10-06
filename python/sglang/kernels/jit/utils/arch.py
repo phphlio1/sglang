@@ -134,6 +134,9 @@ def get_default_target_flags(arch: ArchInfo | None = None) -> List[str]:
             "-std=c++20",
             "-O3",
             "--expt-relaxed-constexpr",
+            # nvcc 13.4 (nvidia-cu13) vs CUDART 13.0 headers: CCCL rejects the
+            # minor-version mismatch. The define is the documented opt-out.
+            "-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK",
         ]
 
 
