@@ -100,9 +100,10 @@ Per-request (AIPerf `profile_export.jsonl`, records export level):
   `request_latency`; TPOT derived per request as `(E2E - TTFT) / (OSL - 1)`.
   ITL is deliberately not used as the primary decode metric.
 - **Jain fairness index on TTFT**, cold/warm TTFT split via
-  `usage_prompt_cache_read_tokens` (server-reported; requires
-  `--use-server-token-count --per-chunk-usage`, which enables SGLang's
-  continuous usage stats), Spearman cache/TTFT correlation.
+  `usage_prompt_cache_read_tokens` (needs the server flag
+  `--enable-cache-report`, in the pinned config since 2026-10-06, plus the
+  client's `--use-server-token-count --per-chunk-usage`), Spearman cache/TTFT
+  correlation.
 
 Aggregate (AIPerf `profile_export_aiperf.json`):
 
@@ -168,8 +169,8 @@ waiting-time CDF, normalized waiting time, generic SLO/goodput.
 itself: it starts `scripts/start_server.sh <policy>` (all pinned serving
 flags live there) and reuses a running server only when its full policy
 spec matches — `schedule_policy`, plus `boost_gamma`/`boost_bin_size` and
-the schedule-eval log path for boost, all read from `/server_info`;
-anything else is restarted first.
+the schedule-eval log path for boost, plus `enable_cache_report`, all read
+from `/server_info`; anything else is restarted first.
 
 ```bash
 scripts/run_e2.sh policy lpm 4        # one official point (repeat per conc)
@@ -193,7 +194,11 @@ SMOKE_POLICY=boost scripts/run_e2.sh smoke
 `scripts/run_boost_matrix.sh` ran the full matrix: {fcfs, lpm, boost} x
 {4, 8, 16} at gamma=1e-4 / k=256 (paper defaults), plus the gamma sweep
 {5e-5, 2e-4} at c8. Table: `python3 analysis/print_results_table.py
-results/agentx`.
+results/agentx`. These runs predate `--enable-cache-report` in the pinned
+config (added 2026-10-06, after the matrix): their client-side
+`usage_prompt_cache_read_tokens` is absent, and cache classification comes
+from the schedule-eval log; runs after the change are not config-identical
+to them.
 
 ```
 policy      c  gamma |    n   hit |  q_p95  q_p99 starv | cold_n c_strv warm_n w_strv  gap99 |   rpm   oTPM   ttft tpot95 retr

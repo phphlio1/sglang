@@ -72,13 +72,13 @@ export AIPERF_DATASET_CONFIGURATION_TIMEOUT AIPERF_SERVICE_PROFILE_CONFIGURE_TIM
 
 SCENARIO="inferencex-agentx-mvp"
 DATASET="semianalysis_cc_traces_weka_062126_256k"
-POLICIES=(fcfs lpm hrrn dfs-weight lof boost)
+POLICIES=(fcfs lpm hrrn dfs-weight boost)
 
 log()  { printf '[e2 %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die()  { printf '[e2 ERROR] %s\n' "$*" >&2; exit 2; }
 
 valid_policy() {
-  case "$1" in fcfs|lpm|hrrn|dfs-weight|lof|boost) return 0 ;; *) return 1 ;; esac
+  case "$1" in fcfs|lpm|hrrn|dfs-weight|boost) return 0 ;; *) return 1 ;; esac
 }
 
 # --- Server lifecycle --------------------------------------------------------

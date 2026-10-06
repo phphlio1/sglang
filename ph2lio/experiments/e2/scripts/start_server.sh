@@ -61,6 +61,11 @@ SERVER_FLAGS=(
   --reasoning-parser qwen3
   --tool-call-parser qwen3_coder
   --enable-metrics                    # Prometheus /metrics (E2 queue-time histogram)
+  # usage.prompt_tokens_details.cached_tokens per request: populates AIPerf's
+  # usage_prompt_cache_read_tokens. Added 2026-10-06 AFTER the seed-42 matrix;
+  # those 11 runs have no client-side cache metrics (eval-log classification
+  # covers them) and are not config-identical to runs after this change.
+  --enable-cache-report
 )
 # ==========================================================================
 
