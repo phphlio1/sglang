@@ -188,18 +188,78 @@ stamped not submission-valid; never used for comparison):
 SMOKE_POLICY=boost scripts/run_e2.sh smoke
 ```
 
+## Results (2026-10-06 matrix: seed 42, 1800 s, single GPU)
+
+`scripts/run_boost_matrix.sh` ran the full matrix: {fcfs, lpm, boost} x
+{4, 8, 16} at gamma=1e-4 / k=256 (paper defaults), plus the gamma sweep
+{5e-5, 2e-4} at c8. Table: `python3 analysis/print_results_table.py
+results/agentx`.
+
+```
+policy      c  gamma |    n   hit |  q_p95  q_p99 starv | cold_n c_strv warm_n w_strv  gap99 |   rpm   oTPM   ttft tpot95 retr
+fcfs        4      - |  214 0.000 |  0.005  2.850 0.000 |    218  0.000      0      -      - |   7.0   5165   1736   26.8    0
+fcfs        8      - |  139 0.000 |  0.005  2.805 0.000 |    145  0.000      0      -      - |   4.6   5826   2099   24.3    0
+fcfs       16      - |  151 0.000 | 97.833 178.143 0.549 |    167  0.509      0      -      - |   4.9   4697   32312   166.8  5
+lpm         4      - |  217 0.883 |  0.005  2.830 0.000 |     10  0.000    210  0.000  6.385 |   7.1   5371   1851   28.4    0
+lpm         8      - |  141 0.894 |  0.005  2.590 0.000 |     16  0.000    131  0.000 -2.041 |   4.6   5839   1987   24.1    0
+lpm        16      - |  201 0.803 | 73.929  94.750 0.380 |     34  0.265    185  0.378 -14.247|   6.6   5622   21468   98.6   6
+boost       4  1e-04 |  223 0.888 |  0.005  0.009 0.000 |     10  0.000    216  0.000 -0.004 |   7.3   5922   1798   27.5    0
+boost       8  1e-04 |  140 0.894 |  0.005  3.600 0.000 |     16  0.000    130  0.000 -3.093 |   4.6   5836   2170   22.2    0
+boost       8  2e-04 |  139 0.893 |  0.005  3.600 0.000 |     16  0.000    130  0.000 -3.091 |   4.5   5678   2278   21.5    0
+boost       8  5e-05 |  143 0.894 |  0.005  3.570 0.007 |     16  0.000    133  0.008 -3.090 |   4.7   5865   2230   24.3    0
+boost      16  1e-04 |  161 0.753 | 118.000 183.600 0.512 |    33  0.273    145  0.524 -21.509|   5.2   4868   26949  115.7   0
+```
+
+Calibration: R = fcfs total-token throughput = 6.9k (c4) / 6.7k (c8) / 7.8k
+(c16) tok/s; the boost starvation bound b_gamma(k)/R at k=256 is ~11.1 s
+(5e-5), ~4.7 s (1e-4), ~1.9 s (2e-4), ~0.5 s (5e-4).
+
+Findings:
+
+1. **Policy gates cache reuse on this deployment.** The hybrid
+   (linear-replay SSM) model's unified radix cache materializes cross-turn
+   prefix reuse only under cache-aware policies: lpm/boost run
+   `_compute_prefix_matches` on every waiting request at every sort, and
+   75-89% of requests admit with deep matches; fcfs skips that path
+   (`supports_fast_match_prefix()` is False for every cache implementation,
+   so the cache-agnostic branch in `calc_priority` never matches) and admits
+   with zero matched prefix tokens at every concurrency -- its server-log
+   `#cached-token` is chunk-continuation self-hits only. fcfs numbers here
+   measure "no effective prefix cache", not "FCFS with cache".
+2. **c4/c8: boost matches lpm** on every metric (hit ~0.89, zero starvation,
+   rpm/oTPM equal, TPOT p95 slightly better at c8). All spec guards pass.
+3. **c16 (~3x oversubscribed): boost at gamma=1e-4 lands near
+   fcfs-with-matching, not lpm**: starvation 0.512 (fcfs 0.549, lpm 0.380),
+   queue p99 183.6 s (fcfs 178.1, lpm 94.8), hit 0.753 (lpm 0.803), oTPM
+   -13% vs lpm, TPOT p95 +17% -- the hit-rate/throughput/TPOT guards fail
+   against lpm at c16. The calibration explains it: the gamma=1e-4 bound
+   (4.7 s) is negligible against 95-184 s queue depths, so boost cannot
+   realize the warm-first ordering that materializes reuse and degenerates
+   to FCFS-with-matching; the cold admissions then dilute the hit rate
+   (0.803 -> 0.753) and throughput settles near fcfs. The anti-starvation
+   property itself holds -- the cold class is not sacrificed (cold-class
+   starvation 0.273 vs lpm's 0.265); the warm class pays for the throughput
+   loss (0.524 vs 0.378).
+4. **The gamma sweep shows no measurable difference at c8**: all three
+   bounds (1.9-11.1 s) sit at or above the c8 queue p99 (~3.6 s), so the
+   dial does not bind there.
+5. **Cold/warm class gaps are small and arrival-phase-confounded**: gap99 is
+   negative (warm p99 > cold p99) under both lpm and boost at c8/c16 -- the
+   warm class is the majority and carries the deep-queue tail; the E1
+   cold-class starvation story does not reproduce on this workload, where
+   structural saturation dominates class ordering.
+
+Follow-ups the matrix motivates: a c16 arm with gamma below the sweep grid
+(gamma ~1e-5 gives a ~76 s bound, comparable to lpm's c16 queue p99 ~95 s;
+larger k only shrinks the bound since b_gamma(k) decreases in k); repeat
+seeds {43, 44} for the lpm-vs-boost c16 pair; hrrn at c8.
+
 ## Next steps after the sweep
 
-1. Core matrix {lpm, fcfs, boost} x concurrencies {4, 8, 16}, 1800 s each,
-   seed 42 (add hrrn at concurrency 8 if budget allows); optional repeat
-   seeds {42, 43, 44} for the headline lpm-vs-boost pair.
-2. Gamma sweep {5e-5, 1e-4, 2e-4} at k=256, concurrency ~8; calibrate the
-   starvation bound first from an fcfs run (R = sustained prefill tok/s;
-   bound ~ b_gamma(k)/R).
-3. Compute `e2_metrics.json` per run; compare starvation rate, queue-time
-   P99, cold/warm queue-wait gap + per-class starvation rate + slope, and
-   cold-class TTFT P99/max across policies at matched concurrency.
-   Guards: cache hit rate loss <= ~2 pts vs lpm; RPM / output-token
-   throughput within +/-5%; TPOT P95 within +10%.
-4. Check server logs for LPM/HRRN/BOOST -> FCFS fallback events
-   (queue > 128).
+1. Compute `e2_metrics.json` per run (`analysis/agentx_metrics.py`, run
+   automatically by `run_e2.sh`) and compare with
+   `analysis/print_results_table.py results/agentx`.
+2. Check server logs for LPM/HRRN/BOOST -> FCFS fallback events
+   (queue > 128); the waiting-queue-length gauge in
+   `queue_wait_per_request` answers this per run (max <= 8 across the
+   2026-10-06 matrix -- the fallback never triggered).
