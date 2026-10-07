@@ -51,7 +51,7 @@ TOKENIZER="${TOKENIZER:-${MODEL}}"
 CONCURRENCY="${CONCURRENCY:-4}"           # session-tree concurrency (default point)
 DURATION="${DURATION:-1800}"              # s; scenario minimum is 900
 SEED="${SEED:-42}"
-OUTPUT_DIR="${OUTPUT_DIR:-${E2_DIR}/results/agentx}"
+OUTPUT_DIR="${OUTPUT_DIR:-${E2_DIR}/results/1x-rtx6000pro/agentx}"
 SERVER_SCRIPT="${SERVER_SCRIPT:-${E2_DIR}/scripts/start_server.sh}"
 METRICS_SCRIPT="${METRICS_SCRIPT:-${E2_DIR}/analysis/agentx_metrics.py}"
 AIPERF="${AIPERF:-${E2_DIR}/.venv/bin/aiperf}"
@@ -61,13 +61,24 @@ SMOKE_DURATION="${SMOKE_DURATION:-300}"     # s; below scenario min -> --unsafe-
 NUM_ENTRIES="${NUM_ENTRIES:-16}"            # dataset subset, smoke only
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"    # s; model load + first-run JIT can be slow
 STOP_SERVER="${STOP_SERVER:-auto}"          # auto | always | never
-# Boost arm hyperparameters (paper defaults; larger gamma = more FCFS-like).
-BOOST_GAMMA="${BOOST_GAMMA:-1e-4}"
+# Boost arm hyperparameters (larger gamma = more FCFS-like). BOOST_GAMMA empty
+# = the server's clock-mode default (1e-4 tokens / 0.1 1/s wall).
+BOOST_GAMMA="${BOOST_GAMMA:-}"
 BOOST_BIN_SIZE="${BOOST_BIN_SIZE:-256}"
 # gamma-Ada arm (Task 8): 1 = server adapts boost_gamma online from the
-# admission wait tail (gamma0 = BOOST_GAMMA); arms log to a distinct eval
-# file and run label so they never mix with static-gamma cells.
+# admission wait tail (gamma0 = BOOST_GAMMA or the clock-mode default); arms
+# log to a distinct eval file and run label so they never mix with
+# static-gamma cells.
 BOOST_ADAPTIVE_GAMMA="${BOOST_ADAPTIVE_GAMMA:-0}"
+# Boost clock (wall-clock fix): wall (default) pins the effective gamma and
+# the adaptive fixed point independent of cache state; tokens is the
+# paper-exact counted-token clock (the pre-fix behavior).
+BOOST_CLOCK="${BOOST_CLOCK:-wall}"
+# In-batch dedup follower-pin hold bound (seconds), every cache-aware policy.
+IN_BATCH_PREFIX_CACHING_MAX_PIN_S="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S:-60}"
+# Exported so start_server.sh sees the resolved values (not just inherited
+# ones), keeping the two scripts' defaults from drifting apart.
+export BOOST_GAMMA BOOST_BIN_SIZE BOOST_ADAPTIVE_GAMMA BOOST_CLOCK IN_BATCH_PREFIX_CACHING_MAX_PIN_S
 # Dataset subsetting for policy mode (Task-4 targeted regime): empty = the
 # full dataset (official matrix points); N = first N entries in scan order
 # (same subset for every policy/seed, so arms stay comparable).
@@ -86,7 +97,7 @@ export AIPERF_DATASET_CONFIGURATION_TIMEOUT AIPERF_SERVICE_PROFILE_CONFIGURE_TIM
 
 SCENARIO="inferencex-agentx-mvp"
 DATASET="semianalysis_cc_traces_weka_062126_256k"
-POLICIES=(fcfs fcfs-match lpm hrrn dfs-weight boost)
+POLICIES=(fcfs-match lpm hrrn dfs-weight boost)
 
 log()  { printf '[e2 %s] %s\n' "$(date +%H:%M:%S)" "$*"; }
 die()  { printf '[e2 ERROR] %s\n' "$*" >&2; exit 2; }
@@ -110,13 +121,14 @@ server_policy() {
 }
 
 # The schedule-eval log path a run of this policy expects: stable per
-# (policy, gamma, k) so a reused server keeps appending to one file, which
-# the per-run line offset then slices.
+# (policy, clock, gamma, k) so a reused server keeps appending to one file,
+# which the per-run line offset then slices. The clock is part of the name:
+# a gamma value means different things under tokens vs wall.
 requested_eval_path() {  # $1 = policy
   if [[ "$1" == "boost" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
-    printf '%s/schedule_eval_ada_k%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_BIN_SIZE}"
+    printf '%s/schedule_eval_ada_%s_k%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}"
   elif [[ "$1" == "boost" ]]; then
-    printf '%s/schedule_eval_g%s_k%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}"
+    printf '%s/schedule_eval_%s_g%s_k%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_CLOCK}" "${BOOST_GAMMA:-def}" "${BOOST_BIN_SIZE}"
   else
     printf '%s/%s/schedule_eval.jsonl' "${OUTPUT_DIR}" "$1"
   fi
@@ -125,24 +137,28 @@ requested_eval_path() {  # $1 = policy
 policy_params_match() {  # $1 = policy; 0 when the running server's full spec matches
   local info
   info="$(server_info_json)" || return 1
-  python3 - "$1" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}" "$(requested_eval_path "$1")" "${info}" <<'PY'
+  python3 - "$1" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}" "${BOOST_CLOCK}" "$(requested_eval_path "$1")" "${info}" <<'PY'
 import json, sys
 
-policy, gamma_s, k_s, want_path, info_s = sys.argv[1:6]
+policy, gamma_s, k_s, clock, want_path, info_s = sys.argv[1:7]
 srv = json.loads(info_s)
 ok = (
     srv.get("schedule_policy") == policy
     and (srv.get("log_schedule_eval_path") or "") == want_path
 )
 if policy == "boost":
-    # Two boost runs with different (gamma, k) must not silently reuse the
-    # first server: gamma/k are part of the reuse key.
+    # Two boost runs with different (clock, gamma, k) must not silently reuse
+    # the first server: the triple is the reuse key; an empty gamma arg means
+    # the clock-mode default (1e-4 tokens / 0.1 1/s wall).
+    default_gamma = 0.1 if clock == "wall" else 1e-4
+    want_gamma = float(gamma_s) if gamma_s else default_gamma
     ok = (
         ok
         and srv.get("boost_gamma") is not None
-        and float(srv["boost_gamma"]) == float(gamma_s)
+        and float(srv["boost_gamma"]) == want_gamma
         and srv.get("boost_bin_size") is not None
         and int(srv["boost_bin_size"]) == int(k_s)
+        and srv.get("boost_clock") == clock
     )
 sys.exit(0 if ok else 1)
 PY
@@ -300,11 +316,23 @@ meta = {
     "dataset": "semianalysis_cc_traces_weka_062126_256k (semianalysisai/cc-traces-weka-062126-256k, 256K-capped)",
     "command": sys.argv[8],
     # Boost arm knobs (from env; ensure_server verified them against /server_info).
-    "boost_gamma": float(__import__("os").environ.get("BOOST_GAMMA", "1e-4")),
+    # boost_gamma null = the clock-mode default (1e-4 tokens / 0.1 1/s wall).
+    "boost_gamma": (
+        float(__import__("os").environ["BOOST_GAMMA"])
+        if __import__("os").environ.get("BOOST_GAMMA")
+        else None
+    ),
     "boost_bin_size": int(__import__("os").environ.get("BOOST_BIN_SIZE", "256")),
     # gamma-Ada arm: true = boost_gamma above is the initial gamma (gamma0)
     # and the server adapts it online from the admission wait tail.
     "boost_adaptive_gamma": __import__("os").environ.get("BOOST_ADAPTIVE_GAMMA", "0") == "1",
+    # Boost clock: 'wall' (arrival in seconds, cache-state-pinned gamma) or
+    # 'tokens' (paper-exact counted-token clock, the pre-fix behavior).
+    "boost_clock": __import__("os").environ.get("BOOST_CLOCK", "wall"),
+    # In-batch dedup follower-pin hold bound (seconds); 0 = unbounded (pre-fix).
+    "in_batch_prefix_caching_max_pin_s": float(
+        __import__("os").environ.get("IN_BATCH_PREFIX_CACHING_MAX_PIN_S", "60")
+    ),
     # Dataset subsetting: null = full dataset (official matrix point); N = the
     # first N entries in scan order (targeted-regime runs; same subset across
     # arms since the mmap cache is keyed by seed only).
@@ -363,11 +391,11 @@ mode_smoke() {
   echo "=== SMOKE DONE: ${run_dir} (submission_valid=false; do NOT use for comparison) ==="
 }
 
-run_label() {  # $1 = policy, $2 = concurrency; boost arms carry gamma/k
+run_label() {  # $1 = policy, $2 = concurrency; boost arms carry clock/gamma/k
   if [[ "$1" == "boost" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
-    printf 'c%s_gada_k%s' "$2" "${BOOST_BIN_SIZE}"
+    printf 'c%s_gada_%s_k%s' "$2" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}"
   elif [[ "$1" == "boost" ]]; then
-    printf 'c%s_g%s_k%s' "$2" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}"
+    printf 'c%s_g%s_%s_k%s' "$2" "${BOOST_GAMMA:-def}" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}"
   else
     printf 'c%s' "$2"
   fi

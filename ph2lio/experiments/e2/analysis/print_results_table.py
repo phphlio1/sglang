@@ -35,6 +35,18 @@ EM = "—"  # em dash: no value / not applicable
 MINUS = "−"  # minus sign, matches the doc tables
 
 
+# The harness records boost_gamma null when the flag was left to the
+# clock-mode default (1e-4 tokens / 0.1 1/s wall); float(None) would crash.
+CLOCK_DEFAULT_GAMMA = {"tokens": 1e-4, "wall": 0.1}
+
+
+def boost_gamma_resolved(meta: dict) -> float:
+    gamma = meta["boost_gamma"]
+    if gamma is not None:
+        return float(gamma)
+    return CLOCK_DEFAULT_GAMMA.get(meta.get("boost_clock", "tokens"), 1e-4)
+
+
 def load_cells(results_root: Path) -> dict[tuple, list[dict]]:
     """(policy, conc, gamma, k) -> [(meta, metrics), ...] per run dir.
 
@@ -52,7 +64,7 @@ def load_cells(results_root: Path) -> dict[tuple, list[dict]]:
         policy = meta["policy"]
         conc = int(meta["concurrency"])
         gamma, k = (
-            (float(meta["boost_gamma"]), int(meta["boost_bin_size"]))
+            (boost_gamma_resolved(meta), int(meta["boost_bin_size"]))
             if policy == "boost"
             else (None, None)
         )
@@ -488,7 +500,10 @@ def main() -> None:
         "results_root",
         type=Path,
         nargs="?",
-        default=Path(__file__).resolve().parent.parent / "results" / "agentx",
+        default=Path(__file__).resolve().parent.parent
+        / "results"
+        / "1x-rtx6000pro"
+        / "agentx",
     )
     parser.add_argument("--flat", action="store_true", help="round-1 flat table")
     parser.add_argument(

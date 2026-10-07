@@ -11,17 +11,20 @@
 #   scripts/start_server.sh <policy>     # policy in: fcfs fcfs-match lpm hrrn dfs-weight lof boost
 #   scripts/start_server.sh --stop
 #
-# Boost-policy knobs (env): BOOST_GAMMA (default 1e-4), BOOST_BIN_SIZE
-# (default 256). LOG_SCHEDULE_EVAL_PATH (absolute .jsonl, default off)
-# enables the per-request schedule-eval log; the file is reset on every
-# server boot.
+# Boost-policy knobs (env): BOOST_GAMMA (default: unset -> clock-mode default,
+# 1e-4 tokens / 0.1 1/s wall), BOOST_BIN_SIZE (default 256), BOOST_CLOCK
+# (default wall; the fixed wall-clock boost), BOOST_ADAPTIVE_GAMMA (gamma-Ada).
+# IN_BATCH_PREFIX_CACHING_MAX_PIN_S (default 60) bounds the in-batch dedup
+# follower pin for every cache-aware policy. LOG_SCHEDULE_EVAL_PATH (absolute
+# .jsonl, default off) enables the per-request schedule-eval log; the file is
+# reset on every server boot.
 #
-# Log: results/agentx/<policy>/server_<timestamp>.log
+# Log: results/1x-rtx6000pro/agentx/<policy>/server_<timestamp>.log
 
 set -euo pipefail
 
 E2_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESULTS_ROOT="${E2_DIR}/results/agentx"
+RESULTS_ROOT="${E2_DIR}/results/1x-rtx6000pro/agentx"
 
 # ===== User-editable serving configuration (E2, set 2026-10-05) =============
 # User-specified config; POLICY is passed as $1 so SERVER_FLAGS excludes it.
@@ -37,12 +40,21 @@ MODEL="Qwen/Qwen3.8-27B-FP8"
 PORT=30000
 HOST="0.0.0.0"
 
-# Boost-policy hyperparameters (paper defaults; larger gamma = more FCFS-like).
-BOOST_GAMMA="${BOOST_GAMMA:-1e-4}"
+# Boost-policy hyperparameters (larger gamma = more FCFS-like). BOOST_GAMMA
+# empty = the server's clock-mode default (1e-4 tokens / 0.1 1/s wall).
+BOOST_GAMMA="${BOOST_GAMMA:-}"
 BOOST_BIN_SIZE="${BOOST_BIN_SIZE:-256}"
 # gamma-Ada (Task 8): 1 = adapt boost_gamma online from the admission wait
-# tail (gamma0 = BOOST_GAMMA); off by default, static-gamma path untouched.
+# tail (gamma0 = BOOST_GAMMA or the clock-mode default); off by default,
+# static-gamma path untouched.
 BOOST_ADAPTIVE_GAMMA="${BOOST_ADAPTIVE_GAMMA:-0}"
+# Boost clock: wall (default) stamps arrival in seconds and pins the
+# effective gamma / adaptive fixed point independent of cache state;
+# tokens is the paper-exact counted-token clock.
+BOOST_CLOCK="${BOOST_CLOCK:-wall}"
+# In-batch dedup follower-pin hold bound (seconds), shared by every
+# cache-aware policy; 0 disables (pre-fix unbounded behavior).
+IN_BATCH_PREFIX_CACHING_MAX_PIN_S="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S:-60}"
 LOG_SCHEDULE_EVAL_PATH="${LOG_SCHEDULE_EVAL_PATH:-}"
 
 SERVER_FLAGS=(
@@ -88,9 +100,12 @@ esac
 # is untouched).
 POLICY_FLAGS=()
 if [[ "${POLICY}" == "boost" ]]; then
-  POLICY_FLAGS+=(--boost-gamma "${BOOST_GAMMA}" --boost-bin-size "${BOOST_BIN_SIZE}")
+  [[ -n "${BOOST_GAMMA}" ]] && POLICY_FLAGS+=(--boost-gamma "${BOOST_GAMMA}")
+  POLICY_FLAGS+=(--boost-bin-size "${BOOST_BIN_SIZE}" --boost-clock "${BOOST_CLOCK}")
   [[ "${BOOST_ADAPTIVE_GAMMA}" == "1" ]] && POLICY_FLAGS+=(--boost-adaptive-gamma)
 fi
+# Follower-pin hold bound: applies to every cache-aware policy.
+POLICY_FLAGS+=(--in-batch-prefix-caching-max-pin-s "${IN_BATCH_PREFIX_CACHING_MAX_PIN_S}")
 if [[ -n "${LOG_SCHEDULE_EVAL_PATH}" ]]; then
   POLICY_FLAGS+=(--log-schedule-eval-path "${LOG_SCHEDULE_EVAL_PATH}")
 fi
@@ -111,8 +126,9 @@ export FLASHINFER_EXTRA_CUDAFLAGS="-DCCCL_DISABLE_CTK_COMPATIBILITY_CHECK"
 
 echo "Starting SGLang server  model=${MODEL}  policy=${POLICY}  port=${PORT}"
 if [[ "${POLICY}" == "boost" ]]; then
-  echo "boost: gamma=${BOOST_GAMMA}  bin_size=${BOOST_BIN_SIZE}  adaptive=${BOOST_ADAPTIVE_GAMMA}"
+  echo "boost: gamma=${BOOST_GAMMA:-<clock default>}  bin_size=${BOOST_BIN_SIZE}  clock=${BOOST_CLOCK}  adaptive=${BOOST_ADAPTIVE_GAMMA}"
 fi
+echo "in-batch dedup pin bound: ${IN_BATCH_PREFIX_CACHING_MAX_PIN_S}s"
 if [[ -n "${LOG_SCHEDULE_EVAL_PATH}" ]]; then
   echo "schedule-eval log: ${LOG_SCHEDULE_EVAL_PATH} (reset on boot)"
   rm -f "${LOG_SCHEDULE_EVAL_PATH}"
