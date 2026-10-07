@@ -65,11 +65,13 @@ class ScheduleEvalLogger:
         policy: str,
         boost_gamma: float,
         boost_bin_size: int,
+        boost_clock: str,
     ) -> None:
         self.path = path
         self.policy = policy
         self.boost_gamma = boost_gamma
         self.boost_bin_size = boost_bin_size
+        self.boost_clock = boost_clock
         self._seen_rids: Set[str] = set()
         self._file: Optional[TextIO] = None
         try:
@@ -135,6 +137,8 @@ class ScheduleEvalLogger:
             "rid": req.rid,
             "policy": self.policy,
             "gamma": self.boost_gamma,
+            # A gamma value alone is unit-ambiguous across clock modes.
+            "boost_clock": self.boost_clock,
             "bin_size": self.boost_bin_size,
             "arrival_wall_s": arrival_wall_s,
             "queue_wait_s": queue_wait_s,

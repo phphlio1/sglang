@@ -4086,6 +4086,22 @@ class TestBoostPolicyArgs(CustomTestCase):
         self._checked(schedule_policy="boost")
         self._checked(schedule_policy="lpm", boost_gamma=0.0)
 
+    def test_boost_gamma_none_resolves_per_clock(self):
+        # Unset gamma takes the clock-mode default (tokens 1e-4, wall 0.1 1/s);
+        # an explicit gamma survives resolution untouched.
+        args = self._checked(schedule_policy="boost")
+        self.assertEqual(resolution_result(args, "boost_gamma"), 1e-4)
+        args = self._checked(schedule_policy="boost", boost_clock="wall")
+        self.assertEqual(resolution_result(args, "boost_gamma"), 0.1)
+        args = self._checked(schedule_policy="boost", boost_clock="wall", boost_gamma=0.05)
+        self.assertEqual(resolution_result(args, "boost_gamma"), 0.05)
+
+    def test_boost_clock_wall_requires_boost(self):
+        with self.assertRaisesRegex(
+            AssertionError, "--boost-clock wall requires --schedule-policy boost"
+        ):
+            self._checked(schedule_policy="lpm", boost_clock="wall")
+
 
 if __name__ == "__main__":
     unittest.main()

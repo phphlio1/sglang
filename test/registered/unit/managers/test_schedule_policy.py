@@ -1,4 +1,5 @@
 import math
+import time
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -7,14 +8,17 @@ from unittest.mock import patch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import (
     AdaptiveBoostGamma,
+    BoostClock,
     CacheAgnosticPolicy,
     CacheAwarePolicy,
     SchedulePolicy,
+    TokenClockRate,
     gamma_boost,
     geometric_bin,
 )
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.observability.schedule_eval_log import stamp_admission_prefix_matches
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -41,6 +45,16 @@ def _make_boost_req(rid, uncached, *, arrival, cached=0, output=0):
     if output:
         req.output_ids.extend([0] * output)
     req.boost_arrival_tokens = arrival
+    return req
+
+
+def _make_wall_req(rid, uncached, *, entry_s, cached=0, output=0):
+    """Wall-clock twin of _make_boost_req: first_queue_entry_time in seconds."""
+    req = _make_req(rid, "", list(range(uncached + cached)))
+    req.num_matched_prefix_tokens = cached
+    if output:
+        req.output_ids.extend([0] * output)
+    req.first_queue_entry_time = entry_s
     return req
 
 
@@ -501,14 +515,183 @@ class TestBoostSort(CustomTestCase):
         self.assertIs(policy.policy, CacheAgnosticPolicy.FCFS)
 
 
+class TestTokenClockRate(CustomTestCase):
+    """TokenClockRate: the wall-mode work-to-seconds converter."""
+
+    def test_first_pair_is_baseline_no_ema(self):
+        # The first observe only stores baselines: no interval has elapsed,
+        # so there is no sample. The first positive-delta interval assigns
+        # its exact ratio (no EMA blend from an undefined prior).
+        rate = TokenClockRate()
+        self.assertIsNone(rate.observe(0, 0.0))
+        self.assertIsNone(rate.tokens_per_s)
+        self.assertEqual(rate.observe(30_000, 1.0), 30_000.0)
+
+    def test_zero_delta_folds_time_not_a_sample(self):
+        # An idle or decode-only stretch (no counted tokens) must not pollute
+        # the EMA, and must not advance the time baseline either: the next
+        # positive sample's window spans the gap, so the rate stays
+        # load-inclusive (the quantity measured as ~3.3-6k tok/s fresh vs
+        # ~36.7k warm).
+        rate = TokenClockRate()
+        rate.observe(0, 0.0)
+        self.assertIsNone(rate.observe(0, 10.0))
+        self.assertAlmostEqual(rate.observe(100, 11.0), 100.0 / 11.0)
+
+    def test_ema_tracks_rate_step(self):
+        # The fresh->warm rate step must actually move the estimate: a frozen
+        # or mis-blended EMA would pin the wall bound to the boot-time rate
+        # forever, recreating the cache-state drift in wall units.
+        rate = TokenClockRate()
+        rate.observe(0, 0.0)
+        tokens, now = 0, 0.0
+        for _ in range(200):
+            tokens, now = tokens + 5_000, now + 1.0
+            rate.observe(tokens, now)
+        self.assertAlmostEqual(rate.tokens_per_s, 5_000.0, delta=1.0)
+        for _ in range(200):
+            tokens, now = tokens + 36_700, now + 1.0
+            rate.observe(tokens, now)
+        self.assertGreater(rate.tokens_per_s, 30_000.0)
+        self.assertLess(rate.tokens_per_s, 36_700.0)
+
+    def test_nonpositive_delta_ignored(self):
+        # A counter regression (e.g. a caller omitting processed_tokens,
+        # defaulting to 0) must neither crash nor sample a negative rate.
+        rate = TokenClockRate()
+        rate.observe(30_000, 0.0)
+        self.assertIsNone(rate.observe(0, 1.0))
+        self.assertIsNone(rate.observe(30_000, 2.0))
+        self.assertAlmostEqual(rate.observe(40_000, 3.0), 10_000.0 / 3.0)
+
+
+class TestBoostWallSort(CustomTestCase):
+    """_sort_by_boost wall mode: phi = A_s - b(q(u)/R, gamma_s), seconds.
+
+    Properties derived from the formula: the unmeasured-rate fallback, the
+    starvation bound in seconds, and the cross-mode identity
+    phi_wall = phi_tokens / R at gamma_s = gamma_t * R (wall mode is tokens
+    mode retuned per cache state).
+    """
+
+    def sort_rids(self, reqs, gamma_s, rate, bin_size=256, deprioritized=frozenset()):
+        queue = list(reqs)
+        SchedulePolicy._sort_by_boost(
+            queue,
+            set(deprioritized),
+            gamma_s,
+            bin_size,
+            clock=BoostClock.WALL,
+            rate_tokens_per_s=rate,
+        )
+        return [r.rid for r in queue]
+
+    def test_unmeasured_rate_is_pure_arrival_order(self):
+        # No rate yet (first prefill batch not run): the defined fallback is
+        # boost 0, so ordering is entry time alone -- in tokens mode the same
+        # reqs reorder by work (test_locality_hot_jumps_ahead_of_older_cold).
+        reqs = [
+            _make_wall_req("new_short", 256, entry_s=900.0),
+            _make_wall_req("old_huge", 250_000, entry_s=100.0),
+            _make_wall_req("mid", 5_000, entry_s=500.0),
+        ]
+        self.assertEqual(
+            self.sort_rids(reqs, gamma_s=0.1, rate=None),
+            ["old_huge", "mid", "new_short"],
+        )
+
+    def test_wall_starvation_bound_in_seconds(self):
+        for gamma_s in (0.02, 0.1, 0.5):
+            for u_cold in (100_000, 250_000):
+                with self.subTest(gamma_s=gamma_s, u_cold=u_cold):
+                    k, rate = 256, 36_700.0
+                    bound_s = gamma_boost(k / rate, gamma_s) - gamma_boost(
+                        geometric_bin(u_cold, k) / rate, gamma_s
+                    )
+                    self.assertGreater(bound_s, 0)
+                    lags = [
+                        bound_s * 0.5,
+                        bound_s * 0.9,
+                        bound_s * 1.1,
+                        bound_s * 2.0,
+                        bound_s * 10.0,
+                    ]
+                    reqs = [_make_wall_req("cold", u_cold, entry_s=0.0)]
+                    reqs += [
+                        _make_wall_req(f"hot{lag:.3f}", 256, entry_s=lag)
+                        for lag in lags
+                    ]
+                    order = self.sort_rids(reqs, gamma_s=gamma_s, rate=rate)
+                    cold_at = order.index("cold")
+                    ahead = [f"hot{lag:.3f}" for lag in lags if lag < bound_s]
+                    behind = [f"hot{lag:.3f}" for lag in lags if lag > bound_s]
+                    self.assertEqual(order[:cold_at], ahead)
+                    self.assertEqual(order[cold_at + 1 :], behind)
+
+    def test_wall_equivalent_to_tokens_at_scaled_gamma(self):
+        # b and the arrival axis both scale by 1/R at gamma_s = gamma_t * R,
+        # so the two clock modes must order the same reqs identically; a
+        # tokens-unit leak into the wall branch (or vice versa) breaks it.
+        rate, gamma_t = 36_700.0, 1e-4
+        spec = [
+            ("cold", 100_000, 0.0),
+            ("hot1", 256, 0.0005),
+            ("hot2", 256, 0.001),
+            ("mid", 5_000, 0.002),
+        ]
+        wall_order = self.sort_rids(
+            [_make_wall_req(rid, u, entry_s=e) for rid, u, e in spec],
+            gamma_s=gamma_t * rate,
+            rate=rate,
+        )
+        queue = [_make_boost_req(rid, u, arrival=int(e * rate)) for rid, u, e in spec]
+        SchedulePolicy._sort_by_boost(queue, set(), gamma_t, 256)
+        self.assertEqual(wall_order, [r.rid for r in queue])
+        # The shared order is genuinely boost-driven, not arrival-ordered.
+        self.assertEqual(wall_order, ["hot1", "hot2", "mid", "cold"])
+
+    def test_calc_priority_measures_rate_from_processed_tokens(self):
+        policy = SchedulePolicy(
+            policy="boost",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            boost_gamma=0.01,
+            boost_clock="wall",
+        )
+        cold = _make_wall_req("cold", 100_000, entry_s=0.0)
+        hot = _make_wall_req("hot", 256, entry_s=100.0)
+        queue = [cold, hot]
+        with (
+            patch.object(policy, "_compute_prefix_matches", return_value=set()),
+            patch(
+                "sglang.srt.managers.schedule_policy.time.perf_counter",
+                side_effect=[0.0, 1.0, 2.0],
+            ),
+        ):
+            policy.calc_priority(queue, processed_tokens=0)
+            # Unmeasured rate: pure arrival order (cold entered first).
+            self.assertEqual([r.rid for r in queue], ["cold", "hot"])
+            policy.calc_priority(queue, processed_tokens=30_000)
+            self.assertEqual(policy.prefill_token_rate.tokens_per_s, 30_000.0)
+            # Unchanged counter: no new sample, rate survives.
+            policy.calc_priority(queue, processed_tokens=30_000)
+            self.assertEqual(policy.prefill_token_rate.tokens_per_s, 30_000.0)
+        # Measured 30k tok/s, gamma_s=0.01: hot's boost is ~937 s against a
+        # 100 s arrival lag, so hot now leads.
+        self.assertEqual([r.rid for r in queue], ["hot", "cold"])
+
+
 class TestFcfsMatch(CustomTestCase):
     """fcfs-match: FCFS ordering with the sort-time prefix match forced on.
 
-    The arm exists because every current cache returns False from
-    supports_fast_match_prefix(), so plain fcfs never populates
-    num_matched_prefix_tokens and the eval log reports zero matched tokens
-    even though admission re-matches. The contract under test: identical
-    ordering to fcfs, with the match populated.
+    The arm predates the admission-time bookkeeping fix: it forced the
+    sort-time match because plain fcfs never populated
+    num_matched_prefix_tokens. Since init_next_round_input now records the
+    admission re-match, plain fcfs reports real reuse too; fcfs-match stays
+    as the sort-time-match reference arm. The contract under test: identical
+    ordering to fcfs, with the sort-time match populated.
     """
 
     def _policy(self, name, tree_cache):
@@ -554,6 +737,100 @@ class TestFcfsMatch(CustomTestCase):
                 "fcfs-match", RadixCache.create_simulated(disable=True)
             )
         self.assertIs(policy.policy, CacheAgnosticPolicy.FCFS)
+
+    def test_admission_rematch_records_match_length(self):
+        # The fcfs hit-metric bug: init_next_round_input's admission re-match
+        # never recorded its length, so plain fcfs (no sort-time match)
+        # reported zero matched tokens in the eval log while enjoying real
+        # reuse -- every fcfs cache-hit row in the campaign tables read
+        # 0.000. The re-match is read-only (inserts nothing); fcfs ordering
+        # never reads num_matched_prefix_tokens, so order is unaffected.
+        warm = _make_req("warm", "y", list(range(64)) + [7, 8, 9])
+        warm.init_next_round_input(self._cache_with_shared_prefix())
+        self.assertEqual(warm.num_matched_prefix_tokens, 64)
+        stamp_admission_prefix_matches([warm])
+        self.assertEqual(warm.matched_prefix_tokens_first_admission, 64)
+
+
+class TestInBatchPrefixCaching(CustomTestCase):
+    """_compute_prefix_matches classification: the in-batch dedup follower pin
+    shared by every cache-aware policy, and its wall-second hold bound
+    (--in-batch-prefix-caching-max-pin-s). The pin had no direct coverage
+    before the bound; these cases pin the classification itself.
+    """
+
+    def _policy(self, max_pin_s=60.0):
+        return SchedulePolicy(
+            policy="lpm",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            in_batch_prefix_caching_max_pin_s=max_pin_s,
+        )
+
+    @staticmethod
+    def _cold_req(rid, token_ids, *, entry_offset_s=None):
+        req = _make_req(rid, "", token_ids)
+        if entry_offset_s is not None:
+            req.first_queue_entry_time = time.perf_counter() - entry_offset_s
+        return req
+
+    def test_classification_leader_follower_unrelated(self):
+        # Cold queue, empty radix: the first scanned req is inserted into the
+        # simulated tree (leader); a later req sharing >= 32 leading tokens
+        # with it is deprioritized (follower); an unrelated req is neither.
+        leader = self._cold_req("leader", list(range(64)))
+        follower = self._cold_req("follower", list(range(64)))
+        unrelated = self._cold_req("unrelated", list(range(1000, 1064)))
+        queue = [leader, follower, unrelated]
+
+        pinned = self._policy()._compute_prefix_matches(queue, CacheAwarePolicy.LPM)
+        self.assertEqual(pinned, {"follower"})
+
+    def test_pin_bound_promotes_after_60s(self):
+        # The observed 112-298 s unbounded holds, unit form: a follower whose
+        # total queue wait exceeds the bound is promoted back to group 0
+        # (sorts by its own key again) instead of waiting behind everyone.
+        leader = self._cold_req("leader", list(range(64)))
+        follower_late = self._cold_req(
+            "follower_late", list(range(64)) + [7, 8, 9], entry_offset_s=61.0
+        )
+        pinned = self._policy()._compute_prefix_matches(
+            [leader, follower_late], CacheAwarePolicy.LPM
+        )
+        self.assertNotIn("follower_late", pinned)
+
+        # Below the bound the old behavior holds: the follower stays pinned.
+        follower_recent = self._cold_req(
+            "follower_recent", list(range(64)) + [7, 8, 9], entry_offset_s=30.0
+        )
+        pinned = self._policy()._compute_prefix_matches(
+            [leader, follower_recent], CacheAwarePolicy.LPM
+        )
+        self.assertEqual(pinned, {"follower_recent"})
+
+    def test_pin_bound_zero_disables(self):
+        # 0 restores the unbounded pin: a follower waiting an hour stays
+        # pinned (the negative-branch contract of the flag).
+        leader = self._cold_req("leader", list(range(64)))
+        follower = self._cold_req("follower", list(range(64)), entry_offset_s=3600.0)
+        pinned = self._policy(max_pin_s=0.0)._compute_prefix_matches(
+            [leader, follower], CacheAwarePolicy.LPM
+        )
+        self.assertEqual(pinned, {"follower"})
+
+    def test_unstamped_req_never_promotes(self):
+        # first_queue_entry_time is None on disagg/synthetic reqs: the wait is
+        # unmeasurable, so the pin keeps the pre-bound behavior instead of
+        # crashing or promoting.
+        leader = self._cold_req("leader", list(range(64)))
+        follower = self._cold_req("follower", list(range(64)))
+        self.assertIsNone(follower.first_queue_entry_time)
+        pinned = self._policy()._compute_prefix_matches(
+            [leader, follower], CacheAwarePolicy.LPM
+        )
+        self.assertEqual(pinned, {"follower"})
 
 
 class TestInBatchDedupStamping(CustomTestCase):
@@ -646,6 +923,112 @@ class TestAdaptiveBoostGamma(CustomTestCase):
         self.assertGreater(thin_gamma, 5e-4)
         self.assertLess(fat_gamma, 1e-4, "fat tail must push gamma below gamma0")
         self.assertGreater(thin_gamma, fat_gamma, "recovery must raise gamma")
+
+    def test_wall_fixed_point_invariant_under_clock_rate(self):
+        # The c8 drift bug in unit form: the same wall waits denominated in a
+        # clock whose rate swings with cache state (fresh 5k vs warm 36.7k
+        # tok/s) move the tokens-mode fixed point ~7.3x, while the wall-mode
+        # estimate of the same waits is one number, ln5/width_s. Fractional
+        # waits also pin the float coercion: the old int() cast would crush
+        # sub-second waits to 0 and degenerate the tail to GAMMA_MAX.
+        wall_waits = [0.0] * 59 + [1.0, 2.0, 3.0, 4.0, 5.0]
+        # p95 = 1.85, p99 = 4.37 of the sorted 64-wait window.
+        width_s = 2.52
+
+        def converged(clock, waits, gamma0):
+            adaptive = AdaptiveBoostGamma(
+                gamma0=gamma0, window=64, min_samples=64, clock=clock
+            )
+            gamma = None
+            for _ in range(200):
+                gamma = adaptive.record_admissions(waits)
+            return gamma
+
+        wall = converged(BoostClock.WALL, wall_waits, 0.1)
+        self.assertAlmostEqual(
+            wall, self.LN5 / width_s, delta=self.LN5 / width_s * 1e-6
+        )
+
+        fresh = converged(BoostClock.TOKENS, [w * 5_000.0 for w in wall_waits], 1e-4)
+        warm = converged(BoostClock.TOKENS, [w * 36_700.0 for w in wall_waits], 1e-4)
+        self.assertAlmostEqual(
+            fresh,
+            self.LN5 / (width_s * 5_000.0),
+            delta=self.LN5 / width_s / 5_000.0 * 1e-6,
+        )
+        self.assertAlmostEqual(
+            warm,
+            self.LN5 / (width_s * 36_700.0),
+            delta=self.LN5 / width_s / 36_700.0 * 1e-6,
+        )
+        self.assertGreater(
+            fresh / warm, 5.0, "token-denominated waits drift with the clock rate"
+        )
+
+    def test_wall_clip_bounds(self):
+        # Wall-mode clip bounds are 1/s scale: the degenerate thin tail lands
+        # at GAMMA_MAX_S (not the 1e-3 tokens bound), the fat tail at
+        # GAMMA_MIN_S.
+        thin = AdaptiveBoostGamma(
+            gamma0=0.1, window=16, min_samples=8, clock=BoostClock.WALL
+        )
+        for _ in range(200):
+            thin_gamma = thin.record_admissions([0.001] * 16)
+        self.assertLessEqual(thin_gamma, AdaptiveBoostGamma.GAMMA_MAX_S)
+        self.assertGreater(thin_gamma, 9.9)
+
+        fat = AdaptiveBoostGamma(
+            gamma0=0.1, window=16, min_samples=8, clock=BoostClock.WALL
+        )
+        for _ in range(200):
+            fat_gamma = fat.record_admissions([0.0] * 15 + [10**9])
+        self.assertGreaterEqual(fat_gamma, AdaptiveBoostGamma.GAMMA_MIN_S)
+        self.assertLess(fat_gamma, 1.001e-3)
+
+    def test_wall_gamma0_outside_bounds_clips(self):
+        # A tokens-scale gamma0 (1e-4 per-token) in wall mode is below the
+        # 1/s floor; it must clip up, not run unclipped (mode-mismatch guard
+        # for the default-resolution path).
+        adaptive = AdaptiveBoostGamma(
+            gamma0=1e-4, window=16, min_samples=8, clock=BoostClock.WALL
+        )
+        self.assertEqual(adaptive.gamma, AdaptiveBoostGamma.GAMMA_MIN_S)
+
+
+class TestFirstAdmissionWaits(CustomTestCase):
+    """record_first_admission_waits: the scheduler's gamma-Ada feed, unit-aware.
+    Wall mode computes waits from the wall entry stamp (cache-state-free);
+    tokens mode from the processed-token counter; first admissions only."""
+
+    def _adaptive_policy(self, clock):
+        return SchedulePolicy(
+            policy="boost",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            boost_adaptive_gamma=True,
+            boost_clock=clock,
+        )
+
+    def test_wait_unit_follows_the_clock(self):
+        first = _make_boost_req("first", 256, arrival=4_000)
+        second = _make_boost_req("second", 256, arrival=7_000)
+        first.first_queue_entry_time = 40.0
+        second.first_queue_entry_time = 60.0
+        readmitted = _make_boost_req("readmitted", 256, arrival=0)
+        readmitted.first_queue_entry_time = 0.0
+        # Already stamped at an earlier admission: excluded from the feed.
+        readmitted.matched_prefix_tokens_first_admission = 64
+        queue = [readmitted, first, second]
+
+        wall = self._adaptive_policy("wall")
+        wall.record_first_admission_waits(queue, processed_tokens=10_000, now_s=100.0)
+        self.assertEqual(list(wall.adaptive_gamma._waits), [60.0, 40.0])
+
+        tokens = self._adaptive_policy("tokens")
+        tokens.record_first_admission_waits(queue, processed_tokens=10_000, now_s=100.0)
+        self.assertEqual(list(tokens.adaptive_gamma._waits), [6_000, 3_000])
 
     def test_warmup_returns_none_below_min_samples(self):
         # Below min_samples percentiles are noise; the caller must be able to

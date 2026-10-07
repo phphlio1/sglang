@@ -47,6 +47,8 @@ POSITIONAL_FIELD_ORDER = (
     "boost_gamma",
     "boost_bin_size",
     "boost_adaptive_gamma",
+    "boost_clock",
+    "in_batch_prefix_caching_max_pin_s",
     "log_schedule_eval_path",
     "enable_priority_scheduling",
     "disable_priority_preemption",

@@ -111,7 +111,11 @@ class TestScheduleEvalLogger(CustomTestCase):
 
     def test_one_line_per_finished_req_with_expected_fields(self):
         logger = ScheduleEvalLogger(
-            path=self.path, policy="boost", boost_gamma=1e-4, boost_bin_size=256
+            path=self.path,
+            policy="boost",
+            boost_gamma=1e-4,
+            boost_bin_size=256,
+            boost_clock="tokens",
         )
         finished = _finish(_make_req("done"))
         pending = _make_req("pending")  # still running: must not be logged
@@ -126,6 +130,7 @@ class TestScheduleEvalLogger(CustomTestCase):
                 "rid",
                 "policy",
                 "gamma",
+                "boost_clock",
                 "bin_size",
                 "arrival_wall_s",
                 "queue_wait_s",
@@ -145,6 +150,8 @@ class TestScheduleEvalLogger(CustomTestCase):
         )
         self.assertEqual(rec["policy"], "boost")
         self.assertEqual(rec["gamma"], 1e-4)
+        # The record's gamma is unit-ambiguous without the clock mode.
+        self.assertEqual(rec["boost_clock"], "tokens")
         self.assertEqual(rec["bin_size"], 256)
         self.assertEqual(rec["input_len"], 100)
         self.assertEqual(rec["matched_prefix_tokens_first_admission"], 64)
@@ -163,7 +170,11 @@ class TestScheduleEvalLogger(CustomTestCase):
         # retraction itself is visible via num_retractions and the
         # last-admission prefix match.
         logger = ScheduleEvalLogger(
-            path=self.path, policy="boost", boost_gamma=1e-4, boost_bin_size=256
+            path=self.path,
+            policy="boost",
+            boost_gamma=1e-4,
+            boost_bin_size=256,
+            boost_clock="tokens",
         )
         logger.log_finished_batch([_finish(_make_req("retracted"), retracted=True)])
         logger.close()
@@ -178,7 +189,11 @@ class TestScheduleEvalLogger(CustomTestCase):
         # Overlap mode can surface a finished req in two result batches; the
         # rid set keeps the file one-line-per-request.
         logger = ScheduleEvalLogger(
-            path=self.path, policy="fcfs", boost_gamma=1e-4, boost_bin_size=256
+            path=self.path,
+            policy="fcfs",
+            boost_gamma=1e-4,
+            boost_bin_size=256,
+            boost_clock="tokens",
         )
         req = _finish(_make_req("done"))
         logger.log_finished_batch([req])
@@ -195,6 +210,7 @@ class TestScheduleEvalLogger(CustomTestCase):
                 policy="boost",
                 boost_gamma=1e-4,
                 boost_bin_size=256,
+                boost_clock="tokens",
             )
         # Disabled, not crashed: logging a finished batch is a no-op.
         logger.log_finished_batch([_finish(_make_req("done"))])

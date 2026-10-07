@@ -1394,6 +1394,10 @@ class Scheduler(
             boost_gamma=get_schedule().boost_gamma,
             boost_bin_size=get_schedule().boost_bin_size,
             boost_adaptive_gamma=get_schedule().boost_adaptive_gamma,
+            boost_clock=get_schedule().boost_clock,
+            in_batch_prefix_caching_max_pin_s=(
+                get_schedule().in_batch_prefix_caching_max_pin_s
+            ),
         )
 
     def maybe_init_schedule_eval_logger(self):
@@ -1407,6 +1411,7 @@ class Scheduler(
             policy=self.schedule_policy,
             boost_gamma=get_schedule().boost_gamma,
             boost_bin_size=get_schedule().boost_bin_size,
+            boost_clock=get_schedule().boost_clock,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -4119,22 +4124,18 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
-        if self.policy.adaptive_gamma is not None:
-            # gamma-Ada feed: first admissions only. The None check on the
-            # first-admission stamp is the first-admission detector, so this
-            # must run before stamp_admission_prefix_matches freezes it;
-            # retracted re-admissions and chunk continuations are excluded.
-            gamma = self.policy.record_admission_waits(
-                [
-                    self.processed_tokens_counter - r.boost_arrival_tokens
-                    for r in can_run_list
-                    if r.boost_arrival_tokens is not None
-                    and r.matched_prefix_tokens_first_admission is None
-                ]
-            )
-            if gamma is not None and self.schedule_eval_logger is not None:
-                # Per-record gamma in the eval log is the trajectory.
-                self.schedule_eval_logger.boost_gamma = gamma
+        # gamma-Ada feed: first admissions only. The None check on the
+        # first-admission stamp is the first-admission detector, so this
+        # must run before stamp_admission_prefix_matches freezes it;
+        # retracted re-admissions and chunk continuations are excluded.
+        gamma = self.policy.record_first_admission_waits(
+            can_run_list,
+            processed_tokens=self.processed_tokens_counter,
+            now_s=time.perf_counter(),
+        )
+        if gamma is not None and self.schedule_eval_logger is not None:
+            # Per-record gamma in the eval log is the trajectory.
+            self.schedule_eval_logger.boost_gamma = gamma
         stamp_admission_prefix_matches(can_run_list)
 
         # Create a new batch

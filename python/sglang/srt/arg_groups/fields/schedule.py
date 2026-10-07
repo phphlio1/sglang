@@ -99,11 +99,18 @@ class Schedule(msgspec.Struct):
         ),
     ] = "fcfs"
     boost_gamma: A[
-        float,
+        Optional[float],
         Arg(
-            help="Gamma for the boost schedule policy. Larger gamma gives stronger anti-starvation (more FCFS-like); smaller gamma favors short uncached work (more locality-driven).",
+            help=(
+                "Gamma for the boost schedule policy. Larger gamma gives stronger "
+                "anti-starvation (more FCFS-like); smaller gamma favors short uncached "
+                "work (more locality-driven). Units follow --boost-clock: per-token "
+                "under 'tokens' (default 1e-4), 1/s under 'wall' (default 0.1). "
+                "Unset uses the clock-mode default."
+            ),
+            resolvable=True,
         ),
-    ] = 1e-4
+    ] = None
     boost_bin_size: A[
         int,
         Arg(
@@ -113,9 +120,41 @@ class Schedule(msgspec.Struct):
     boost_adaptive_gamma: A[
         bool,
         Arg(
-            help="Adapt boost_gamma online from the admission wait tail (gamma-Ada): gamma_hat = ln5/(w99-w95) over the last 2048 first-admission waits in clock tokens, EMA-smoothed (beta 0.2) and clipped to [3e-7, 1e-3]. Fatter tail -> smaller gamma (stronger locality bias); thinner tail -> larger gamma (more FCFS-like). Requires --schedule-policy boost; off by default.",
+            help="Adapt boost_gamma online from the admission wait tail (gamma-Ada): gamma_hat = ln5/(w99-w95) over the last 2048 first-admission waits in the active clock's unit (counted tokens, or wall seconds under --boost-clock wall), EMA-smoothed (beta 0.2) and clipped. Fatter tail -> smaller gamma (stronger locality bias); thinner tail -> larger gamma (more FCFS-like). Requires --schedule-policy boost; off by default.",
         ),
     ] = False
+    boost_clock: A[
+        str,
+        Arg(
+            help=(
+                "Clock for the boost schedule policy's arrival and work axes. "
+                "'tokens' (default) is the paper-exact counted-token clock "
+                "(includes linear replay of matched prefixes, so the wall-time "
+                "meaning of boost_gamma varies with cache state). 'wall' stamps "
+                "arrival in wall seconds and converts uncached work to "
+                "seconds-of-service via a measured token-clock rate, pinning the "
+                "effective gamma and the adaptive estimator's fixed point "
+                "independent of cache state; boost_gamma is then in 1/s. Requires "
+                "--schedule-policy boost."
+            ),
+            choices=["tokens", "wall"],
+        ),
+    ] = "tokens"
+    in_batch_prefix_caching_max_pin_s: A[
+        float,
+        Arg(
+            help=(
+                "Wall-second bound on the in-batch prefix-caching follower pin: a "
+                "waiting request deprioritized as a duplicate-prefix follower "
+                "(shares >= 32 leading tokens with an earlier waiting peer while "
+                "its own radix match is <= 32) is promoted back to normal "
+                "priority once its total queue wait since first entry exceeds "
+                "this. 0 or negative disables the bound (the follower waits for "
+                "its leader unconditionally). Applies to lpm, hrrn, "
+                "shortest-prefill-first and boost. Default 60 s."
+            ),
+        ),
+    ] = 60.0
     log_schedule_eval_path: A[
         Optional[str],
         Arg(

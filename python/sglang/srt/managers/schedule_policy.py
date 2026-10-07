@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from array import array
 
 from sglang.srt.environ import envs
@@ -272,16 +273,71 @@ def _percentile(sorted_vals: Sequence[float], p: float) -> float:
     return sorted_vals[f] + (k - f) * (sorted_vals[c] - sorted_vals[f])
 
 
+class BoostClock(Enum):
+    """Arrival/work clock for the boost policy; see --boost-clock."""
+
+    TOKENS = "tokens"  # counted-token clock (paper-exact)
+    WALL = "wall"  # wall seconds; work via measured token-clock rate
+
+
+class TokenClockRate:
+    """EMA of the token-clock rate (counted prefill tokens per wall second).
+
+    Wall-clock boost converts uncached work to seconds-of-service with this
+    rate. The counted stream includes linear replay of matched prefixes (and
+    mixed-chunk decode tokens), so the rate absorbs the cache-state swing in
+    the counter; the conversion is exact where the counter is prefill-pure.
+    """
+
+    BETA = 0.2
+
+    def __init__(self) -> None:
+        self._last_tokens: Optional[int] = None
+        self._last_t: Optional[float] = None
+        self._tokens_per_s: Optional[float] = None
+
+    @property
+    def tokens_per_s(self) -> Optional[float]:
+        return self._tokens_per_s
+
+    def observe(self, processed_tokens: int, now_s: float) -> Optional[float]:
+        """Fold one (counter, wall) sample into the EMA; returns the rate
+        (None until the first positive-delta interval is seen)."""
+        if self._last_tokens is None:
+            self._last_tokens = processed_tokens
+            self._last_t = now_s
+            return self._tokens_per_s
+        delta_tokens = processed_tokens - self._last_tokens
+        delta_s = now_s - self._last_t
+        if delta_tokens > 0 and delta_s > 0:
+            # No sample and no baseline advance on nonpositive deltas: an
+            # idle or decode-only stretch folds into the next sample's
+            # window, keeping the rate load-inclusive.
+            sample = delta_tokens / delta_s
+            self._last_tokens = processed_tokens
+            self._last_t = now_s
+            if self._tokens_per_s is None:
+                self._tokens_per_s = sample
+            else:
+                self._tokens_per_s = (
+                    1.0 - self.BETA
+                ) * self._tokens_per_s + self.BETA * sample
+        return self._tokens_per_s
+
+
 class AdaptiveBoostGamma:
     """Adaptive gamma for the boost policy (gamma-Ada).
 
     gamma_hat = ln(0.05/0.01) / (w99 - w95) = ln 5 / tail_width, over the
-    last WINDOW first-admission waits measured in clock tokens (processed-
-    token counter minus the stamp-once boost arrival stamp). Fatter wait
-    tail -> smaller gamma_hat -> larger boosts (locality/LAS-ward); thin
-    tail -> larger gamma_hat (FCFS-ward). The estimate is EMA-smoothed
-    (BETA) and clipped to [GAMMA_MIN, GAMMA_MAX]. Off by default;
-    see --boost-adaptive-gamma.
+    last WINDOW first-admission waits measured in the active clock's unit
+    (counted tokens, or wall seconds under --boost-clock wall).
+
+    Fatter wait tail -> smaller gamma_hat -> larger boosts (locality/LAS-ward);
+
+    Thin tail -> larger gamma_hat (FCFS-ward).
+
+    The estimate is EMA-smoothed (BETA) and clipped to the clock's unit bounds.
+    Off by default; see --boost-adaptive-gamma.
     """
 
     WINDOW = 2048
@@ -289,6 +345,10 @@ class AdaptiveBoostGamma:
     BETA = 0.2
     GAMMA_MIN = 3e-7
     GAMMA_MAX = 1e-3
+    # Wall clip bounds in 1/s; measured c4-c16 fixed points land in
+    # [0.017, 0.62] 1/s (ln5 / wall tail width).
+    GAMMA_MIN_S = 1e-3
+    GAMMA_MAX_S = 10.0
     LN5 = math.log(5.0)
     # Trajectory log lines: at most one per LOG_MIN_UPDATES updates, or on a
     # >= LOG_REL_CHANGE move since the last logged gamma.
@@ -296,11 +356,22 @@ class AdaptiveBoostGamma:
     LOG_REL_CHANGE = 0.25
 
     def __init__(
-        self, gamma0: float, window: int = WINDOW, min_samples: int = MIN_SAMPLES
+        self,
+        gamma0: float,
+        window: int = WINDOW,
+        min_samples: int = MIN_SAMPLES,
+        clock: BoostClock = BoostClock.TOKENS,
     ) -> None:
         self._waits: deque = deque(maxlen=window)
         self._min_samples = min_samples
-        self._gamma = min(max(gamma0, self.GAMMA_MIN), self.GAMMA_MAX)
+        self._unit = "s" if clock is BoostClock.WALL else "tokens"
+        self._gamma_min = (
+            self.GAMMA_MIN_S if clock is BoostClock.WALL else self.GAMMA_MIN
+        )
+        self._gamma_max = (
+            self.GAMMA_MAX_S if clock is BoostClock.WALL else self.GAMMA_MAX
+        )
+        self._gamma = min(max(gamma0, self._gamma_min), self._gamma_max)
         self._updates_since_log = 0
         self._last_logged_gamma = self._gamma
 
@@ -308,25 +379,24 @@ class AdaptiveBoostGamma:
     def gamma(self) -> float:
         return self._gamma
 
-    def record_admissions(self, waits: Iterable[int]) -> Optional[float]:
-        """Feed first-admission waits (clock tokens); returns the updated
-        gamma when this call applied an update, None while the window is
-        still filling below min_samples."""
-        self._waits.extend(max(0, int(w)) for w in waits)
+    def record_admissions(self, waits: Iterable[float]) -> Optional[float]:
+        """Feed first-admission waits (in the active clock's unit); returns
+        the updated gamma when this call applied an update, None while the
+        window is still filling below min_samples."""
+        self._waits.extend(max(0.0, float(w)) for w in waits)
         if len(self._waits) < self._min_samples:
             return None
         ordered = sorted(self._waits)
-        # delta == 0 (no tail spread) -> gamma_hat -> inf -> GAMMA_MAX: the
+        # delta == 0 (no tail spread) -> gamma_hat -> inf -> gamma_max: the
         # degenerate thin tail is maximally FCFS-ward, not an error.
         delta = _percentile(ordered, 99) - _percentile(ordered, 95)
         gamma_hat = self.LN5 / delta if delta > 0 else float("inf")
-        gamma_hat = min(max(gamma_hat, self.GAMMA_MIN), self.GAMMA_MAX)
+        gamma_hat = min(max(gamma_hat, self._gamma_min), self._gamma_max)
         gamma = min(
             max(
-                (1.0 - self.BETA) * self._gamma + self.BETA * gamma_hat,
-                self.GAMMA_MIN,
+                (1.0 - self.BETA) * self._gamma + self.BETA * gamma_hat, self._gamma_min
             ),
-            self.GAMMA_MAX,
+            self._gamma_max,
         )
         self._maybe_log(gamma, gamma_hat, delta, len(ordered))
         self._gamma = gamma
@@ -341,10 +411,11 @@ class AdaptiveBoostGamma:
         ):
             logger.info(
                 "boost adaptive gamma: gamma=%.3e (gamma_hat=%.3e, "
-                "tail w99-w95=%.0f tokens, n=%d)",
+                "tail w99-w95=%.3g %s, n=%d)",
                 gamma,
                 gamma_hat,
                 delta,
+                self._unit,
                 n,
             )
             self._updates_since_log = 0
@@ -388,6 +459,8 @@ class SchedulePolicy:
         boost_gamma: float = 1e-4,
         boost_bin_size: int = 256,
         boost_adaptive_gamma: bool = False,
+        boost_clock: str = "tokens",
+        in_batch_prefix_caching_max_pin_s: float = 60.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -397,10 +470,20 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self.boost_gamma = boost_gamma
         self.boost_bin_size = boost_bin_size
+        self.boost_clock = BoostClock(boost_clock)
+        self.in_batch_prefix_caching_max_pin_s = in_batch_prefix_caching_max_pin_s
+        # Wall-mode token-clock rate EMA; None in tokens mode and for
+        # non-boost policies (fixed-gamma tokens path stays bit-identical).
+        self.prefill_token_rate: Optional[TokenClockRate] = (
+            TokenClockRate()
+            if self.boost_clock is BoostClock.WALL
+            and self.policy == CacheAwarePolicy.BOOST
+            else None
+        )
         # gamma-Ada; None unless boost + --boost-adaptive-gamma (off by
         # default, so the fixed-gamma path is bit-identical to before).
         self.adaptive_gamma: Optional[AdaptiveBoostGamma] = (
-            AdaptiveBoostGamma(boost_gamma)
+            AdaptiveBoostGamma(boost_gamma, clock=self.boost_clock)
             if boost_adaptive_gamma and self.policy == CacheAwarePolicy.BOOST
             else None
         )
@@ -415,16 +498,20 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
     ) -> None:
+        # Before _determine_active_policy so the >128-queue FCFS fallback
+        # still refreshes the rate between wall-mode sorts.
+        if self.prefill_token_rate is not None:
+            self.prefill_token_rate.observe(processed_tokens, time.perf_counter())
         policy = self._determine_active_policy(waiting_queue)
 
         # Populate req.num_matched_prefix_tokens at schedule time. Cache-aware policies
         # set it in _compute_prefix_matches; do the same full match for
         # cache-agnostic policies when the radix supports it, so the load
         # snapshot has it. Skip on decode (never prefills). fcfs-match forces
-        # the match on regardless: it is the metric-visible reference arm for
+        # the match on regardless: it is the sort-time-match reference arm for
         # caches where supports_fast_match_prefix() is False (there the plain
-        # cache-agnostic branch never fires and admission reports zero matched
-        # tokens even though init_next_round_input re-matches at admission).
+        # cache-agnostic branch never fires; admission reports its own match
+        # via init_next_round_input).
         if (
             not isinstance(policy, CacheAwarePolicy)
             and (
@@ -467,6 +554,12 @@ class SchedulePolicy:
                     self.boost_bin_size,
                     self.enable_priority_scheduling,
                     self.priority_sign,
+                    clock=self.boost_clock,
+                    rate_tokens_per_s=(
+                        self.prefill_token_rate.tokens_per_s
+                        if self.prefill_token_rate is not None
+                        else None
+                    ),
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                 SchedulePolicy._sort_by_shortest_prefill(
@@ -517,16 +610,44 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
-    def record_admission_waits(self, waits: List[int]) -> Optional[float]:
-        """Feed first-admission waits (clock tokens) to gamma-Ada; returns the
-        updated gamma when it moved (the caller mirrors it into the eval log),
-        None on every other path. No-op unless boost + adaptive gamma."""
+    def record_admission_waits(self, waits: List[float]) -> Optional[float]:
+        """Feed first-admission waits (in the active clock's unit) to gamma-Ada;
+        returns the updated gamma when it moved (the caller mirrors it into the
+        eval log), None on every other path. No-op unless boost + adaptive
+        gamma."""
         if self.adaptive_gamma is None:
             return None
         gamma = self.adaptive_gamma.record_admissions(waits)
         if gamma is not None:
             self.boost_gamma = gamma
         return gamma
+
+    def record_first_admission_waits(
+        self,
+        reqs: Sequence[Req],
+        *,
+        processed_tokens: int,
+        now_s: float,
+    ) -> Optional[float]:
+        """Feed the first admissions among reqs to gamma-Ada, waits computed
+        in the active clock's unit (counted tokens, or wall seconds under
+        --boost-clock wall)."""
+        if self.adaptive_gamma is None:
+            return None
+        waits = []
+        for r in reqs:
+            if r.matched_prefix_tokens_first_admission is not None:
+                continue
+            if self.boost_clock is BoostClock.WALL:
+                if r.first_queue_entry_time is None:
+                    continue
+                wait = max(0.0, now_s - r.first_queue_entry_time)
+            else:
+                if r.boost_arrival_tokens is None:
+                    continue
+                wait = max(0, processed_tokens - r.boost_arrival_tokens)
+            waits.append(wait)
+        return self.record_admission_waits(waits)
 
     def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
         policy = self._determine_active_policy(waiting_queue)
@@ -579,6 +700,7 @@ class SchedulePolicy:
         """
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        now_s = time.perf_counter()
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
@@ -610,10 +732,9 @@ class SchedulePolicy:
                         self.waiting_queue_radix_tree, match_result, extra_key=extra_key
                     )
                 in_batch_matching_prefixes = match_result.device_indices
-                if (
-                    len(in_batch_matching_prefixes)
-                    >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
-                ):
+                if len(in_batch_matching_prefixes) >= (
+                    IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
+                ) and not self._pin_hold_expired(r, now_s):
                     temporary_deprioritized.add(r.rid)
                 else:
                     # Insert with a dummy key
@@ -628,6 +749,16 @@ class SchedulePolicy:
                         )
                     )
         return temporary_deprioritized
+
+    def _pin_hold_expired(self, r: Req, now_s: float) -> bool:
+        """Whether the follower pin's wall-second hold bound has released r
+        (total queue wait since first entry; --in-batch-prefix-caching-max-pin-s)."""
+        if self.in_batch_prefix_caching_max_pin_s <= 0:
+            return False
+        # None = never stamped (disagg/synthetic); keep the pin, old behavior.
+        if r.first_queue_entry_time is None:
+            return False
+        return now_s - r.first_queue_entry_time > self.in_batch_prefix_caching_max_pin_s
 
     @staticmethod
     def _shortest_prefill_work(r: Req) -> int:
@@ -736,36 +867,57 @@ class SchedulePolicy:
         bin_size: int,
         enable_priority_scheduling: bool = False,
         priority_sign: int = -1,
+        *,
+        clock: BoostClock = BoostClock.TOKENS,
+        rate_tokens_per_s: Optional[float] = None,
     ) -> None:
         """Gamma-boosted arrival ordering (UniBoost, Li et al., ICML 2026, Sec. 2).
 
         phi(r) = A(r) - b_gamma(q(u(r))), served in ascending phi.
-        A(r): token-clock stamp at first queue entry (survives retraction).
+        A(r): token-clock stamp at first queue entry (survives retraction), or
+              the wall first-entry stamp under clock=WALL.
         u(r): uncached work = input + generated - matched prefix tokens
               (device + host hits; retracted requests charged for re-prefill).
         q():  geometric binning at bin_size; caps max boost at b_gamma(bin_size).
+        Wall mode converts work to seconds-of-service via rate_tokens_per_s
+        (gamma in 1/s); unmeasured rate -> boost 0 (pure arrival order).
 
         Anti-starvation: a newcomer can only jump ahead by its boost, which is
-        bounded by b_gamma(bin_size) clock-tokens; requests older than that are
-        unreachable — bounded displacement, converging to FCFS.
+        bounded by b_gamma(bin_size) clock-tokens (or b_gamma(bin_size / rate)
+        wall seconds); requests older than that are unreachable — bounded
+        displacement, converging to FCFS.
         """
 
         def key(r: Req):
             u = SchedulePolicy._shortest_prefill_work(r)
             w = geometric_bin(u, bin_size)
-            # None = never stamped (synthetic reqs); treat as oldest.
-            arrival = (
-                r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
-            )
-            phi = arrival - gamma_boost(w, gamma)
+            if clock is BoostClock.WALL:
+                # None = never stamped (synthetic reqs); treat as oldest.
+                arrival_s = (
+                    r.first_queue_entry_time
+                    if r.first_queue_entry_time is not None
+                    else 0.0
+                )
+                boost_s = (
+                    gamma_boost(w / rate_tokens_per_s, gamma)
+                    if rate_tokens_per_s is not None
+                    else 0.0
+                )
+                rank = arrival_s - boost_s
+            else:
+                # None = never stamped (synthetic reqs); treat as oldest.
+                arrival = (
+                    r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
+                )
+                rank = arrival - gamma_boost(w, gamma)
             if r.rid in temporary_deprioritized:
                 # In-batch dedup followers still go last, same as lpm.
-                group, rank = 1, 0.0
+                group, phi = 1, 0.0
             else:
-                group, rank = 0, phi
+                group, phi = 0, rank
             if enable_priority_scheduling:
-                return (r.priority * priority_sign, group, rank, r.rid)
-            return (group, rank, r.rid)
+                return (r.priority * priority_sign, group, phi, r.rid)
+            return (group, phi, r.rid)
 
         waiting_queue.sort(key=key)
 

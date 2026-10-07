@@ -1193,8 +1193,8 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen: Optional[int] = None
         # Total cached prefix length (on-device prefix_indices + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
-        # time and used to estimate uncached tokens / sort by longest prefix for
-        # load reporting.
+        # and admission time and used to estimate uncached tokens / sort by
+        # longest prefix for load reporting.
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
@@ -1423,6 +1423,8 @@ class Req(ReqDllmMixin):
         # Schedule-eval log bookkeeping (--log-schedule-eval-path): first entry
         # and first admission are stamp-once (they must survive retraction),
         # last admission is last-write-wins. See observability/schedule_eval_log.py.
+        # first_queue_entry_time is also the boost wall-clock arrival axis
+        # (--boost-clock wall); same stamp-once coverage as boost_arrival_tokens.
         self.first_queue_entry_time: Optional[float] = None
         self.matched_prefix_tokens_first_admission: Optional[int] = None
         self.matched_prefix_tokens_last_admission: Optional[int] = None
@@ -1716,6 +1718,14 @@ class Req(ReqDllmMixin):
                 self.kv.cache_protected_len = match_result.cache_protected_len
             else:
                 self.kv.cache_protected_len = len(self.prefix_indices)
+            # The admission re-match is the last match before the
+            # first-admission stamp; record its length so policies without a
+            # sort-time match (plain fcfs) report real reuse. Read-only: the
+            # match above inserts nothing.
+            self.num_matched_prefix_tokens = min(
+                len(self.prefix_indices) + self.host_hit_length,
+                self._compute_max_prefix_len(input_len),
+            )
 
             if self.is_dllm():
                 self._update_block_offset_for_dllm()

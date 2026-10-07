@@ -204,6 +204,10 @@ def check_server_args(server_args: Any):
         assert cfg.schedule_policy == "boost", (
             "--boost-adaptive-gamma requires --schedule-policy boost"
         )
+    if cfg.boost_clock == "wall":
+        assert cfg.schedule_policy == "boost", (
+            "--boost-clock wall requires --schedule-policy boost"
+        )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",
@@ -589,6 +593,21 @@ def default_unset_prefill_decode_interval(server_args: Any):
             server_args,
             "prefill_decode_interval_default",
             prefill_decode_interval=0,
+        )
+
+
+def default_unset_boost_gamma(server_args: Any):
+    """Unset --boost-gamma takes the clock-mode default (see --boost-clock)."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    cfg = resolving_view(server_args)
+    if cfg.boost_gamma is None:
+        # Wall default 0.1 1/s: geometric center of the measured c4-c16
+        # adaptive fixed points (ln5 / wall tail width, in [0.017, 0.62] 1/s).
+        declare_resolution(
+            server_args,
+            "boost_gamma_default",
+            boost_gamma=(0.1 if cfg.boost_clock == "wall" else 1e-4),
         )
 
 
