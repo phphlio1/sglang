@@ -1,7 +1,7 @@
 """E2 AgentX metrics computation from AIPerf run outputs.
 
-Reads one run directory (produced by scripts/run_agentx_policy.sh or
-run_agentx_smoke.sh) and computes the E2 target metrics:
+Reads one run directory (produced by scripts/run_e2.sh policy/smoke modes)
+and computes the E2 target metrics:
 
   - TTFT / TPOT / E2E mean + P95          (per-request, profile_export.jsonl)
   - RPM / TPM                              (aggregate, profile_export_aiperf.json)
@@ -161,12 +161,13 @@ def extract_per_request(records: list[dict]) -> dict:
 
 def percentile_stats(values_s: list[float]) -> dict:
     if not values_s:
-        return {"n": 0, "mean_ms": None, "p95_ms": None}
+        return {"n": 0, "mean_ms": None, "p95_ms": None, "p99_ms": None}
     ms = sorted(v * 1000.0 for v in values_s)
     return {
         "n": len(ms),
         "mean_ms": sum(ms) / len(ms),
         "p95_ms": _percentile(ms, 95),
+        "p99_ms": _percentile(ms, 99),
     }
 
 

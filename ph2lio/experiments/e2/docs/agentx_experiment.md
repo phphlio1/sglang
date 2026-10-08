@@ -188,7 +188,7 @@ scripts/run_e2.sh policy boost 8      # boost at the paper default gamma/k
 BOOST_GAMMA=2e-4 scripts/run_e2.sh policy boost 8   # sweep arm
 scripts/run_e2.sh sweep 4 8           # all six policies at the given concs
 sbatch --array=0-5 scripts/run_e2.sh array   # Slurm: one policy per task
-python3 analysis/agentx_metrics.py results/agentx/boost/c8_g1e-4_k256_<ts>
+python3 analysis/agentx_metrics.py results/1x-rtx6000pro/agentx/boost/c8_g1e-4_k256_<ts>
 ```
 
 Smoke test (pipeline validation only — 300 s duration + 16-entry subset
@@ -204,7 +204,7 @@ SMOKE_POLICY=boost scripts/run_e2.sh smoke
 `scripts/run_boost_matrix.sh` ran the full matrix: {fcfs, lpm, boost} x
 {4, 8, 16} at gamma=1e-4 / k=256 (paper defaults), plus the gamma sweep
 {5e-5, 2e-4} at c8. Flat table (round-1 format):
-`python3 analysis/print_results_table.py --flat results/agentx`; the
+`python3 analysis/print_results_table.py --flat results/1x-rtx6000pro/agentx`; the
 canonical final table is the same script's default output and is carried in
 the "Final results" section below. These runs predate
 `--enable-cache-report` in the pinned config (added 2026-10-06, after the
@@ -622,11 +622,11 @@ Notes on the canonical table:
 - Round-1 c8 boost rows are warm-start (no fresh c8 boost cell existed
   until round 6 adds one under `results/agentx_adaptive`).
 
-Frontier plot: `results/agentx/frontier_c16.png` (regenerate with a
+Frontier plot: `results/1x-rtx6000pro/agentx/frontier_c16.png` (regenerate with a
 matplotlib-bearing interpreter: `python3 analysis/frontier_plot.py
 --gamma-star 1e-5`; system python3 lacks matplotlib — use the aiperf venv
 or conda python). Point coordinates and per-point guards:
-`results/agentx/frontier_c16.json`.
+`results/1x-rtx6000pro/agentx/frontier_c16.json`.
 
 ## Round 6: gamma-Ada validation
 
@@ -634,7 +634,7 @@ or conda python). Point coordinates and per-point guards:
 1800 s) then `analysis/adaptive_gamma_check.py --gamma-star 1e-5 --bracket
 3e-6 2e-5`. Arms: adaptive c8 + adaptive c16 (gamma0 = 1e-4), plus a fresh
 static gamma*=1e-5 c8 reference; the static c16 gamma* cell is round 2's.
-Raw output: `results/agentx_adaptive/adaptive_gamma_check.json`.
+Raw output: `results/1x-rtx6000pro/agentx_adaptive/adaptive_gamma_check.json`.
 
 **c16 (the validation cell): PASS — bracket, hit, starvation, and TPOT all
 hold.**
@@ -681,3 +681,91 @@ c8 sits two orders above the c16 bracket — harmless where the dial does
 not bind, and a documented caveat for any deployment that carries one
 gamma across concurrencies. Upstream candidate (with boost) pending H200
 validation.
+
+## Full run (2026-10-07): five-policy comparison at c4/c8 — final RTX run
+
+Self-contained write-up (setup, execution log, table, trajectories,
+verdicts, acceptance): `full_run.md`.
+
+6 arms x {c4, c8} = 12 cells, fresh boot per cell, seed 42, 1800 s, pinned
+serving config unchanged (`scripts/run_fullrun_c4c8.sh`; driver log
+`logs/fullrun_c4c8_20261007_022137.log`). Pre-flight dfs-weight smoke
+(600 s, c4) passed before the sweep — the arm that had 3 failed boot
+attempts and zero landed cells landed both cells cleanly here. Zero cell
+failures; nothing quarantined. Retractions 0 in all 12 cells; the
+>128-request FCFS fallback never came close (max `#queue-req` observed
+across all 12 servers: 2).
+
+Canonical table regenerated (`python3 analysis/print_results_table.py`,
+default mode). The two gamma-Ada rows carry `gamma0 -> converged` in the
+gamma column; their run_meta key stays (gamma0, k), so each supersedes the
+round-1 static cell at the same key (c4 1e-4 static; c8 1e-4 static) by
+latest-per-seed. The c8 5e-5 / 2e-4 boost rows are the round-1/2 static
+references, unchanged. Starvation threshold: the 12 full-run cells were
+regenerated at `--starvation-threshold 0.2` (2026-10-07; TTFT/TPOT p99
+fields added to the stats at the same time) — the 10 s default was blind
+at c4/c8 (waits 3 ms to ~8 s), leaving starv all-zero; no request lands
+between 0.2 s and the multi-second tail, so the 0.2 / 0.25 / 0.5 / 1 s
+rates coincide. Only the
+starvation fields (and the new p99 fields) changed, verified
+field-by-field against the 10 s output. The two static c8 references predate the scrape-retention
+policy, so they keep the 10 s threshold (marked †, not comparable).
+
+| Policy | c | γ | n | hit | q_p95 (s) | q_p99 (s) | starv | cold n | cold starv | warm n | warm starv | gap99 (s) | RPM | oTPM | TTFT (ms) | TPOT p95 (ms) | retr | q_p99 Δ vs LPM | Anti-starv. vs LPM |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **lpm (baseline)** | 4 | — | 224 | 0.918 | 0.005 | 2.760 | 0.018 | 7 | 0.000 | 217 | 0.018 | −2.486 | 7.3 | 5965 | 1718 | 29.0 | 0 | — | — |
+| boost | 4 | 1e-4→1.96e-4 * | 216 | 0.914 | 0.005 | 2.943 | 0.032 | 7 | 0.000 | 210 | 0.033 | −2.950 | 7.0 | 5184 | 1766 | 26.2 | 0 | +6.6% | −77.8% |
+| hrrn | 4 | — | 216 | 0.914 | 0.005 | 3.840 | 0.023 | 7 | 0.143 | 209 | 0.019 | +2.681 | 7.1 | 5364 | 1770 | 27.0 | 0 | +39.1% | −27.8% |
+| fcfs-match | 4 | — | 223 | 0.916 | 0.005 | 3.770 | 0.018 | 7 | 0.000 | 216 | 0.019 | −3.007 | 7.3 | 5922 | 1786 | 24.6 | 0 | +36.6% | +0.0% |
+| fcfs ‡ | 4 | — | 216 | 0.000 | 0.004 | 0.005 | 0.009 | 217 | 0.009 | 0 | — | — | 7.0 | 5184 | 1681 | 28.7 | 0 | −99.8% | +50.0% |
+| dfs-weight | 4 | — | 221 | 0.917 | 0.005 | 4.780 | 0.023 | 7 | 0.000 | 215 | 0.023 | −3.840 | 7.2 | 5476 | 1815 | 24.1 | 0 | +73.2% | −27.8% |
+| **lpm (baseline)** | 8 | — | 138 | 0.941 | 0.005 | 3.610 | 0.022 | 10 | 0.000 | 129 | 0.023 | −3.100 | 4.5 | 5674 | 2154 | 22.6 | 0 | — | — |
+| boost | 8 | 5e-5 | 143 | 0.940 | 0.005 | 3.570 | 0.007 † | 10 | 0.000 | 133 | 0.008 † | −3.091 | 4.7 | 5865 | 2230 | 24.3 | 0 | −1.1% | +68.2% † |
+| boost | 8 | 1e-4→9.8e-5 * | 138 | 0.939 | 0.005 | 3.620 | 0.022 | 10 | 0.000 | 128 | 0.023 | −3.100 | 4.5 | 5823 | 2233 | 21.0 | 0 | +0.3% | +0.0% |
+| boost | 8 | 2e-4 | 139 | 0.941 | 0.005 | 3.600 | 0.000 † | 10 | 0.000 | 130 | 0.000 † | −3.091 | 4.5 | 5678 | 2278 | 21.5 | 0 | −0.3% | +100.0% † |
+| hrrn | 8 | — | 142 | 0.940 | 0.005 | 2.570 | 0.014 | 10 | 0.000 | 132 | 0.015 | −2.010 | 4.7 | 5847 | 2058 | 21.7 | 0 | −28.8% | +36.4% |
+| fcfs-match | 8 | — | 143 | 0.941 | 0.005 | 3.570 | 0.021 | 10 | 0.000 | 133 | 0.023 | −3.093 | 4.7 | 5859 | 2154 | 24.5 | 0 | −1.1% | +4.5% |
+| fcfs ‡ | 8 | — | 146 | 0.000 | 0.005 | 3.540 | 0.021 | 146 | 0.021 | 0 | — | — | 4.8 | 5900 | 2166 | 23.9 | 0 | −1.9% | +4.5% |
+| dfs-weight | 8 | — | 138 | 0.940 | 0.005 | 2.800 | 0.021 | 10 | 0.000 | 129 | 0.023 | −2.689 | 4.5 | 5674 | 2115 | 21.3 | 0 | −22.4% | +4.5% |
+| **lpm (baseline)** | 16 | — | 201 | 0.869 | 73.929 | 94.750 | 0.380 | 20 | 0.400 | 185 | 0.378 | −12.232 | 6.6 | 5622 | 21468 | 98.6 | 6 | — | — |
+| boost | 16 | 3e-6 | 165 | 0.820 | 78.000 | 188.667 | 0.488 | 21 | 0.381 | 147 | 0.503 | −40.063 | 5.4 | 5061 | 25810 | 97.8 | 0 | +99.1% | −28.4% |
+| boost | 16 | 1e-5 | 170 | 0.838 | 87.833 | 171.167 | 0.457 | 20 | 0.600 | 153 | 0.438 | +36.656 | 5.5 | 5007 | 26937 | 103.3 | 5 | +80.7% | −20.3% |
+| boost | 16 | 2e-5 | 165 | 0.830 | 106.875 | 191.375 | 0.473 | 18 | 0.611 | 151 | 0.457 | +148.486 | 5.4 | 4940 | 26667 | 112.5 | 0 | +102.0% | −24.5% |
+| boost | 16 | 3e-5 | 159 | 0.810 | 111.250 | 192.250 | 0.531 | 18 | 0.389 | 144 | 0.549 | −30.451 | 5.2 | 4936 | 28227 | 102.9 | 0 | +102.9% | −39.7% |
+| boost | 16 | 1e-4 | 168 | 0.836 | 127.778 | 215.000 | 0.471 | 20 | 0.400 | 150 | 0.480 | −16.284 | 5.5 | 5023 | 28858 | 143.1 | 6 | +126.9% | −23.9% |
+| fcfs-match | 16 | — | 142 | 0.805 | 151.667 | 190.333 | 0.559 | 18 | 0.444 | 127 | 0.575 | −16.492 | 4.6 | 4590 | 31930 | 121.1 | 0 | +100.9% | −47.1% |
+| fcfs ‡ | 16 | — | 151 | 0.000 | 97.833 | 178.143 | 0.549 | 153 | 0.549 | 0 | — | — | 4.9 | 4697 | 32312 | 166.8 | 5 | +88.0% | −44.5% |
+
+(*) gamma-Ada rows: `gamma0 -> converged gamma` (last-quarter mean; the
+eval log carries the full per-admission trajectory). c16 rows are the
+round-2 sweep (static; unchanged). Footnotes (a)-(d) of the close-out
+table above apply verbatim.
+
+### Gamma-Ada trajectories (the two full-run boost cells)
+
+- **c4** (`c4_gada_k256_20261007_052130`, 222 arrivals): gamma0=1e-4 held
+  while the window filled, climbed through ~7e-4, **touched the 1e-3 clip
+  at 64% through the run**, then descended and settled at **1.96e-4** from
+  69% onward (last quarter 1.96-1.97e-4, flat). The plan's "pins at the
+  1e-3 clip" guess was half right: the clip was visited but not pinned —
+  the fixed point sits at ~2x gamma0. Benign at c4 headroom: hit 0.914,
+  starv@0.2s 0.032, TPOT p95 26.2 ms, all inside the arm band.
+- **c8** (`c8_gada_k256_20261007_090608`, 146 arrivals): gamma0=1e-4,
+  monotone slight decay, converged **9.82e-5** (last quarter 9.80-9.82e-5,
+  flat; peak = gamma0 itself). Dead center of the offline fixed-point band
+  for c8 (7.8e-5-1.4e-4, Task 8.1) and a hair under gamma0 — the dial does
+  not bind at c8, consistent with round 6.
+
+### Reading notes for the full-run table
+
+- **c4 queue tails are 2-3-request phenomena.** At n~220, q_p99 is the
+  ~2nd-worst wait; this run's outlier waits landed on warm first-admissions
+  in five of six arms (gap99 negative; round-1's lpm c4 had them on cold
+  ones, +6.60 s). hrrn is the only positive-sign arm (+2.68 s). Treat c4
+  gap99 sign as run noise; the round-1 sign is in the close-out table.
+- fcfs c4's q_p99 0.005 s (vs fcfs-match 3.77 s, same ordering) is the
+  same tail noise in the other direction: round-1 read fcfs 2.85 /
+  fcfs-match 1.77. The c4 queue-histogram percentiles rank arms only
+  within a run, not across runs.
+- The c16 group is carried unchanged from the close-out table for
+  completeness; the full run adds no c16 cells (that band belongs to H200).

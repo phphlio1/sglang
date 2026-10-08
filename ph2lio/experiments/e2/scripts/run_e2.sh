@@ -79,6 +79,8 @@ IN_BATCH_PREFIX_CACHING_MAX_PIN_S="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S:-60}"
 # Exported so start_server.sh sees the resolved values (not just inherited
 # ones), keeping the two scripts' defaults from drifting apart.
 export BOOST_GAMMA BOOST_BIN_SIZE BOOST_ADAPTIVE_GAMMA BOOST_CLOCK IN_BATCH_PREFIX_CACHING_MAX_PIN_S
+# Exported so the run_meta python block records the resolved values.
+export GRACE_PERIOD FORCE_RESTART
 # Dataset subsetting for policy mode (Task-4 targeted regime): empty = the
 # full dataset (official matrix points); N = first N entries in scan order
 # (same subset for every policy/seed, so arms stay comparable).
@@ -89,6 +91,16 @@ NUM_DATASET_ENTRIES="${NUM_DATASET_ENTRIES:-}"
 # agent-work gaps), so a small window is the arrival-density lever at c8.
 TRAJECTORY_START_MIN_RATIO="${TRAJECTORY_START_MIN_RATIO:-}"
 TRAJECTORY_START_MAX_RATIO="${TRAJECTORY_START_MAX_RATIO:-}"
+# Client drain after --benchmark-duration: stop issuing new requests, then
+# wait up to this many seconds for in-flight requests to return (their
+# responses count in metrics). inf = wait for all; fixes the in-flight-at-
+# close cut (the 306.3 s / 152.6 s prefill giants lost at lpm/c16).
+GRACE_PERIOD="${GRACE_PERIOD:-inf}"
+# 1 = always stop and boot a fresh server, even when the running server's
+# full policy spec matches: every cell starts from a cold radix cache (the
+# c16-sweep regime). 0 keeps the reuse rule (a warm server carries earlier
+# runs' cache state).
+FORCE_RESTART="${FORCE_RESTART:-0}"
 # ============================================================================
 
 AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800  # first run reconstructs the dataset cache
@@ -196,13 +208,16 @@ server_start() {  # $1 = policy
 
 ensure_server() {  # $1 = policy; sets SERVER_FRESH_BOOT (1 = this run booted)
   SERVER_FRESH_BOOT=1
-  if server_healthy; then
+  if server_healthy && [[ "${FORCE_RESTART}" != "1" ]]; then
     if policy_params_match "$1"; then
       log "reusing running server (full policy spec matches: $1)"
       SERVER_FRESH_BOOT=0
       return
     fi
     log "running server's policy spec does not match ${1}; restarting"
+    server_stop
+  elif server_healthy; then
+    log "FORCE_RESTART=1: stopping matching server for a cold radix cache"
     server_stop
   fi
   server_start "$1"
@@ -241,6 +256,7 @@ run_aiperf() {  # $1 = run_dir, $2 = concurrency, $3 = duration, extra flags in 
     --public-dataset "${DATASET}"
     --concurrency "${conc}"
     --benchmark-duration "${dur}"
+    --benchmark-grace-period "${GRACE_PERIOD}"
     --random-seed "${SEED}"
     --export-level records
     --use-server-token-count
@@ -363,6 +379,12 @@ meta = {
     # Server protocol: 1 = this run booted a fresh server (cold radix cache);
     # 0 = it reused a running server whose cache carries earlier runs.
     "server_fresh_boot": sys.argv[12] == "1",
+    # Client drain: seconds waited for in-flight requests after duration
+    # ("inf" = all); responses landing in the window count in metrics.
+    "grace_period_s": __import__("os").environ.get("GRACE_PERIOD", "inf"),
+    # 1 = ensure_server was forced to stop a spec-matching server so this
+    # cell starts from a cold radix cache.
+    "server_force_restart": __import__("os").environ.get("FORCE_RESTART", "0") == "1",
     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
 }
 Path(sys.argv[1]).write_text(json.dumps(meta, indent=2) + "\n")
@@ -466,7 +488,7 @@ Usage: $0 <mode> [args]
   array                    Slurm array mode (SLURM_ARRAY_TASK_ID 0..5 -> policies)
 Env knobs: SGLANG_URL MODEL TOKENIZER CONCURRENCY DURATION SEED OUTPUT_DIR
            SMOKE_POLICY SMOKE_DURATION NUM_ENTRIES HEALTH_TIMEOUT STOP_SERVER
-           BOOST_GAMMA BOOST_BIN_SIZE NUM_DATASET_ENTRIES
+           BOOST_GAMMA BOOST_BIN_SIZE NUM_DATASET_ENTRIES GRACE_PERIOD FORCE_RESTART
            TRAJECTORY_START_MIN_RATIO TRAJECTORY_START_MAX_RATIO
 EOF
     exit 2 ;;

@@ -1,15 +1,17 @@
 # E2 final report — UniBoost boost-policy campaign (RTX 6000 Pro)
 
 Seed-42 campaign, 2026-10-05/07. Companion to `agentx_experiment.md`
-(protocol and per-task detail) and `agentx_round2_findings.md` (results
-compendium); this file is the self-contained summary. Harness:
+(protocol and per-task detail) and `full_run.md` (the final c4/c8 run);
+this file is the self-contained summary. Harness:
 `ph2lio/experiments/e2`, AIPerf `inferencex-agentx-mvp`, Weka agentic-coding
 traces (256K-capped), Qwen3.8-27B-FP8 single GPU, DURATION=1800, fresh boot
 per cell.
 
 **Campaign status: closed on RTX 6000 Pro, pending the 4x H200 campaign**
 (which inherits round 4 targeted regime, round 5 seed replicas, and the
-hrrn c16 cell).
+hrrn c16 cell). The final RTX run — the full five-policy comparison at
+c4/c8 (2026-10-07, 12/12 cells landed, zero failures) — is documented in
+`full_run.md` and summarized in the "Full run" section below.
 
 ## Round-6 verdict — gamma-Ada validation (the one remaining GPU run)
 
@@ -49,6 +51,48 @@ start with zero configuration; its known scale sensitivity (per-concurrency,
 cache-state-dependent fixed point) is a documented caveat for deployments
 carrying one gamma across concurrencies.
 
+## Full run (2026-10-07): five-policy verdict at c4/c8
+
+12 cells (6 arms x {c4, c8}), fresh boot per cell, seed 42, zero failures
+(`scripts/run_fullrun_c4c8.sh`). Full table, gamma-Ada trajectories, and
+reading notes: `agentx_experiment.md` "Full run". Boost arm = gamma-Ada
+(gamma0=1e-4, k=256). Retractions 0 in all 12 cells; the >128-request FCFS
+fallback never came close (max `#queue-req` observed: 2).
+
+- **c4 (headroom band).** All six arms sit in one efficiency band — hit
+  0.914-0.918 (lpm best by <=0.4 pt), RPM 7.0-7.3 — so at c4 no policy buys
+  locality; the discriminating axes are the tails. TPOT p95: dfs-weight
+  24.1 and fcfs-match 24.6 lead; lpm is the worst of the field (29.0 ms);
+  boost (gamma-Ada, converged 1.96e-4) 26.2 and hrrn 27.0 sit between.
+  Fairness: at the 0.2 s stall threshold, 1-3% of requests wait over
+  0.2 s — fcfs best (0.009), lpm/fcfs-match 0.018, hrrn/dfs-weight
+  0.023, boost worst at 0.032 (−78% vs lpm: its reordering buys TPOT at
+  the cost of the stalled tail). q_p99
+  ranks boost closest to the lpm baseline (+6.6%; fcfs-match +37%,
+  hrrn +39%, dfs-weight +73% — dfs-weight buys its TPOT lead with the
+  worst queue tail and the lowest Jain, 0.186 vs lpm 0.208). Caveat: at
+  n~220 the c4 p99 is a 2-3-request phenomenon and its cold/warm
+  classification flipped vs round 1 (gap99 negative in five arms; hrrn
+  alone positive, +2.68 s) — treat c4 gap99 sign as run noise. Verdict:
+  boost tracks the lpm baseline's fairness at a 9% better TPOT p95 and
+  0.4 pt less hit; dfs-weight is the efficiency-favoring outlier; hrrn
+  shows no fairness dividend at c4.
+- **c8 (chunk-blocking band).** Efficiency is again tight on hit
+  (0.939-0.941) and RPM (4.5-4.8). TPOT p95: boost (gamma-Ada, converged
+  9.82e-5) leads the field at 21.0 ms, dfs-weight 21.3 and hrrn 21.7
+  follow, lpm 22.6, fcfs-match trails at 24.5. Fairness: hrrn is the
+  standout — lowest stall rate (0.014 at the 0.2 s threshold, +36% better
+  than lpm's 0.022), lowest q_p99 (2.57 s, −28.8% vs lpm) and the best
+  Jain (0.329 vs lpm 0.313); dfs-weight also cuts q_p99 −22.4%; boost
+  sits at exact lpm parity on stalls (0.022, +0.0%). This
+  matches insight 5: c8 tails are chunk-blocking, not ordering — the
+  gamma dial does not bind, and gamma-Ada's fixed point (9.82e-5, dead
+  center of the offline band 7.8e-5-1.4e-4, a hair under gamma0) confirms
+  round 6's "behaviorally identical to static at c8" from a fresh boot;
+  the static 5e-5 / 2e-4 references bracket the adaptive cell on a flat
+  frontier. Verdict: at c8, boost = lpm parity on fairness with the best
+  TPOT p95 of the field; hrrn is the fairness winner at equal hit.
+
 ## Canonical final table
 
 `python3 analysis/print_results_table.py` (default mode; latest-per-seed,
@@ -56,16 +100,20 @@ seed replicas n-weighted; lpm baseline bold per concurrency group):
 
 | Policy | c | γ | n | hit | q_p95 (s) | q_p99 (s) | starv | cold n | cold starv | warm n | warm starv | gap99 (s) | RPM | oTPM | TTFT (ms) | TPOT p95 (ms) | retr | q_p99 Δ vs LPM | Anti-starv. vs LPM |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **lpm (baseline)** | 4 | — | 217 | 0.912 | 0.005 | 2.830 | 0.000 | 7 | 0.000 | 210 | 0.000 | +6.596 | 7.1 | 5371 | 1851 | 28.4 | 0 | — | — |
-| boost | 4 | 1e-4 | 223 | 0.916 | 0.005 | 0.009 | 0.000 | 7 | 0.000 | 216 | 0.000 | −0.004 | 7.3 | 5922 | 1798 | 27.5 | 0 | −99.7% | 0% ¹ |
-| fcfs-match | 4 | — | 223 | 0.916 | 0.005 | 1.770 | 0.000 | 7 | 0.000 | 216 | 0.000 | −1.645 | 7.3 | 5922 | 1748 | 27.0 | 0 | −37.5% | 0% ¹ |
-| fcfs ‡ | 4 | — | 214 | 0.000 | 0.005 | 2.850 | 0.000 | 215 | 0.000 | 0 | — | — | 7.0 | 5165 | 1736 | 26.8 | 0 | +0.7% | 0% ¹ |
-| **lpm (baseline)** | 8 | — | 141 | 0.941 | 0.005 | 2.590 | 0.000 | 10 | 0.000 | 131 | 0.000 | −2.041 | 4.6 | 5839 | 1987 | 24.1 | 0 | — | — |
-| boost | 8 | 5e-5 | 143 | 0.940 | 0.005 | 3.570 | 0.007 | 10 | 0.000 | 133 | 0.008 | −3.091 | 4.7 | 5865 | 2230 | 24.3 | 0 | +37.8% | −0.7 pp ¹ |
-| boost | 8 | 1e-4 | 140 | 0.942 | 0.005 | 3.600 | 0.000 | 10 | 0.000 | 130 | 0.000 | −3.093 | 4.6 | 5836 | 2170 | 22.2 | 0 | +39.0% | 0% ¹ |
-| boost | 8 | 2e-4 | 139 | 0.941 | 0.005 | 3.600 | 0.000 | 10 | 0.000 | 130 | 0.000 | −3.091 | 4.5 | 5678 | 2278 | 21.5 | 0 | +39.0% | 0% ¹ |
-| hrrn | 8 | — | 129 | 0.937 | 0.005 | 2.855 | 0.000 | 10 | 0.000 | 119 | 0.000 | −2.767 | 4.2 | 5612 | 2146 | 24.5 | 0 | +10.2% | 0% ¹ |
-| fcfs ‡ | 8 | — | 139 | 0.000 | 0.005 | 2.805 | 0.000 | 139 | 0.000 | 0 | — | — | 4.6 | 5826 | 2099 | 24.3 | 0 | +8.3% | 0% ¹ |
+| **lpm (baseline)** | 4 | — | 224 | 0.918 | 0.005 | 2.760 | 0.018 | 7 | 0.000 | 217 | 0.018 | −2.486 | 7.3 | 5965 | 1718 | 29.0 | 0 | — | — |
+| boost | 4 | 1e-4→1.96e-4 * | 216 | 0.914 | 0.005 | 2.943 | 0.032 | 7 | 0.000 | 210 | 0.033 | −2.950 | 7.0 | 5184 | 1766 | 26.2 | 0 | +6.6% | −77.8% |
+| hrrn | 4 | — | 216 | 0.914 | 0.005 | 3.840 | 0.023 | 7 | 0.143 | 209 | 0.019 | +2.681 | 7.1 | 5364 | 1770 | 27.0 | 0 | +39.1% | −27.8% |
+| fcfs-match | 4 | — | 223 | 0.916 | 0.005 | 3.770 | 0.018 | 7 | 0.000 | 216 | 0.019 | −3.007 | 7.3 | 5922 | 1786 | 24.6 | 0 | +36.6% | +0.0% |
+| fcfs ‡ | 4 | — | 216 | 0.000 | 0.004 | 0.005 | 0.009 | 217 | 0.009 | 0 | — | — | 7.0 | 5184 | 1681 | 28.7 | 0 | −99.8% | +50.0% |
+| dfs-weight | 4 | — | 221 | 0.917 | 0.005 | 4.780 | 0.023 | 7 | 0.000 | 215 | 0.023 | −3.840 | 7.2 | 5476 | 1815 | 24.1 | 0 | +73.2% | −27.8% |
+| **lpm (baseline)** | 8 | — | 138 | 0.941 | 0.005 | 3.610 | 0.022 | 10 | 0.000 | 129 | 0.023 | −3.100 | 4.5 | 5674 | 2154 | 22.6 | 0 | — | — |
+| boost | 8 | 5e-5 | 143 | 0.940 | 0.005 | 3.570 | 0.007 † | 10 | 0.000 | 133 | 0.008 † | −3.091 | 4.7 | 5865 | 2230 | 24.3 | 0 | −1.1% | +68.2% † |
+| boost | 8 | 1e-4→9.8e-5 * | 138 | 0.939 | 0.005 | 3.620 | 0.022 | 10 | 0.000 | 128 | 0.023 | −3.100 | 4.5 | 5823 | 2233 | 21.0 | 0 | +0.3% | +0.0% |
+| boost | 8 | 2e-4 | 139 | 0.941 | 0.005 | 3.600 | 0.000 † | 10 | 0.000 | 130 | 0.000 † | −3.091 | 4.5 | 5678 | 2278 | 21.5 | 0 | −0.3% | +100.0% † |
+| hrrn | 8 | — | 142 | 0.940 | 0.005 | 2.570 | 0.014 | 10 | 0.000 | 132 | 0.015 | −2.010 | 4.7 | 5847 | 2058 | 21.7 | 0 | −28.8% | +36.4% |
+| fcfs-match | 8 | — | 143 | 0.941 | 0.005 | 3.570 | 0.021 | 10 | 0.000 | 133 | 0.023 | −3.093 | 4.7 | 5859 | 2154 | 24.5 | 0 | −1.1% | +4.5% |
+| fcfs ‡ | 8 | — | 146 | 0.000 | 0.005 | 3.540 | 0.021 | 146 | 0.021 | 0 | — | — | 4.8 | 5900 | 2166 | 23.9 | 0 | −1.9% | +4.5% |
+| dfs-weight | 8 | — | 138 | 0.940 | 0.005 | 2.800 | 0.021 | 10 | 0.000 | 129 | 0.023 | −2.689 | 4.5 | 5674 | 2115 | 21.3 | 0 | −22.4% | +4.5% |
 | **lpm (baseline)** | 16 | — | 201 | 0.869 | 73.929 | 94.750 | 0.380 | 20 | 0.400 | 185 | 0.378 | −12.232 | 6.6 | 5622 | 21468 | 98.6 | 6 | — | — |
 | boost | 16 | 3e-6 | 165 | 0.820 | 78.000 | 188.667 | 0.488 | 21 | 0.381 | 147 | 0.503 | −40.063 | 5.4 | 5061 | 25810 | 97.8 | 0 | +99.1% | −28.4% |
 | boost | 16 | 1e-5 | 170 | 0.838 | 87.833 | 171.167 | 0.457 | 20 | 0.600 | 153 | 0.438 | +36.656 | 5.5 | 5007 | 26937 | 103.3 | 5 | +80.7% | −20.3% |
@@ -77,7 +125,13 @@ seed replicas n-weighted; lpm baseline bold per concurrency group):
 
 Footnotes and reading notes (full text in `agentx_experiment.md` "Final
 results"): (a) anti-starvation deltas are vs the same-concurrency lpm
-baseline; the >10 s starvation rate is blind below c16-scale waits. (b) ‡
+baseline; starv counts queue waits above the cell's recorded threshold
+— 0.2 s for the full-run c4/c8 cells (regenerated 2026-10-07; the 10 s
+default was blind there, and no request lands between 0.2 s and the
+multi-second tail, so the 0.2 / 0.25 / 0.5 / 1 s rates coincide),
+10 s for the c16 sweep; † the two static c8 reference cells predate the
+scrape-retention policy and keep the 10 s threshold (not comparable with
+the 0.2 s rows). (b) ‡
 fcfs hit=0.000 is a sort-time bookkeeping artifact (cache-agnostic
 policies never populate `num_matched_prefix_tokens` when
 `supports_fast_match_prefix()` is False); fcfs has real admission-time
@@ -90,7 +144,7 @@ hrrn row is fresh-boot, with the measured fresh-vs-warm confound
 (+0.7 pts hit, +3.2% oTPM, +23.7% TPOT p95 on the 1e-4 pair) leaving
 ~2.4-5.2 pts of the hit gap structural to boost-vs-lpm.
 
-Frontier plot: `results/agentx/frontier_c16.png` (gamma* = 1e-5 ringed).
+Frontier plot: `results/1x-rtx6000pro/agentx/frontier_c16.png` (gamma* = 1e-5 ringed).
 
 ## Insights
 
@@ -153,5 +207,5 @@ Frontier plot: `results/agentx/frontier_c16.png` (gamma* = 1e-5 ringed).
 3. `2c82ab2323` — `arch.py` CCCL toolkit-check opt-out (own commit)
 4. `4f1a287b22` — docs + close-out
 
-Results tree intentionally untracked. Repro: see `RUN.md` and the
-"Repro" section of `agentx_round2_findings.md`.
+Results tree intentionally untracked. Repro: see `RUN.md`; the full-run
+driver is `scripts/run_fullrun_c4c8.sh` (see `full_run.md`).

@@ -6,11 +6,16 @@ canonical RTX blocks print by default (the c4/c8 full run 2026-10-07 and
 the c16 sweep 2026-10-08); --all-blocks prints every landed block.
 
 Columns (spec docs/metrics_v2.md section 3, in order): n, cache hit (%),
-queue avg/p95/p99 (s), TTFT avg/p95/p99 (ms), ITL p50/p95/p99 (ms), tok/s,
+queue mean/p90/p99 (s), TTFT mean/p95/p99 (ms), ITL mean/p90/p99 (ms), tok/s,
 Jain, stretch p95/p99, worst-5% wait share (%). n prints both populations
 (P_done = completed profile records; P_wait = eval-log admissions) -- the
 eval-log rid and the profile x_request_id do not join, so every metric
 names its population in e2_metrics_v2.json.
+
+fcfs-match prints as "fcfs" (decided 2026-10-08: it is the fcfs arm --
+identical ordering plus the sort-time match the bookkeeping fix
+bdc67a5720 made redundant to force); plain pre-fix fcfs cells are
+excluded from this table.
 
 A side table cross-checks queue p95/p99 (eval log, exact) against the
 frozen v1 histogram percentiles per cell -- the evidence that moved the
@@ -36,9 +41,9 @@ from print_results_table import FINAL_POLICY_ORDER, cell_key, group_full_runs
 CANONICAL_COMMITS = ("c634f2c859", "0083303206")
 
 HEADER = (
-    "| Policy | n done | n wait | cache hit (%) | queue avg (s) | queue p95 (s) "
-    "| queue p99 (s) | TTFT avg (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL p50 (ms) "
-    "| ITL p95 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 "
+    "| Policy | n done | n wait | cache hit (%) | queue mean (s) | queue p90 (s) "
+    "| queue p99 (s) | TTFT mean (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL mean (ms) "
+    "| ITL p90 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 "
     "| worst-5% wait (%) |"
 )
 SEP = "|" + "---|" * 17
@@ -74,7 +79,7 @@ def _pct(fraction, spec=".2f"):
 
 def table_row(cell: tuple, run: dict) -> str:
     meta, m = run["meta"], run["metrics_v2"]
-    policy = cell[0]
+    policy = "fcfs" if cell[0] == "fcfs-match" else cell[0]
     label = f"**{policy} (baseline)**" if policy == "lpm" else policy
     queue = m["queue_wait_s"]
     ttft = m["ttft_ms"]
@@ -87,13 +92,13 @@ def table_row(cell: tuple, run: dict) -> str:
             str(m["n"]["p_wait"]),
             _pct(m["cache_hit"]["rate"]),
             _fmt(queue["mean"], ".3f"),
-            _fmt(queue["p95"], ".3f"),
+            _fmt(queue["p90"], ".3f"),
             _fmt(queue["p99"], ".3f"),
             _fmt(ttft["mean"], ".2f"),
             _fmt(ttft["p95"], ".2f"),
             _fmt(ttft["p99"], ".2f"),
-            _fmt(itl["p50"], ".2f"),
-            _fmt(itl["p95"], ".2f"),
+            _fmt(itl["mean"], ".2f"),
+            _fmt(itl["p90"], ".2f"),
             _fmt(itl["p99"], ".2f"),
             _fmt(m["tok_per_s"]["value"], ".1f"),
             _fmt(m["jain_queue_wait"]["value"], ".3f"),
@@ -126,25 +131,25 @@ def _rel_delta(new, old):
 
 
 def print_cross_check(groups: list[dict]):
-    """Side table: eval-log queue p95/p99 vs frozen v1 histogram, per cell."""
-    print("\n## Cross-check: queue percentiles, eval log (v2) vs frozen histogram (v1)\n")
-    print("| Block | Cell | n wait | p95 eval (s) | p95 hist (s) | Δp95 | p99 eval (s) | p99 hist (s) | Δp99 |")
-    print("|" + "---|" * 8)
+    """Side table: eval-log queue p99 (exact) vs frozen v1 histogram, per cell."""
+    print("\n## Cross-check: queue p99, eval log (v2) vs frozen histogram (v1)\n")
+    print("| Block | Cell | n wait | p99 eval (s) | p99 hist (s) | Δp99 |")
+    print("|" + "---|" * 6)
     for group in groups:
         for cell in sorted(group["cells"], key=lambda c: (c[1], FINAL_POLICY_ORDER.get(c[0], 99))):
+            if cell[0] == "fcfs":
+                continue
             m = group["cells"][cell][-1]["metrics_v2"]
             queue = m["queue_wait_s"]
             frozen = m["cross_check"]["queue_histogram_frozen_v1"]
-            policy, conc = cell[0], cell[1]
+            policy = "fcfs" if cell[0] == "fcfs-match" else cell[0]
+            conc = cell[1]
             print(
                 " | ".join(
                     (
                         group["commit"][:10],
                         f"{policy}/c{conc}",
                         str(queue["n"]),
-                        _fmt(queue["p95"], ".3f"),
-                        _fmt(frozen["p95_s"], ".3f"),
-                        _rel_delta(queue["p95"], frozen["p95_s"]),
                         _fmt(queue["p99"], ".3f"),
                         _fmt(frozen["p99_s"], ".3f"),
                         _rel_delta(queue["p99"], frozen["p99_s"]),
@@ -167,6 +172,11 @@ def main():
     groups = group_full_runs(load_v2_runs(args.results_root))
     if not groups:
         sys.exit(f"no e2_metrics_v2.json under {args.results_root}; run: python3 analysis/metrics_v2.py --all")
+    # Plain fcfs cells are superseded by fcfs-match (which prints as "fcfs");
+    # they stay in e2_metrics_v2.json as the fcfs-match cross-check.
+    for group in groups:
+        group["cells"] = {c: runs for c, runs in group["cells"].items() if c[0] != "fcfs"}
+        group["n_cells"] = len(group["cells"])
 
     selected = groups if args.all_blocks else [g for g in groups if g["commit"][:10] in CANONICAL_COMMITS]
     missing = [c for c in CANONICAL_COMMITS if c not in {g["commit"][:10] for g in selected}]

@@ -5,7 +5,7 @@ e2_metrics.json). v2 replaces every threshold- or histogram-dependent
 metric with per-request measurements from the schedule-eval log and the
 records-level profile export (audit: docs/metrics_v2_audit.md):
 
-  - queue avg/p50/p95/p99 from eval-log queue_wait_s, exact; the v1
+  - queue mean/p90/p99 from eval-log queue_wait_s, exact; the v1
     histogram percentiles are bucket-resolution bounded (-40..-68% at
     c4/c8 p95, +13..+33% at c16 p99)
   - Jain on queue_wait_s, not TTFT (TTFT mixes legitimate prefill-time
@@ -326,10 +326,10 @@ def compute_metrics_v2(run_dir: Path) -> dict:
     )
     gaps = itl_chunk_gaps(done_rows)
     if gaps is not None:
-        itl = {"source": "per_chunk", "n_chunks": len(gaps), **stats(gaps, (50, 95, 99))}
+        itl = {"source": "per_chunk", "n_chunks": len(gaps), **stats(gaps, (90, 99))}
     else:
         tpot = tpot_values_ms(done_rows)
-        itl = {"source": "tpot_based", "n_chunks": None, **stats(tpot, (50, 95, 99))}
+        itl = {"source": "tpot_based", "n_chunks": None, **stats(tpot, (90, 99))}
 
     tps, window = tok_per_s(done_rows)
     ttfts_ms = [row["ttft_s"] * 1000.0 for row in done_rows]
@@ -369,7 +369,7 @@ def compute_metrics_v2(run_dir: Path) -> dict:
         },
         "n": {"p_done": len(done_rows), "p_wait": len(wait_rows)},
         "cache_hit": {"rate": cache_hit_rate(wait_rows), "population": "p_wait"},
-        "queue_wait_s": {**stats(waits, (50, 95, 99)), "population": "p_wait"},
+        "queue_wait_s": {**stats(waits, (90, 99)), "population": "p_wait"},
         "ttft_ms": {**stats(ttfts_ms, (95, 99)), "population": "p_done"},
         "itl_ms": {**itl, "population": "p_done"},
         "tok_per_s": {"value": tps, "window": window, "population": "p_done"},

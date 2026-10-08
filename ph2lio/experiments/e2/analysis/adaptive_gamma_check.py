@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Task 8.3 gamma-Ada validation: trajectory, bracket, and behavior guards.
 
-Reads the adaptive arms (results/agentx_adaptive/boost/c*_gada_k256_*), pulls
+Reads the adaptive arms (results/1x-rtx6000pro/agentx_adaptive/boost/c*_gada_k256_*), pulls
 the per-record gamma trajectory from each run's schedule_eval.jsonl (the
 scheduler stamps the current adapted gamma on every record), and checks:
 
@@ -111,9 +111,9 @@ def arm_row(name: str, run_dir: Path | None) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--adaptive-root", type=Path, default=E2 / "results" / "agentx_adaptive"
+        "--adaptive-root", type=Path, default=E2 / "results" / "1x-rtx6000pro" / "agentx_adaptive"
     )
-    parser.add_argument("--official-root", type=Path, default=E2 / "results" / "agentx")
+    parser.add_argument("--official-root", type=Path, default=E2 / "results" / "1x-rtx6000pro" / "agentx")
     parser.add_argument("--gamma-star", type=float, required=True)
     parser.add_argument(
         "--bracket",
