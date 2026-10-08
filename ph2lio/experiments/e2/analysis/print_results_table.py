@@ -5,7 +5,7 @@ Default: the canonical FINAL TABLE (markdown) -- rows grouped by concurrency,
 each group led by its lpm baseline (bold), boost rows sorted by gamma
 ascending, then hrrn / fcfs-match / fcfs, then any other arms; two computed
 delta columns against the lpm baseline of the same concurrency; footnotes
-(a)-(d). Within a cell the latest run per seed is kept (a fresh-boot re-run
+(a)-(e). Within a cell the latest run per seed is kept (a fresh-boot re-run
 supersedes an older same-seed run of that cell); seeds then average into one
 n-weighted row by default (--per-seed emits one row per seed).
 
@@ -244,6 +244,9 @@ def final_rows(cells: dict[tuple, list[dict]], per_seed: bool) -> list[dict]:
     """Ordered row dicts: one per (cell [, seed]) with lpm baselines attached."""
     by_conc: dict[int, list[dict]] = {}
     for (policy, conc, gamma, k), runs in cells.items():
+        # Every run of a cell shares the harness config; only boost rows
+        # render a clock, so the clock rides on boost rows alone.
+        clock = runs[0]["meta"].get("boost_clock", "tokens") if policy == "boost" else None
         seed_latest = latest_per_seed(runs)
         replicas = (
             [
@@ -251,6 +254,7 @@ def final_rows(cells: dict[tuple, list[dict]], per_seed: bool) -> list[dict]:
                     "policy": policy,
                     "conc": conc,
                     "gamma": gamma,
+                    "clock": clock,
                     "seed": r["meta"].get("seed"),
                     "m": r["metrics"],
                 }
@@ -262,6 +266,7 @@ def final_rows(cells: dict[tuple, list[dict]], per_seed: bool) -> list[dict]:
                     "policy": policy,
                     "conc": conc,
                     "gamma": gamma,
+                    "clock": clock,
                     "seed": None,
                     "m": averaged_cell(runs),
                 }
@@ -300,13 +305,20 @@ def final_table(cells: dict[tuple, list[dict]], per_seed: bool = False) -> str:
         m = row["m"]
         lpm_m = row["lpm_m"]
         policy = row["policy"]
+        hit = dig(m, "queue_wait_per_request.first_attempt_cache_hit_rate")
         label = policy
         if policy == "lpm":
             label = "**lpm (baseline)**"
-        if policy == "fcfs":
+        # ‡ marks the pre-fix bookkeeping confound (hit stuck at ~0 with real
+        # reuse), not fcfs itself; post-fix cells read a real hit.
+        if policy == "fcfs" and (hit or 0.0) < 0.01:
             label = "fcfs ‡"
         if row["seed"] is not None:
             label += f" (seed {row['seed']})"
+        # † = wall-clock gamma in 1/s; unmarked boost gammas are per-token.
+        gamma_cell = fmt_gamma(row["gamma"])
+        if policy == "boost" and row["clock"] == "wall":
+            gamma_cell += " †"
 
         cold_n = dig(m, "queue_wait_per_request.cold_class.n") or 0
         warm_n = dig(m, "queue_wait_per_request.warm_class.n") or 0
@@ -325,9 +337,9 @@ def final_table(cells: dict[tuple, list[dict]], per_seed: bool = False) -> str:
                 [
                     label,
                     str(row["conc"]),
-                    fmt_gamma(row["gamma"]),
+                    gamma_cell,
                     str(dig(m, "n_complete_records") or 0),
-                    fmt(dig(m, "queue_wait_per_request.first_attempt_cache_hit_rate")),
+                    fmt(hit),
                     fmt(dig(m, "queue.queue_time_p95_s")),
                     fmt(q_p99),
                     fmt(starv),
@@ -404,12 +416,24 @@ def footnotes(cells: dict[tuple, list[dict]]) -> list[str]:
         else None
     )
 
-    return [
+    notes = [
         f"**Footnotes**\n\n(a) ¹ Anti-starvation is relative to the LPM baseline of the same concurrency; a relative change is undefined when the baseline is 0, so the cell prints the absolute point change instead (`−X.X pp`). The starvation rate counts queue waits > 10 s and is blind below that threshold, so at c4/c8 (waits ≤ 4 s) the rate column stays 0.000 for every arm -- the c4 evidence is the cold-vs-warm queue-wait gap (LPM +6.39 s → boost ~0.00 s, eliminated) and q_p99 −99.7% at hit parity.",
-        f"(b) ‡ fcfs confound: fcfs leaves the sort-time prefix-match bookkeeping at zero for this deployment's cache (every current implementation returns False from `supports_fast_match_prefix()`), so its hit column reads 0.000 even though admission-time matching gives it real cache reuse (Task 1's verdict); fcfs-match is the reference arm with the bookkeeping forced on. fcfs still measures FCFS *ordering*, which is what boost degenerates toward at large γ.",
+        "(b) ‡ marks fcfs rows whose hit column reads ~0.000: the pre-fix confound, where fcfs recorded no admission-time prefix-match bookkeeping, so real cache reuse showed as zero (admission-time matching does give fcfs reuse; fcfs-match stays the reference arm with sort-time matching forced on). Post-fix cells (commit bdc67a5720 and later) read a real hit -- the c16 validation sweep reads 0.785 -- and stay unmarked. fcfs still measures FCFS *ordering*, which is what boost degenerates toward at large γ.",
         f"(c) Cold-class starvation at c16: boost (γ={gamma_s}) {fmt(cold16)} vs LPM {fmt(lpm_cold16)} ({rel(cold16, lpm_cold16)} relative); fcfs {fmt(fcfs_cold16)} ({rel(fcfs_cold16, lpm_cold16)}). Overall starvation at c16: LPM {fmt(lpm_starv16)}, boost {fmt(boost_starv16)}, fcfs {fmt(fcfs_starv16)}.",
         "(d) Metric definitions: starv = share of requests with queue wait > 10 s; gap99 = cold-class p99 − warm-class p99 queue wait (schedule-eval log, first admission stamp); hit = token-weighted first-attempt prefix hit rate; q_p95/p99 = queue-wait percentiles (server histogram); TTFT = client-observed mean; retr = retraction count. Seed replicas average into one n-weighted row.",
     ]
+    if any(
+        key[0] == "boost" and runs[0]["meta"].get("boost_clock", "tokens") == "wall"
+        for key, runs in cells.items()
+    ):
+        notes.append(
+            "(e) † wall-clock gamma, in 1/s: the row runs `--boost-clock wall`, so gamma "
+            "scales seconds of service (arrival stamped in wall seconds, work scaled by "
+            "the measured token rate); unmarked boost gammas are tokens-clock (per token). "
+            "The two scales are not comparable -- the cross-mode identity is "
+            "γ_wall = γ_tokens * R (R = measured token rate)."
+        )
+    return notes
 
 
 # ---------------------------------------------------------------------------
@@ -433,12 +457,16 @@ def flat_table(cells: dict[tuple, list[dict]]) -> None:
     for key in sorted(singles, key=cell_sort_key):
         policy, conc, gamma, k = key
         m = singles[key]["metrics"]
+        # † = wall-clock gamma in 1/s; unmarked boost gammas are per-token.
+        gamma_s = fmt(gamma, ".0e") if gamma else "-"
+        if policy == "boost" and singles[key]["meta"].get("boost_clock", "tokens") == "wall":
+            gamma_s += "†"
         q = m.get("queue_wait_per_request", {})
         queue = m.get("queue", {})
         thr = m.get("throughput", {})
         retr = q.get("retractions", {}).get("value")
         print(
-            f"{policy:10s} {conc:2d} {fmt(gamma, '.0e') if gamma else '-':>6s} | "
+            f"{policy:10s} {conc:2d} {gamma_s:>6s} | "
             f"{m.get('n_complete_records', 0):4d} {fmt(q.get('first_attempt_cache_hit_rate'), '.3f'):>5s} | "
             f"{fmt(queue.get('queue_time_p95_s')):>6s} {fmt(queue.get('queue_time_p99_s')):>6s} "
             f"{fmt(queue.get('starvation_rate'), '.3f'):>5s} | "
@@ -453,7 +481,8 @@ def flat_table(cells: dict[tuple, list[dict]]) -> None:
         "\nlegend: hit=first-attempt token-weighted prefix hit rate; q_p95/p99/starv ="
         " queue-wait percentiles + >10s share (server histogram); c/w_strv = cold/warm"
         " per-class starvation (schedule-eval log); gap99 = cold p99 - warm p99 queue"
-        " wait; retr = retraction count (gauge sum). Units: s except rpm/oTPM."
+        " wait; retr = retraction count (gauge sum). Units: s except rpm/oTPM;"
+        " gamma† = wall-clock (1/s), unmarked gamma = per-token."
     )
 
 
