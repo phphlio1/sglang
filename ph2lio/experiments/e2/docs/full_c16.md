@@ -16,7 +16,9 @@ that require a comparator, each tagged *landed*; nothing from c4/c8.
 ## Setup
 
 - Driver: `scripts/run_fullrun_c16.sh` (new; continue-on-failure,
-  self-logging) over `scripts/run_e2.sh policy <arm> 16`. Serving config
+  self-logging) over `scripts/run_e2.sh policy <arm> 16`; at sweep end the
+  driver prints the canonical tables (`analysis/print_results_table.py`,
+  counted per full run — this sweep's block prints first). Serving config
   `scripts/start_server.sh` **unchanged**.
 - Qwen3.8-27B-FP8, single RTX 6000 Pro, DURATION=1800, seed 42, fresh boot
   per cell (`STOP_SERVER=always`), AIPerf `inferencex-agentx-mvp`, Weka
@@ -56,43 +58,57 @@ killed 2026-10-06 19:37 at hardware retirement). Health gauges: retractions
 
 ## Results — the six 2026-10-08 c16 cells
 
-Regenerated canonical rows (`analysis/print_results_table.py`; the full
-output also retains the landed Oct 6 static-gamma boost rows and the c4/c8
-groups — not quoted here):
+The c16 block of this sweep as the table script counts it
+(`analysis/print_results_table.py`: results are counted **per full run** —
+the cells sharing a sweep's `sglang_commit` stamp, one block per full run,
+latest first — in the `full_run.md` table format). The landed Oct 5/6/7 c16
+runs sit in their own blocks and never mix into this table:
 
-| Policy | c | γ | n | hit | q_p95 (s) | q_p99 (s) | starv | cold n | cold starv | warm n | warm starv | gap99 (s) | RPM | oTPM | TTFT (ms) | TPOT p95 (ms) | retr | q_p99 Δ vs LPM | Anti-starv. vs LPM |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **lpm (baseline)** | 16 | — | 178 | 0.858 | 79.750 | 183.800 | 0.409 | 17 | 0.529 | 164 | 0.396 | +155.689 | 5.8 | 5517 | 22799 | 92.7 | 0 | — | — |
-| boost | 16 | 1e-1 † | 160 | 0.822 | 93.600 | 167.200 | 0.482 | 18 | 0.389 | 146 | 0.493 | +12.233 | 5.2 | 4837 | 27742 | 168.1 | 0 | −9.0% | −17.8% |
-| hrrn | 16 | — | 175 | 0.841 | 90.250 | 174.429 | 0.436 | 21 | 0.571 | 158 | 0.418 | +46.177 | 5.7 | 5062 | 25198 | 126.6 | 1 | −5.1% | −6.6% |
-| fcfs-match | 16 | — | 150 | 0.801 | 91.750 | 174.500 | 0.588 | 21 | 0.524 | 132 | 0.598 | −9.411 | 4.9 | 5017 | 28224 | 128.9 | 6 | −5.1% | −43.8% |
-| fcfs | 16 | — | 149 | 0.785 | 91.333 | 169.600 | 0.559 | 20 | 0.450 | 132 | 0.576 | +45.231 | 4.9 | 3822 | 29614 | 129.6 | 6 | −7.7% | −36.7% |
-| dfs-weight | 16 | — | 157 | 0.830 | 95.000 | 340.000 | 0.388 | 17 | 0.353 | 143 | 0.392 | +153.981 | 5.1 | 5087 | 29119 | 104.7 | 6 | +85.0% | +5.1% |
+### c16 — concurrency 16
 
-Column definitions: starv = share of requests with queue wait > 10 s; hit =
-token-weighted first-attempt prefix hit rate; q_p95/p99 = queue-wait
-percentiles (server histogram); gap99 = cold-class p99 − warm-class p99
-queue wait (schedule-eval log, first admission stamp); TTFT = client-observed
-mean; retr = retraction count. **†** the boost row's gamma is wall-clock, in
-1/s: arrival is stamped in wall seconds and work is scaled by the measured
-token rate, so it is not comparable with per-token gammas — the cross-mode
-identity is γ_wall = γ_tokens · R. **‡** (no row here needs it) marks pre-fix
-fcfs rows whose hit reads ~0.000 — the bookkeeping artifact this sweep's
-fcfs row retires (0.785, unmarked).
+| Policy | γ | n | retr | cache hit (%) | q_p95 (s) | q_p99 (s) | starv (%) | cold n | warm n | cold starv (%) | warm starv (%) | gap99 (s) | RPM | TPM (M) | TTFT avg (s) | TTFT p95 (s) | TTFT p99 (s) | TPOT avg (ms) | TPOT p95 (ms) | TPOT p99 (ms) | Jain | q_p99 Δ vs LPM | Starv vs LPM |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **lpm (baseline)** | — | 178 | 0 | 85.81% | 79.750 | 183.800 | 40.88% | 17 | 164 | 52.94% | 39.63% | +155.69 | 5.8 | 0.599 | 22.80 | 93.46 | 127.21 | 35.77 | 92.67 | 199.70 | 0.378 | — | — |
+| hrrn | — | 175 | 1 | 84.07% | 90.250 | 174.429 | 43.58% | 21 | 158 | 57.14% | 41.77% | +46.18 | 5.7 | 0.571 | 25.20 | 98.26 | 153.07 | 38.44 | 126.63 | 222.36 | 0.352 | −5.10% | +6.60% |
+| boost | 1e-1 † | 160 | 0 | 82.25% | 93.600 | 167.200 | 48.17% | 18 | 146 | 38.89% | 49.32% | +12.23 | 5.2 | 0.512 | 27.74 | 100.99 | 133.67 | 46.97 | 168.14 | 279.23 | 0.391 | −9.03% | +17.83% |
+| fcfs-match | — | 150 | 6 | 80.12% | 91.750 | 174.500 | 58.82% | 21 | 132 | 52.38% | 59.85% | −9.41 | 4.9 | 0.467 | 28.22 | 96.83 | 138.50 | 466.18 | 128.90 | 1459.59 | 0.462 | −5.06% | +43.88% |
+| fcfs | — | 149 | 6 | 78.49% | 91.333 | 169.600 | 55.92% | 20 | 132 | 45.00% | 57.58% | +45.23 | 4.9 | 0.455 | 29.61 | 100.71 | 122.86 | 471.82 | 129.65 | 1309.15 | 0.436 | −7.73% | +36.79% |
+| dfs-weight | — | 157 | 6 | 82.99% | 95.000 | 340.000 | 38.75% | 17 | 143 | 35.29% | 39.16% | +153.98 | 5.1 | 0.525 | 29.12 | 98.86 | 318.20 | 38.18 | 104.72 | 319.89 | 0.183 | +84.98% | −5.21% |
+
+Columns (the table script's footnotes (a)–(e)): cache hit = token-weighted
+first-attempt prefix hit rate; starv = share of requests with queue wait >
+the cell's recorded threshold — **10 s** in these cells (c16 waits run tens
+of seconds; the c4/c8 tables in `full_run.md` use 0.2 s); q_p95/p99 =
+queue-wait percentiles (server histogram); gap99 = cold-class p99 −
+warm-class p99 queue wait (schedule-eval log, first admission stamp); RPM =
+requests/min; TPM (M) = total (input + output) tokens/min in millions;
+TTFT/TPOT = client-observed avg/p95/p99 (TTFT in s, TPOT in ms); Jain = TTFT
+fairness index (higher = fairer); retr = retraction count. Δ columns are vs
+the same-table lpm baseline — negative = better. **†** the boost row's gamma
+is wall-clock, in 1/s: arrival is stamped in wall seconds and work is scaled
+by the measured token rate, so it is not comparable with per-token gammas —
+the cross-mode identity is γ_wall = γ_tokens · R. **‡** (no row here needs
+it) marks pre-fix fcfs rows whose hit reads ~0.00% — the bookkeeping
+artifact this sweep's fcfs row retires (78.49%, unmarked).
 
 Reading of the field:
 
-- **hit**: lpm 0.858 best of six (field 0.785–0.858); boost 0.822 mid-field.
-- **queue tail (q_p99)**: boost 167.2 s best (−9.0% vs lpm); fcfs 169.6,
-  hrrn 174.4, fcfs-match 174.5, lpm 183.8; dfs-weight 340.0 worst (+85.0%).
-- **cold-class starvation**: dfs-weight 0.353 and boost 0.389 lead; lpm
-  0.529 and fcfs-match 0.524 trail.
-- **new-session penalty (gap99)**: fcfs-match −9.4 s and boost +12.2 s lead;
-  lpm +155.7 s and dfs-weight +154.0 s trail — the wall-clock boost arm
-  nearly closes the cold-vs-warm p99 gap the lpm baseline carries.
-- **TPOT p95**: lpm 92.7 ms best; boost 168.1 ms worst — the sweep's one
+- **hit**: lpm 85.81% best of six (field 78.49–85.81%); boost 82.25%
+  mid-field.
+- **queue tail (q_p99)**: boost 167.2 s best (−9.03% vs lpm); fcfs 169.6,
+  hrrn 174.4, fcfs-match 174.5, lpm 183.8; dfs-weight 340.0 worst (+84.98%).
+- **cold-class starvation**: dfs-weight 35.29% and boost 38.89% lead; lpm
+  52.94% and fcfs-match 52.38% trail.
+- **new-session penalty (gap99)**: fcfs-match −9.41 s and boost +12.23 s
+  lead; lpm +155.69 s and dfs-weight +153.98 s trail — the wall-clock boost
+  arm nearly closes the cold-vs-warm p99 gap the lpm baseline carries.
+- **TPOT p95**: lpm 92.67 ms best; boost 168.14 ms worst — the sweep's one
   regression flag (check 4).
-- **throughput**: oTPM 3822 (fcfs) – 5517 (lpm); boost 4837.
+- **fairness (Jain)**: fcfs-match 0.462 and fcfs 0.436 lead; boost 0.391
+  sits just over lpm 0.378; hrrn 0.352; dfs-weight 0.183 is the outlier low,
+  riding its queue tail.
+- **throughput**: TPM (M) 0.455 (fcfs) – 0.599 (lpm); boost 0.512 mid-field
+  (oTPM 4837).
 
 ## The six pre-registered checks
 
@@ -114,41 +130,44 @@ Reading of the field:
    exceeds 60 s** — the hrrn/dfs waits sit just under the bound, i.e. the
    bound is doing the capping; unbounded (*landed*, γ=1e-4 fresh cell) the
    same stamp ran to 108.3 s (7 followers, p50 12.4 s).
-3. **fcfs admission bookkeeping — PASS.** fcfs hit reads **0.785** — real
+3. **fcfs admission bookkeeping — PASS.** fcfs hit reads **78.49%** — real
    reuse, confirmed by its eval log (mean matched prefix ≈ 67k tokens, 79%
-   of admissions nonzero). fcfs-match 0.801 stays the honest sort-time
-   reference. The landed pre-fix fcfs row read 0.000 — the artifact this
+   of admissions nonzero). fcfs-match 80.12% stays the honest sort-time
+   reference. The landed pre-fix fcfs row read 0.00% — the artifact this
    fix retires (*landed*); the table script now scopes the ‡ marker to
    those rows.
 4. **Boost wall vs the best landed c16 static cell (γ=3e-6, the
-   cold-starvation pick) — MIXED.** Comparator (*landed*): hit 0.820, cold
-   starv 0.381, cold p99 111.0 s, q_p99 188.7 s, TPOT p95 97.8 ms. This
-   sweep's wall cell: hit 0.822, cold starv 0.389, cold p99 116.1 s, q_p99
-   167.2 s, TPOT p95 168.1 ms. Matched on hit (±0.002) and cold starvation
-   (+0.008); cold p99 +5.1 s; q_p99 better by 21.5 s cross-boot and −9.0%
-   vs the same-run lpm baseline. **TPOT p95 regressed**: 168.1 ms is the
-   sweep's worst by +29.7% over the next-worst arm (fcfs 129.6) and sits
-   beyond the landed same-config fresh-boot spread (γ=1e-4 pair
-   115.7 ↔ 143.1 ms; *landed*) and beyond every landed c16 boost cell
-   (97.8–143.1). Context that isolates the effect: the wall arm's reuse is
-   intact (≈74.6k tokens mean matched prefix, 82% of admissions nonzero)
-   and oTPM 4837 is mid-field — a decode-tail effect, not a throughput
-   collapse. **Follow-up, inherited by the H200 campaign: a static-wall
-   arm at the offline γ̂ ≈ 0.09 1/s** — if the static arm shows the same
-   tail, the clock mode is implicated; if not, gamma-Ada's transient is.
-5. **lpm hit — PASS (no regression).** lpm 0.858 is the sweep's best
-   (field 0.785–0.858). Landed context (*landed*): the landed lpm c16 row
-   0.869 is a round-1 warm-start row (the landed report measured the
-   fresh-vs-warm confound at +0.7 pts hit); against it the fresh 0.858 is
+   cold-starvation pick) — MIXED.** Comparator (*landed*): hit 82.0%, cold
+   starv 38.1%, cold p99 111.0 s, q_p99 188.7 s, TPOT p95 97.8 ms. This
+   sweep's wall cell: hit 82.25%, cold starv 38.89%, cold p99 116.1 s,
+   q_p99 167.2 s, TPOT p95 168.14 ms. Matched on hit (±0.2 pts) and cold
+   starvation (+0.8 pts); cold p99 +5.1 s; q_p99 better by 21.5 s
+   cross-boot and −9.03% vs the same-run lpm baseline. **TPOT p95
+   regressed**: 168.14 ms is the sweep's worst by +29.7% over the
+   next-worst arm (fcfs 129.65) and sits beyond the landed same-config
+   fresh-boot spread (γ=1e-4 pair 115.7 ↔ 143.1 ms; *landed*) and beyond
+   every landed c16 boost cell (97.8–143.1). Context that isolates the
+   effect: the wall arm's reuse is intact (≈74.6k tokens mean matched
+   prefix, 82% of admissions nonzero) and TPM 0.512 (oTPM 4837) is
+   mid-field — a decode-tail effect, not a throughput collapse.
+   **Follow-up, inherited by the H200 campaign: a static-wall arm at the
+   offline γ̂ ≈ 0.09 1/s** — if the static arm shows the same tail, the
+   clock mode is implicated; if not, gamma-Ada's transient is.
+5. **lpm hit — PASS (no regression).** lpm 85.81% is the sweep's best
+   (field 78.49–85.81%). Landed context (*landed*): the landed lpm c16 row
+   86.9% is a round-1 warm-start row (the landed report measured the
+   fresh-vs-warm confound at +0.7 pts hit); against it the fresh 85.81% is
    −1.1 pts — the same order as that confound, i.e. explained by
    warm-start state and boot variance.
-6. **Canonical table regeneration — PASS.** The table regenerates with all
-   six new rows; the wall boost row is clock-labeled (γ = 1e-1 †, footnote
-   e — wall and per-token gammas never mixed unlabeled) and ‡ is scoped to
-   pre-fix hit≈0 rows (footnote b rewritten). Per latest-per-seed semantics
-   the new rows supersede the landed same-cell rows (c16 lpm/fcfs/
-   fcfs-match are now the post-fix fresh rows); the landed snapshot remains
-   in `agentx_final_report.md`.
+6. **Canonical table regeneration — PASS.** The table script now counts
+   results **per full run** (cells grouped by their sweep's commit stamp,
+   one block per full run, latest first) and both full-run drivers print it
+   at sweep end; this sweep's block carries all six rows and nothing else —
+   the landed Oct 5/6/7 c16 runs sit in their own blocks, never mixed in.
+   The wall boost row is clock-labeled (γ = 1e-1 †, footnote e — wall and
+   per-token gammas never mixed unlabeled) and ‡ is scoped to pre-fix
+   hit≈0% rows (footnote b). The landed snapshot remains in
+   `agentx_final_report.md`.
 
 ## gamma-Ada wall trajectory (boost cell detail)
 
@@ -173,30 +192,34 @@ wall-clock gamma-Ada converges monotonically from 0.1 into the bracket
 (0.061 1/s, 0.67× the offline fixed point) with no FCFS-ward drift; the
 60 s follower-pin bound caps every follower wait in the sweep (worst 58.8 s,
 vs 108.3 s unbounded landed) while the boost arm's own followers wait
-≤ 1.7 s; fcfs reads real cache reuse (0.785); lpm keeps the best hit of the
-field (0.858). The wall-clock boost arm posts the sweep's best queue tail
-(q_p99 167.2 s, −9.0% vs lpm — the first c16 boost row to come in under the
+≤ 1.7 s; fcfs reads real cache reuse (78.5%); lpm keeps the best hit of the
+field (85.8%). The wall-clock boost arm posts the sweep's best queue tail
+(q_p99 167.2 s, −9.03% vs lpm — the first c16 boost row to come in under the
 lpm baseline of its own table) at matched hit and cold-class starvation,
-and nearly closes the new-session p99 gap (gap99 +12.2 s vs lpm's +155.7 s).
-One open flag: **TPOT p95 168.1 ms** — the sweep's worst by 30%, beyond the
-landed same-config boot spread, with reuse and throughput intact: a
-decode-tail effect. The H200 campaign inherits the follow-up (static-wall
-arm at γ̂ ≈ 0.09 1/s) alongside the wall-clock config this sweep validated.
+and nearly closes the new-session p99 gap (gap99 +12.23 s vs lpm's
++155.69 s). One open flag: **TPOT p95 168.14 ms** — the sweep's worst by
+30%, beyond the landed same-config boot spread, with reuse and throughput
+intact: a decode-tail effect. The H200 campaign inherits the follow-up
+(static-wall arm at γ̂ ≈ 0.09 1/s) alongside the wall-clock config this
+sweep validated.
 
 ## Reading notes
 
-- **TPOT p95 flag**: see check 4. Read TPOT by p95 only — at c16 the TPOT
-  *mean* is outlier-dominated (fcfs/fcfs-match means read 466–472 ms
-  against p95s of 129/128 ms) and is not a usable column.
+- **TPOT p95 flag**: see check 4. Read TPOT by p95 only — the TPOT avg
+  column at c16 is outlier-dominated (fcfs/fcfs-match 471.82/466.18 ms
+  against p95s of 129.65/128.90 ms; p99s 1309/1460 ms) and is not a usable
+  column.
 - **dfs-weight tails**: q_p99 340.0 s and cold p99 355.5 s — the sweep's
   worst by far (next-worst q_p99: lpm 183.8 s) with a mid-field TPOT p95
-  (104.7 ms): the arm's known TPOT-for-tails trade, now measured at c16.
+  (104.72 ms) and the field's lowest Jain (0.183): the arm's known
+  TPOT-for-tails trade, now measured at c16.
 - **Single-boot caveat**: one boot per cell, one seed; single-cell TPOT p95
   deltas at c16 carry boot variance (the landed same-config fresh pair
-  spread 115.7 ↔ 143.1 ms bounds it — *landed*). The flag's 168.1 ms sits
+  spread 115.7 ↔ 143.1 ms bounds it — *landed*). The flag's 168.14 ms sits
   beyond that bound; the queue-tail and hit results are cross-arm
   consistent and not boot-sensitive.
-- **TTFT**: client-observed mean 22.8–29.6 s, p95 93.5–101.0 s across arms —
+- **TTFT**: client-observed avg 22.80–29.61 s, p95 93.46–100.99 s, p99
+  122.86–318.20 s across arms (dfs-weight's p99 rides its queue tail) —
   c16 is the load-binding band on this GPU (see `full_run.md`'s reading
   note); queue depth mean 2.10–2.28, max 5–7.
 - The landed round-6 tokens-clock adaptive c16 cell (converged 1.76e-5) has
@@ -211,8 +234,9 @@ arm at γ̂ ≈ 0.09 1/s) alongside the wall-clock config this sweep validated.
 - Six pre-registered checks answered: **done** — five PASS, one MIXED
   (TPOT p95) with the prescribed follow-up.
 - Canonical table regenerated with the clock-labeled wall row and the
-  scoped ‡: **done** (this file quotes the six new rows; the script's full
-  output remains the canonical artifact).
+  scoped ‡: **done** — the table script now counts results per full run and
+  both full-run drivers print it at sweep end; this file quotes this
+  sweep's c16 block.
 - Held to the plan: no targeted-regime knobs, no second seed, no
   tokens-clock boost arm, no c4/c8 repeats.
 - RTX wall-clock numbers are never compared against H200 numbers; the H200

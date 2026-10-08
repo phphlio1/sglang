@@ -50,6 +50,12 @@ for c in 4 8; do
   run_cell boost "$c" BOOST_ADAPTIVE_GAMMA=1 BOOST_GAMMA=1e-4 BOOST_BIN_SIZE=256 BOOST_CLOCK=tokens
 done
 
+# Print the canonical tables, counted per full run (this sweep's block
+# first -- latest full run prints first).
+echo "=== [fullrun $(date +%H:%M:%S)] results tables ==="
+python3 analysis/print_results_table.py \
+  || echo "=== [fullrun] results tables FAILED (non-fatal) ==="
+
 echo "=== [fullrun] complete $(date) ==="
 if (( ${#FAILED[@]} )); then
   echo "=== [fullrun] FAILED cells: ${FAILED[*]} ==="

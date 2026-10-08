@@ -55,6 +55,12 @@ run_cell hrrn 16
 # c4-c16 adaptive fixed points); gamma-Ada converges from it.
 run_cell boost 16 BOOST_ADAPTIVE_GAMMA=1 BOOST_GAMMA=0.1 BOOST_BIN_SIZE=256 BOOST_CLOCK=wall
 
+# Print the canonical tables, counted per full run (this sweep's block
+# first -- latest full run prints first).
+echo "=== [fullrun-c16 $(date +%H:%M:%S)] results tables ==="
+python3 analysis/print_results_table.py \
+  || echo "=== [fullrun-c16] results tables FAILED (non-fatal) ==="
+
 echo "=== [fullrun-c16] complete $(date) ==="
 if (( ${#FAILED[@]} )); then
   echo "=== [fullrun-c16] FAILED cells: ${FAILED[*]} ==="

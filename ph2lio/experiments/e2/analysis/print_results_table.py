@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Print the E2 policy-comparison tables from per-run e2_metrics.json files.
 
-Default: the canonical FINAL TABLE (markdown) -- rows grouped by concurrency,
-each group led by its lpm baseline (bold), boost rows sorted by gamma
-ascending, then hrrn / fcfs-match / fcfs, then any other arms; two computed
-delta columns against the lpm baseline of the same concurrency; footnotes
-(a)-(e). Within a cell the latest run per seed is kept (a fresh-boot re-run
-supersedes an older same-seed run of that cell); seeds then average into one
-n-weighted row by default (--per-seed emits one row per seed).
+Results are counted PER FULL RUN: the cells of one sweep-driver invocation,
+identified by the sglang_commit stamp every cell of a sweep shares (the docs
+label sweeps the same way -- "6/6 cells under commit 0083303206"). One block
+per full run, latest first, so the sweep a driver just landed prints first
+(the full-run drivers call this script at sweep end). The block heading's
+date is a label read off the cells' timestamps, not a filter. Each block:
+one ### cN section per concurrency, in the docs/full_run.md table format
+(percent displays, TTFT/TPOT avg/p95/p99, Jain, TPM in M/min) plus a gamma
+column (the clock/scale disambiguator for boost rows) and two computed delta
+columns against the lpm baseline of the same table. Footnotes (a)-(e) print
+at the end; footnote (c) prints under each full run that holds c16
+lpm/fcfs/boost cells. Within a cell the latest run per seed is kept (a
+fresh-boot re-run supersedes an older same-seed run of that cell); seeds
+then average into one n-weighted row by default (--per-seed emits one row
+per seed).
 
---flat prints the round-1 flat table (one row per cell, latest run wins),
---calibration the R / b_gamma(k) calibration table.
+--flat prints the round-1 flat table (one row per cell across all full
+runs, latest run wins), --calibration the R / b_gamma(k) calibration table.
 
 Pure reporting: reads JSON, prints text. No server contact.
 """
@@ -27,9 +35,9 @@ from pathlib import Path
 # Display order matches the matrix driver (run_boost_matrix.sh).
 POLICY_ORDER = {"fcfs": 0, "lpm": 1, "boost": 2, "hrrn": 3, "dfs-weight": 4, "lof": 5}
 SWEEP_GAMMAS = ("3e-6", "5e-6", "1e-5", "2e-5", "3e-5", "5e-5", "1e-4", "2e-4", "5e-4")
-# Within a concurrency group: lpm baseline first, boost by gamma, then the
-# reference arms, then anything else.
-FINAL_POLICY_ORDER = {"lpm": 0, "boost": 1, "hrrn": 2, "fcfs-match": 3, "fcfs": 4}
+# Within a concurrency group (full_run.md arm order): lpm baseline first,
+# hrrn, boost by gamma, fcfs-match, fcfs, then anything else.
+FINAL_POLICY_ORDER = {"lpm": 0, "hrrn": 1, "boost": 2, "fcfs-match": 3, "fcfs": 4, "dfs-weight": 5, "lof": 6}
 
 EM = "—"  # em dash: no value / not applicable
 MINUS = "−"  # minus sign, matches the doc tables
@@ -47,30 +55,77 @@ def boost_gamma_resolved(meta: dict) -> float:
     return CLOCK_DEFAULT_GAMMA.get(meta.get("boost_clock", "tokens"), 1e-4)
 
 
-def load_cells(results_root: Path) -> dict[tuple, list[dict]]:
-    """(policy, conc, gamma, k) -> [(meta, metrics), ...] per run dir.
+# ---------------------------------------------------------------------------
+# Loading and full-run grouping
+# ---------------------------------------------------------------------------
 
-    Every run dir with run_meta.json is a comparison cell member (smoke runs
-    are not); the final table averages replicas, the flat table keeps the
-    latest.
-    """
-    cells: dict[tuple, list[dict]] = {}
+
+def load_runs(results_root: Path) -> list[dict]:
+    """[{meta, metrics}] for every run dir holding run_meta.json (smoke runs
+    record neither file and never appear)."""
+    runs = []
     for metrics_path in sorted(results_root.glob("*/*/e2_metrics.json")):
-        run_dir = metrics_path.parent
-        meta_path = run_dir / "run_meta.json"
+        meta_path = metrics_path.parent / "run_meta.json"
         if not meta_path.exists():
             continue
-        meta = json.loads(meta_path.read_text())
-        policy = meta["policy"]
-        conc = int(meta["concurrency"])
-        gamma, k = (
-            (boost_gamma_resolved(meta), int(meta["boost_bin_size"]))
-            if policy == "boost"
-            else (None, None)
+        runs.append(
+            {
+                "meta": json.loads(meta_path.read_text()),
+                "metrics": json.loads(metrics_path.read_text()),
+            }
         )
-        cells.setdefault((policy, conc, gamma, k), []).append(
-            {"meta": meta, "metrics": json.loads(metrics_path.read_text())}
+    return runs
+
+
+def cell_key(meta: dict) -> tuple:
+    """(policy, conc, gamma, k): the comparison cell a run belongs to."""
+    policy = meta["policy"]
+    gamma, k = (
+        (boost_gamma_resolved(meta), int(meta["boost_bin_size"]))
+        if policy == "boost"
+        else (None, None)
+    )
+    return (policy, int(meta["concurrency"]), gamma, k)
+
+
+def group_full_runs(runs: list[dict]) -> list[dict]:
+    """One entry per full run -- the cells sharing a sweep's sglang_commit
+    stamp -- latest first (the sweep a driver just landed prints first)."""
+    by_commit: dict[str, dict[tuple, list[dict]]] = {}
+    for run in runs:
+        meta = run["meta"]
+        by_commit.setdefault(meta["sglang_commit"], {}).setdefault(
+            cell_key(meta), []
+        ).append(run)
+
+    groups = []
+    for commit, cells in by_commit.items():
+        ts = [
+            r["meta"].get("timestamp") or ""
+            for cell_runs in cells.values()
+            for r in cell_runs
+        ]
+        first, last = min(ts)[:10], max(ts)[:10]
+        groups.append(
+            {
+                "commit": commit,
+                # Heading label only; runs are grouped by commit, never by date.
+                "date": first if first == last else f"{first}..{last}",
+                "last_ts": max(ts),
+                "n_cells": len(cells),
+                "cells": cells,
+            }
         )
+    groups.sort(key=lambda g: g["last_ts"], reverse=True)
+    return groups
+
+
+def merge_cells(groups: list[dict]) -> dict[tuple, list[dict]]:
+    """All full runs' cells in one {cell key -> [runs]} map (flat table)."""
+    cells: dict[tuple, list[dict]] = {}
+    for g in groups:
+        for key, cell_runs in g["cells"].items():
+            cells.setdefault(key, []).extend(cell_runs)
     return cells
 
 
@@ -88,12 +143,33 @@ def latest(cells: dict[tuple, list[dict]]) -> dict[tuple, dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+
 def fmt(v, spec=".3f") -> str:
     if v is None:
         return "-"
     if isinstance(v, float) and math.isnan(v):
         return "-"
     return format(v, spec)
+
+
+def pct(v, spec=".2f") -> str:
+    """Fraction -> percent display (full_run.md's hit/starv convention)."""
+    if v is None:
+        return EM
+    if isinstance(v, float) and math.isnan(v):
+        return EM
+    return format(v * 100.0, spec) + "%"
+
+
+def fmt_s(ms: float | None) -> str:
+    """Milliseconds -> seconds, full_run.md's TTFT display."""
+    if ms is None:
+        return EM
+    return fmt(ms / 1000.0, ".2f")
 
 
 def fmt_gamma(gamma: float | None) -> str:
@@ -117,8 +193,16 @@ def signed_fmt(v: float | None, spec=".3f") -> str:
     return f"{sign}{format(abs(v), spec)}"
 
 
+def dig(d: dict, path: str):
+    for part in path.split("."):
+        if not isinstance(d, dict):
+            return None
+        d = d.get(part)
+    return d
+
+
 # ---------------------------------------------------------------------------
-# Final table
+# Final table (per full run)
 # ---------------------------------------------------------------------------
 
 
@@ -168,13 +252,6 @@ def averaged_cell(runs: list[dict]) -> dict:
             ]
         )
 
-    def dig(d: dict, path: str):
-        for part in path.split("."):
-            if not isinstance(d, dict):
-                return None
-            d = d.get(part)
-        return d
-
     for path in (
         "queue_wait_per_request.first_attempt_cache_hit_rate",
         "queue.queue_time_p95_s",
@@ -186,9 +263,14 @@ def averaged_cell(runs: list[dict]) -> dict:
         "queue_wait_per_request.warm_class.starvation_rate",
         "queue_wait_per_request.cold_warm_queue_wait_gap.p99_s",
         "throughput.request_per_min",
-        "throughput.output_tokens_per_min",
+        "throughput.total_token_throughput_tps",
         "ttft.mean_ms",
+        "ttft.p95_ms",
+        "ttft.p99_ms",
+        "tpot.mean_ms",
         "tpot.p95_ms",
+        "tpot.p99_ms",
+        "fairness.ttft_fairness_jain",
     ):
         node = out
         parts = path.split(".")
@@ -209,35 +291,30 @@ def averaged_cell(runs: list[dict]) -> dict:
     return out
 
 
-def dig(d: dict, path: str):
-    for part in path.split("."):
-        if not isinstance(d, dict):
-            return None
-        d = d.get(part)
-    return d
-
-
 def q_p99_delta(cfg_q_p99: float | None, lpm_q_p99: float | None) -> str:
     if cfg_q_p99 is None or lpm_q_p99 in (None, 0):
         return EM
     # From the displayed .3f values so a reader recomputing the delta from the
     # printed columns gets the printed answer.
     cfg_r, lpm_r = round(cfg_q_p99, 3), round(lpm_q_p99, 3)
-    return signed_pct((cfg_r - lpm_r) / lpm_r * 100.0)
+    return signed_pct((cfg_r - lpm_r) / lpm_r * 100.0, ".2f")
 
 
-def anti_starvation_delta(cfg_starv: float | None, lpm_starv: float | None) -> str:
+def starv_vs_lpm_delta(cfg_starv: float | None, lpm_starv: float | None) -> str:
     if cfg_starv is None or lpm_starv is None:
         return EM
-    # Same displayed-value rule as q_p99_delta; the zero-baseline check reads
-    # the displayed value too (0.0004 displays as 0.000 and is degenerate).
-    cfg_r, lpm_r = round(cfg_starv, 3), round(lpm_starv, 3)
+    # Same displayed-value rule as q_p99_delta, at the printed precision
+    # (starv prints as a 2-dp percent = 4-dp fraction); the zero-baseline
+    # check reads the displayed value too (a 0.01% baseline is degenerate).
+    cfg_r, lpm_r = round(cfg_starv, 4), round(lpm_starv, 4)
     if lpm_r == 0:
         # Relative change is undefined against a zero baseline.
         if cfg_r == 0:
             return "0% ¹"
-        return f"{MINUS}{cfg_r * 100:.1f} pp ¹"
-    return signed_pct((lpm_r - cfg_r) / lpm_r * 100.0)
+        pp = (cfg_r - lpm_r) * 100.0
+        sign = "+" if pp >= 0 else MINUS
+        return f"{sign}{abs(pp):.1f} pp ¹"
+    return signed_pct((cfg_r - lpm_r) / lpm_r * 100.0, ".2f")
 
 
 def final_rows(cells: dict[tuple, list[dict]], per_seed: bool) -> list[dict]:
@@ -293,15 +370,25 @@ def final_rows(cells: dict[tuple, list[dict]], per_seed: bool) -> list[dict]:
 
 
 def final_table(cells: dict[tuple, list[dict]], per_seed: bool = False) -> str:
+    # full_run.md's columns and displays, plus the gamma column (the clock/
+    # scale disambiguator for boost rows); one ### section per concurrency.
     header = (
-        "| Policy | c | γ | n | hit | q_p95 (s) | q_p99 (s) | starv | cold n |"
-        " cold starv | warm n | warm starv | gap99 (s) | RPM | oTPM | TTFT (ms) |"
-        " TPOT p95 (ms) | retr | q_p99 Δ vs LPM | Anti-starv. vs LPM |"
+        "| Policy | γ | n | retr | cache hit (%) | q_p95 (s) | q_p99 (s) | starv (%) |"
+        " cold n | warm n | cold starv (%) | warm starv (%) | gap99 (s) | RPM | TPM (M) |"
+        " TTFT avg (s) | TTFT p95 (s) | TTFT p99 (s) | TPOT avg (ms) | TPOT p95 (ms) |"
+        " TPOT p99 (ms) | Jain | q_p99 Δ vs LPM | Starv vs LPM |"
     )
-    sep = "|---|" + "---|" * 19
-    lines = [header, sep]
+    sep = "|---|" + "---|" * 23
 
+    out: list[str] = []
+    conc_prev: int | None = None
     for row in final_rows(cells, per_seed):
+        if row["conc"] != conc_prev:
+            out.append(f"### c{row['conc']} — concurrency {row['conc']}")
+            out.append("")
+            out.append(header)
+            out.append(sep)
+            conc_prev = row["conc"]
         m = row["m"]
         lpm_m = row["lpm_m"]
         policy = row["policy"]
@@ -322,8 +409,8 @@ def final_table(cells: dict[tuple, list[dict]], per_seed: bool = False) -> str:
 
         cold_n = dig(m, "queue_wait_per_request.cold_class.n") or 0
         warm_n = dig(m, "queue_wait_per_request.warm_class.n") or 0
-        warm_starv = dig(m, "queue_wait_per_request.warm_class.starvation_rate")
         gap99 = dig(m, "queue_wait_per_request.cold_warm_queue_wait_gap.p99_s")
+        tps = dig(m, "throughput.total_token_throughput_tps")
 
         q_p99 = dig(m, "queue.queue_time_p99_s")
         starv = dig(m, "queue.starvation_rate")
@@ -331,35 +418,43 @@ def final_table(cells: dict[tuple, list[dict]], per_seed: bool = False) -> str:
         lpm_starv = dig(lpm_m, "queue.starvation_rate") if lpm_m else None
         is_baseline = policy == "lpm"
 
-        lines.append(
+        out.append(
             "| "
             + " | ".join(
                 [
                     label,
-                    str(row["conc"]),
                     gamma_cell,
                     str(dig(m, "n_complete_records") or 0),
-                    fmt(hit),
+                    fmt(dig(m, "queue_wait_per_request.retractions.value"), ".0f"),
+                    pct(hit),
                     fmt(dig(m, "queue.queue_time_p95_s")),
                     fmt(q_p99),
-                    fmt(starv),
+                    pct(starv),
                     str(cold_n),
-                    fmt(dig(m, "queue_wait_per_request.cold_class.starvation_rate")),
                     str(warm_n),
-                    fmt(warm_starv) if warm_n else EM,
-                    signed_fmt(gap99) if (warm_n and cold_n) else EM,
+                    pct(dig(m, "queue_wait_per_request.cold_class.starvation_rate"))
+                    if cold_n
+                    else EM,
+                    pct(dig(m, "queue_wait_per_request.warm_class.starvation_rate"))
+                    if warm_n
+                    else EM,
+                    signed_fmt(gap99, ".2f") if (warm_n and cold_n) else EM,
                     fmt(dig(m, "throughput.request_per_min"), ".1f"),
-                    fmt(dig(m, "throughput.output_tokens_per_min"), ".0f"),
-                    fmt(dig(m, "ttft.mean_ms"), ".0f"),
-                    fmt(dig(m, "tpot.p95_ms"), ".1f"),
-                    fmt(dig(m, "queue_wait_per_request.retractions.value"), ".0f"),
+                    fmt(tps * 60.0 / 1e6, ".3f") if tps is not None else EM,
+                    fmt_s(dig(m, "ttft.mean_ms")),
+                    fmt_s(dig(m, "ttft.p95_ms")),
+                    fmt_s(dig(m, "ttft.p99_ms")),
+                    fmt(dig(m, "tpot.mean_ms"), ".2f"),
+                    fmt(dig(m, "tpot.p95_ms"), ".2f"),
+                    fmt(dig(m, "tpot.p99_ms"), ".2f"),
+                    fmt(dig(m, "fairness.ttft_fairness_jain"), ".3f"),
                     EM if is_baseline else q_p99_delta(q_p99, lpm_q_p99),
-                    EM if is_baseline else anti_starvation_delta(starv, lpm_starv),
+                    EM if is_baseline else starv_vs_lpm_delta(starv, lpm_starv),
                 ]
             )
             + " |"
         )
-    return "\n".join(lines)
+    return "\n".join(out)
 
 
 def best_c16_boost(cells: dict[tuple, list[dict]]) -> tuple | None:
@@ -385,42 +480,57 @@ def best_c16_boost(cells: dict[tuple, list[dict]]) -> tuple | None:
     )[0]
 
 
-def footnotes(cells: dict[tuple, list[dict]]) -> list[str]:
-    lpm16 = latest(cells).get(("lpm", 16, None, None))
-    fcfs16 = latest(cells).get(("fcfs", 16, None, None))
+def c16_note(cells: dict[tuple, list[dict]]) -> str | None:
+    """Footnote (c) for one full run: the c16 cold-vs-baseline starvation
+    comparison. Only a run holding c16 lpm, fcfs and boost cells carries it."""
+    singles = latest(cells)
+    lpm16 = singles.get(("lpm", 16, None, None))
+    fcfs16 = singles.get(("fcfs", 16, None, None))
     best = best_c16_boost(cells)
-    best16 = latest(cells).get(best) if best else None
+    if not (lpm16 and fcfs16 and best):
+        return None
+    best16 = singles.get(best)
 
     def rel(a: float | None, b: float | None) -> str:
         if a is None or b in (None, 0):
             return "n/a"
         return f"{(a - b) / b * 100:+.1f}%"
 
-    lpm_starv16 = dig(lpm16["metrics"], "queue.starvation_rate") if lpm16 else None
-    fcfs_starv16 = dig(fcfs16["metrics"], "queue.starvation_rate") if fcfs16 else None
-    boost_starv16 = dig(best16["metrics"], "queue.starvation_rate") if best16 else None
-    gamma_s = fmt_gamma(best[2]) if best else "n/a"
-    cold16 = (
-        dig(best16["metrics"], "queue_wait_per_request.cold_class.starvation_rate")
-        if best16
-        else None
-    )
-    lpm_cold16 = (
-        dig(lpm16["metrics"], "queue_wait_per_request.cold_class.starvation_rate")
-        if lpm16
-        else None
-    )
-    fcfs_cold16 = (
-        dig(fcfs16["metrics"], "queue_wait_per_request.cold_class.starvation_rate")
-        if fcfs16
-        else None
+    def starv(run: dict | None) -> float | None:
+        return dig(run["metrics"], "queue.starvation_rate") if run else None
+
+    def cold(run: dict | None) -> float | None:
+        return (
+            dig(run["metrics"], "queue_wait_per_request.cold_class.starvation_rate")
+            if run
+            else None
+        )
+
+    cold16, lpm_cold16, fcfs_cold16 = cold(best16), cold(lpm16), cold(fcfs16)
+    return (
+        f"(c) Cold-class starvation at c16 (this full run): boost (γ={fmt_gamma(best[2])})"
+        f" {pct(cold16)} vs LPM {pct(lpm_cold16)} ({rel(cold16, lpm_cold16)} relative);"
+        f" fcfs {pct(fcfs_cold16)} ({rel(fcfs_cold16, lpm_cold16)}). Overall starvation"
+        f" at c16: LPM {pct(starv(lpm16))}, boost {pct(starv(best16))},"
+        f" fcfs {pct(starv(fcfs16))}."
     )
 
+
+def footnotes(cells: dict[tuple, list[dict]]) -> list[str]:
+    thresholds = sorted(
+        {
+            fmt(dig(r["metrics"], "queue.starvation_threshold_s"), ".4g")
+            for runs in cells.values()
+            for r in runs
+            if dig(r["metrics"], "queue.starvation_threshold_s") is not None
+        }
+    )
+    thresholds_str = " / ".join(f"{t} s" for t in thresholds) if thresholds else "per-cell"
+
     notes = [
-        f"**Footnotes**\n\n(a) ¹ Anti-starvation is relative to the LPM baseline of the same concurrency; a relative change is undefined when the baseline is 0, so the cell prints the absolute point change instead (`−X.X pp`). The starvation rate counts queue waits > 10 s and is blind below that threshold, so at c4/c8 (waits ≤ 4 s) the rate column stays 0.000 for every arm -- the c4 evidence is the cold-vs-warm queue-wait gap (LPM +6.39 s → boost ~0.00 s, eliminated) and q_p99 −99.7% at hit parity.",
-        "(b) ‡ marks fcfs rows whose hit column reads ~0.000: the pre-fix confound, where fcfs recorded no admission-time prefix-match bookkeeping, so real cache reuse showed as zero (admission-time matching does give fcfs reuse; fcfs-match stays the reference arm with sort-time matching forced on). Post-fix cells (commit bdc67a5720 and later) read a real hit -- the c16 validation sweep reads 0.785 -- and stay unmarked. fcfs still measures FCFS *ordering*, which is what boost degenerates toward at large γ.",
-        f"(c) Cold-class starvation at c16: boost (γ={gamma_s}) {fmt(cold16)} vs LPM {fmt(lpm_cold16)} ({rel(cold16, lpm_cold16)} relative); fcfs {fmt(fcfs_cold16)} ({rel(fcfs_cold16, lpm_cold16)}). Overall starvation at c16: LPM {fmt(lpm_starv16)}, boost {fmt(boost_starv16)}, fcfs {fmt(fcfs_starv16)}.",
-        "(d) Metric definitions: starv = share of requests with queue wait > 10 s; gap99 = cold-class p99 − warm-class p99 queue wait (schedule-eval log, first admission stamp); hit = token-weighted first-attempt prefix hit rate; q_p95/p99 = queue-wait percentiles (server histogram); TTFT = client-observed mean; retr = retraction count. Seed replicas average into one n-weighted row.",
+        f"**Footnotes**\n\n(a) q_p99 Δ vs LPM and Starv vs LPM are relative to the same-table lpm baseline -- negative = better than baseline (lower queue tail / fewer stalled requests). ¹ the baseline's displayed starvation is 0.00%, so the relative change is undefined and the cell prints the absolute point change instead (±X.X pp). The starvation rate is blind below its per-cell threshold (footnote d).",
+        "(b) ‡ marks fcfs rows whose hit column reads ~0.00%: the pre-fix confound, where fcfs recorded no admission-time prefix-match bookkeeping, so real cache reuse showed as zero (admission-time matching does give fcfs reuse; fcfs-match stays the reference arm with sort-time matching forced on). Post-fix cells (commit bdc67a5720 and later) read a real hit -- the c16 validation sweep reads 78.5% -- and stay unmarked. fcfs still measures FCFS *ordering*, which is what boost degenerates toward at large γ.",
+        f"(d) Metric definitions: cache hit = token-weighted first-attempt prefix hit rate; starv = share of requests with queue wait > the cell's recorded starvation threshold ({thresholds_str} across these cells; the rate is blind below it); q_p95/p99 = queue-wait percentiles (server histogram); gap99 = cold-class p99 − warm-class p99 queue wait (schedule-eval log, first admission stamp); RPM = requests/min; TPM (M) = total (input + output) tokens/min in millions; TTFT/TPOT = client-observed avg/p95/p99 (TTFT in s, TPOT in ms); Jain = TTFT fairness index (higher = fairer); retr = retraction count. Seed replicas average into one n-weighted row.",
     ]
     if any(
         key[0] == "boost" and runs[0]["meta"].get("boost_clock", "tokens") == "wall"
@@ -479,7 +589,8 @@ def flat_table(cells: dict[tuple, list[dict]]) -> None:
         )
     print(
         "\nlegend: hit=first-attempt token-weighted prefix hit rate; q_p95/p99/starv ="
-        " queue-wait percentiles + >10s share (server histogram); c/w_strv = cold/warm"
+        " queue-wait percentiles + above-threshold share (per-cell"
+        " starvation_threshold_s; server histogram); c/w_strv = cold/warm"
         " per-class starvation (schedule-eval log); gap99 = cold p99 - warm p99 queue"
         " wait; retr = retraction count (gauge sum). Units: s except rpm/oTPM;"
         " gamma† = wall-clock (1/s), unmarked gamma = per-token."
@@ -545,22 +656,32 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    cells = load_cells(args.results_root)
-    if not cells:
+    runs = load_runs(args.results_root)
+    if not runs:
         sys.exit(f"no e2_metrics.json under {args.results_root}")
 
+    groups = group_full_runs(runs)
+    all_cells = merge_cells(groups)
+
     if args.flat:
-        flat_table(cells)
+        flat_table(all_cells)
         if args.calibration:
-            calibration_table(cells)
+            calibration_table(all_cells)
         return
 
-    print(final_table(cells, per_seed=args.per_seed))
-    print()
-    print("\n\n".join(footnotes(cells)))
+    for g in groups:
+        print(f"## Full run {g['date']} — commit {g['commit'][:10]} ({g['n_cells']} cells)")
+        print()
+        print(final_table(g["cells"], per_seed=args.per_seed))
+        note = c16_note(g["cells"])
+        if note:
+            print()
+            print(note)
+        print()
+    print("\n\n".join(footnotes(all_cells)))
     if args.calibration:
         print()
-        calibration_table(cells)
+        calibration_table(all_cells)
 
 
 if __name__ == "__main__":
