@@ -21,7 +21,8 @@ A side table cross-checks queue p95/p99 (eval log, exact) against the
 frozen v1 histogram percentiles per cell -- the evidence that moved the
 v2 table off the histogram (audit docs/metrics_v2_audit.md section 3).
 
-print_results_table.py (the v1 tables) is untouched; this is the v2 view.
+Self-contained: no import from print_results_table.py (the v1 view) -- the
+v1 script may change shape without breaking this pipeline.
 
 Usage:
     python3 analysis/print_metrics_v2_table.py [--all-blocks]
@@ -34,11 +35,65 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from print_results_table import FINAL_POLICY_ORDER, cell_key, group_full_runs
+
+# Self-contained on purpose: print_results_table.py (the v1 view) is free to
+# change shape without breaking the v2 pipeline; only the results-root layout
+# (results_root/<policy>/<run_dir>/{run_meta,e2_metrics_v2}.json) is shared.
+FINAL_POLICY_ORDER = {"lpm": 0, "boost": 1, "hrrn": 2, "fcfs-match": 3, "fcfs": 4, "dfs-weight": 5}
+
+# The harness records boost_gamma null when the flag was left to the clock-mode
+# default (1e-4 tokens / 0.1 1/s wall); float(None) would crash.
+CLOCK_DEFAULT_GAMMA = {"tokens": 1e-4, "wall": 0.1}
+
+
+def _boost_gamma_resolved(meta: dict) -> float:
+    gamma = meta["boost_gamma"]
+    if gamma is not None:
+        return float(gamma)
+    return CLOCK_DEFAULT_GAMMA.get(meta.get("boost_clock", "tokens"), 1e-4)
+
+
+def _cell_key(meta: dict) -> tuple:
+    """(policy, conc, gamma, k, clock): the comparison cell a run belongs to.
+    The clock rides on boost cells so a wall arm and a tokens arm with the
+    same gamma/k never merge into one cell."""
+    policy = meta["policy"]
+    gamma, k, clock = (
+        (_boost_gamma_resolved(meta), int(meta["boost_bin_size"]), meta.get("boost_clock", "tokens"))
+        if policy == "boost"
+        else (None, None, None)
+    )
+    return (policy, int(meta["concurrency"]), gamma, k, clock)
+
+
+def _group_full_runs(runs: list[dict]) -> list[dict]:
+    """One entry per full run -- the cells sharing a sweep's sglang_commit
+    stamp -- latest first (the sweep a driver just landed prints first)."""
+    by_commit: dict[str, dict[tuple, list[dict]]] = {}
+    for run in runs:
+        meta = run["meta"]
+        by_commit.setdefault(meta["sglang_commit"], {}).setdefault(_cell_key(meta), []).append(run)
+
+    groups = []
+    for commit, cells in by_commit.items():
+        ts = [r["meta"].get("timestamp") or "" for cell_runs in cells.values() for r in cell_runs]
+        first, last = min(ts)[:10], max(ts)[:10]
+        groups.append(
+            {
+                "commit": commit,
+                # Heading label only; runs are grouped by commit, never by date.
+                "date": first if first == last else f"{first}..{last}",
+                "last_ts": max(ts),
+                "n_cells": len(cells),
+                "cells": cells,
+            }
+        )
+    groups.sort(key=lambda g: g["last_ts"], reverse=True)
+    return groups
 
 # The two canonical RTX blocks: c4/c8 full run (2026-10-07) and the c16
 # validation sweep (2026-10-08). Identified by commit stamp, never by date.
-CANONICAL_COMMITS = ("c634f2c859", "0083303206")
+CANONICAL_COMMITS = ("c634f2c859", "0083303206", "101ea1dcf3")
 
 HEADER = (
     "| Policy | n done | n wait | cache hit (%) | queue mean (s) | queue p90 (s) "
@@ -169,7 +224,7 @@ def main():
     )
     args = parser.parse_args()
 
-    groups = group_full_runs(load_v2_runs(args.results_root))
+    groups = _group_full_runs(load_v2_runs(args.results_root))
     if not groups:
         sys.exit(f"no e2_metrics_v2.json under {args.results_root}; run: python3 analysis/metrics_v2.py --all")
     # Plain fcfs cells are superseded by fcfs-match (which prints as "fcfs");

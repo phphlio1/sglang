@@ -70,9 +70,45 @@ Ngoài danh sách (starvation mọi ngưỡng, cold/warm, gap99) vẫn tính và
 lưu trong khối `cross_check` của `e2_metrics_v2.json` (kèm percentile
 histogram frozen v1 để đối chiếu), không vào bảng.
 
-## 3. Bảng v2 — hai block canonical, đếm per-full-run (theo `sglang_commit`)
+## 3. Bảng v2 — ba block canonical, đếm per-full-run (theo `sglang_commit`)
 
 Output của `python3 analysis/print_metrics_v2_table.py`:
+
+
+## Full run 2026-10-09 — commit 101ea1dcf3 (15 cells)
+
+Sweep mentor-stage-1: c4/c8/c16 × {fcfs-match, lpm, hrrn, dfs-weight,
+boost} × 1 run × 30', seed 42, fresh boot mỗi cell (FORCE_RESTART=1),
+grace 30s (drain in-flight sau duration, đếm vào metrics). Boost chạy
+gamma tĩnh γ̂ offline = 0.09 1/s (wall clock), không adaptive.
+
+### c4 — concurrency 4
+
+| Policy | n done | n wait | cache hit (%) | queue mean (s) | queue p90 (s) | queue p99 (s) | TTFT mean (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL mean (ms) | ITL p90 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 | worst-5% wait (%) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+**lpm (baseline)** | 220 | 222 | 91.76% | 0.092 | 0.002 | 2.936 | 1779.20 | 7225.36 | 13642.73 | 42.66 | 44.28 | 83.00 | 92.9 | 0.015 | 0.01 | 2.85 | 98.55%
+boost | 212 | 212 | 91.30% | 0.058 | 0.002 | 2.246 | 1768.20 | 7071.56 | 13541.61 | 42.77 | 44.05 | 80.15 | 88.3 | 0.012 | 0.01 | 0.24 | 97.64%
+hrrn | 222 | 222 | 91.76% | 0.050 | 0.002 | 1.936 | 1682.95 | 7080.40 | 11586.28 | 43.30 | 44.22 | 79.97 | 99.6 | 0.013 | 0.01 | 1.95 | 97.34%
+fcfs | 223 | 223 | 91.79% | 0.133 | 0.002 | 3.596 | 1839.42 | 7881.43 | 11718.51 | 42.26 | 44.57 | 86.97 | 99.3 | 0.029 | 0.01 | 4.86 | 99.00%
+dfs-weight | 216 | 217 | 91.32% | 0.104 | 0.002 | 5.220 | 1748.93 | 7631.11 | 14055.84 | 43.79 | 44.25 | 85.84 | 88.6 | 0.021 | 0.02 | 1.35 | 98.38%
+### c8 — concurrency 8
+
+| Policy | n done | n wait | cache hit (%) | queue mean (s) | queue p90 (s) | queue p99 (s) | TTFT mean (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL mean (ms) | ITL p90 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 | worst-5% wait (%) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+**lpm (baseline)** | 143 | 143 | 94.21% | 0.183 | 0.003 | 3.890 | 2323.19 | 11117.82 | 16321.75 | 41.33 | 42.29 | 74.85 | 99.6 | 0.021 | 0.01 | 1.71 | 99.10%
+boost | 142 | 142 | 94.10% | 0.136 | 0.003 | 4.935 | 2251.08 | 10410.30 | 14503.18 | 40.68 | 41.96 | 71.91 | 99.0 | 0.026 | 0.01 | 2.37 | 98.85%
+hrrn | 143 | 143 | 94.04% | 0.044 | 0.003 | 1.683 | 2089.60 | 9905.51 | 14053.79 | 42.09 | 42.30 | 75.69 | 99.4 | 0.015 | 0.01 | 0.60 | 96.51%
+fcfs | 137 | 138 | 94.00% | 0.046 | 0.003 | 1.828 | 2113.72 | 10044.72 | 14439.41 | 42.71 | 42.59 | 84.51 | 96.8 | 0.016 | 0.01 | 0.64 | 96.63%
+dfs-weight | 142 | 142 | 94.02% | 0.059 | 0.003 | 2.573 | 2120.06 | 9953.82 | 14067.36 | 43.61 | 44.39 | 84.47 | 98.9 | 0.022 | 0.01 | 0.88 | 96.84%
+### c16 — concurrency 16
+
+| Policy | n done | n wait | cache hit (%) | queue mean (s) | queue p90 (s) | queue p99 (s) | TTFT mean (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL mean (ms) | ITL p90 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 | worst-5% wait (%) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+**lpm (baseline)** | 169 | 173 | 84.81% | 19.892 | 57.810 | 153.131 | 23958.37 | 74285.69 | 130670.55 | 77.16 | 52.70 | 211.51 | 87.8 | 0.282 | 38.05 | 53.58 | 30.57%
+boost | 164 | 168 | 83.03% | 19.536 | 53.201 | 173.198 | 23028.70 | 84795.82 | 117749.90 | 92.71 | 53.32 | 245.14 | 85.5 | 0.261 | 31.07 | 54.27 | 35.18%
+hrrn | 177 | 180 | 84.84% | 17.409 | 51.919 | 111.336 | 23593.50 | 82065.00 | 141705.79 | 81.41 | 53.10 | 226.71 | 95.6 | 0.321 | 25.11 | 50.04 | 29.58%
+fcfs | 163 | 168 | 81.86% | 21.100 | 65.599 | 140.530 | 26134.03 | 93752.34 | 147291.40 | 83.28 | 52.73 | 225.47 | 83.6 | 0.303 | 47.25 | 79.39 | 32.64%
+dfs-weight | 143 | 146 | 81.58% | 27.500 | 51.702 | 365.985 | 35114.19 | 171258.53 | 383571.18 | 95.34 | 53.81 | 191.56 | 81.4 | 0.140 | 31.60 | 65.52 | 56.89%
 
 
 ## Full run 2026-10-08 — commit 0083303206 (5 cells)
@@ -114,6 +150,21 @@ dfs-weight | 138 | 139 | 94.01% | 0.061 | 0.003 | 2.610 | 2114.71 | 10166.08 | 1
 
 | Block | Cell | n wait | p99 eval (s) | p99 hist (s) | Δp99 |
 |---|---|---|---|---|---|
+101ea1dcf3 | lpm/c4 | 222 | 2.936 | 3.780 | -22.3%
+101ea1dcf3 | boost/c4 | 212 | 2.246 | 2.440 | -7.9%
+101ea1dcf3 | hrrn/c4 | 222 | 1.936 | 2.780 | -30.4%
+101ea1dcf3 | fcfs/c4 | 223 | 3.596 | 3.885 | -7.4%
+101ea1dcf3 | dfs-weight/c4 | 217 | 5.220 | 6.383 | -18.2%
+101ea1dcf3 | lpm/c8 | 143 | 3.890 | 4.570 | -14.9%
+101ea1dcf3 | boost/c8 | 142 | 4.935 | 6.450 | -23.5%
+101ea1dcf3 | hrrn/c8 | 143 | 1.683 | 2.570 | -34.5%
+101ea1dcf3 | fcfs/c8 | 138 | 1.828 | 2.620 | -30.2%
+101ea1dcf3 | dfs-weight/c8 | 142 | 2.573 | 2.790 | -7.8%
+101ea1dcf3 | lpm/c16 | 173 | 153.131 | 213.500 | -28.3%
+101ea1dcf3 | boost/c16 | 168 | 173.198 | 172.000 | +0.7%
+101ea1dcf3 | hrrn/c16 | 180 | 111.336 | 140.000 | -20.5%
+101ea1dcf3 | fcfs/c16 | 168 | 140.530 | 181.333 | -22.5%
+101ea1dcf3 | dfs-weight/c16 | 146 | 365.985 | 377.000 | -2.9%
 0083303206 | lpm/c16 | 181 | 132.019 | 183.800 | -28.2%
 0083303206 | hrrn/c16 | 179 | 151.221 | 174.429 | -13.3%
 0083303206 | boost/c16 | 164 | 112.050 | 167.200 | -33.0%
@@ -131,6 +182,19 @@ c634f2c859 | fcfs/c8 | 143 | 3.067 | 3.570 | -14.1%
 c634f2c859 | dfs-weight/c8 | 139 | 2.610 | 2.800 | -6.8%
 
 ## 4. Đọc bảng v2
+
+- **Block 2026-10-09 (sweep stage-1, 15 cell)**: c4/c8 mọi arm gần
+  trùng nhau (queue mean 0.04–0.18 s; worst-5% ~97–99% = burst bootstrap
+  chiếm gần hết wait mass). Ở c16 khác biệt thật: hrrn tốt nhất mọi trục
+  (queue mean 17.41 s, p99 111.3 s, Jain 0.321, tok/s 95.6); dfs-weight
+  tệ nhất mọi trục (queue p99 366 s, TTFT p99 383.6 s, Jain 0.140,
+  worst-5% 56.9%). **Boost γ=0.09 tĩnh thua chính block 10-08 gamma-Ada**
+  (queue p99 173.2 vs 112.1 s; Jain 0.261 vs 0.339; TTFT p99 của boost
+  117.7 s là thấp nhất trong cả hai block) — bằng chứng trực tiếp rằng
+  adaptation mua được hơn chọn đúng hằng số tĩnh; caveat 1 run/cell, đuôi c16 nhiễu
+  lớn, chờ repeat ở stage starvation. Cross-check c16: boost hist khớp
+  eval (+0.7%) — block trước vẹch -33% vì bucket v1 giữa phân phối đổi
+  hẳn khi p99 rơi vùng khác.
 
 - **"fcfs" trong bảng v2 là fcfs-match** (quyết định 2026-10-08: fcfs-match
   là arm fcfs — ordering giống hệt fcfs, chỉ thêm sort-time match mà sau fix
