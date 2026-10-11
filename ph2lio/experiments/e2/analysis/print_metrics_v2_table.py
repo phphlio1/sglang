@@ -101,7 +101,7 @@ HEADER = (
     "| ITL p90 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 "
     "| worst-5% wait (%) |"
 )
-SEP = "|" + "---|" * 17
+SEP = "|" + "---|" * 18  # 18 columns: HEADER's count, or GFM refuses the table
 
 
 def load_v2_runs(results_root: Path) -> list[dict]:
