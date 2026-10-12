@@ -101,6 +101,21 @@ GRACE_PERIOD="${GRACE_PERIOD:-inf}"
 # c16-sweep regime). 0 keeps the reuse rule (a warm server carries earlier
 # runs' cache state).
 FORCE_RESTART="${FORCE_RESTART:-0}"
+# GPU-side time series — the one signal the 3 Hz /metrics scrapes lack
+# (util/power/mem per GPU). One nvidia-smi query per interval during the
+# benchmark+drain window only, written to <run_dir>/gpu_samples.csv.
+# 0 disables. Runs outside the serving path and identically for every
+# policy, so the policy comparison stays clean.
+GPU_SAMPLER_INTERVAL="${GPU_SAMPLER_INTERVAL:-5}"
+# Space-separated dirs to pre-read into the node page cache before a server
+# boot; empty = off. On the H200 arms the venv and the sglang tree live on
+# NFS and the 8 dp replicas import them concurrently: the contending cold
+# reads serialize on NFS bandwidth (measured on qwen cell 2: rank
+# weight-load starts staggered ~9.2 min apart while each rank's own GPU work
+# is only ~5 min, so boot is ~2 h), and each cell's ~0.5-1.2 TB of hicache
+# host pools evicts the venv pages again, so every cell re-reads. One
+# sequential cat (~12 GB) replaces 8 contending importers.
+WARM_CACHE_PATHS="${WARM_CACHE_PATHS:-}"
 # ============================================================================
 
 AIPERF_DATASET_CONFIGURATION_TIMEOUT=1800  # first run reconstructs the dataset cache
@@ -189,8 +204,20 @@ server_stop() {
 
 SERVER_STARTED=0
 
+warm_import_cache() {  # pre-read WARM_CACHE_PATHS into the page cache, once, sequentially
+  [[ -n "${WARM_CACHE_PATHS}" ]] || return 0
+  local d t0
+  t0=$(date +%s)
+  for d in ${WARM_CACHE_PATHS}; do
+    [[ -d "${d}" ]] || { log "warm_import_cache: skipping absent dir ${d}"; continue; }
+    find "${d}" -type f -exec cat {} + >/dev/null 2>&1 || true
+  done
+  log "import cache warmed (${WARM_CACHE_PATHS}; $(( $(date +%s) - t0 ))s)"
+}
+
 server_start() {  # $1 = policy
   mkdir -p "${OUTPUT_DIR}/$1"
+  warm_import_cache
   LOG_SCHEDULE_EVAL_PATH="$(requested_eval_path "$1")" \
     nohup bash "${SERVER_SCRIPT}" "$1" >/dev/null 2>&1 &
   SERVER_STARTED=1
@@ -245,8 +272,32 @@ new_run_dir() {  # $1 = parent dir, $2 = label prefix; echoes unique stamped dir
   die "could not allocate a fresh run dir under $1"
 }
 
+GPU_SAMPLER_PID=""
+
+start_gpu_sampler() {  # $1 = run_dir; nvidia-smi time series -> $1/gpu_samples.csv
+  [[ "${GPU_SAMPLER_INTERVAL}" =~ ^[0-9]+$ ]] || die "GPU_SAMPLER_INTERVAL must be a number"
+  (( GPU_SAMPLER_INTERVAL > 0 )) || return 0
+  command -v nvidia-smi >/dev/null 2>&1 || { log "gpu sampler: nvidia-smi not found; skipping"; return 0; }
+  nohup nvidia-smi --query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,power.draw,temperature.gpu,clocks.sm \
+    --format=csv -l "${GPU_SAMPLER_INTERVAL}" > "$1/gpu_samples.csv" 2>/dev/null &
+  GPU_SAMPLER_PID=$!
+  # die() inside run_aiperf must not leak the sampler past script exit.
+  trap stop_gpu_sampler EXIT
+  log "gpu sampler started (interval ${GPU_SAMPLER_INTERVAL}s, pid ${GPU_SAMPLER_PID})"
+}
+
+stop_gpu_sampler() {
+  [[ -n "${GPU_SAMPLER_PID}" ]] || return 0
+  kill "${GPU_SAMPLER_PID}" 2>/dev/null || true
+  wait "${GPU_SAMPLER_PID}" 2>/dev/null || true
+  GPU_SAMPLER_PID=""
+  trap - EXIT
+  log "gpu sampler stopped"
+}
+
 run_aiperf() {  # $1 = run_dir, $2 = concurrency, $3 = duration, extra flags in "$@"
   local run_dir="$1" conc="$2" dur="$3"; shift 3
+  start_gpu_sampler "${run_dir}"
   local cmd=(
     "${AIPERF}" profile
     --scenario "${SCENARIO}"
@@ -275,6 +326,7 @@ run_aiperf() {  # $1 = run_dir, $2 = concurrency, $3 = duration, extra flags in 
     local status=$?
     die "aiperf FAILED (exit ${status}); see ${run_dir}/aiperf_console.log"
   fi
+  stop_gpu_sampler
 }
 
 post_run_diagnostics() {  # $1 = run_dir, $2 = context cap for the report
@@ -489,7 +541,7 @@ Usage: $0 <mode> [args]
 Env knobs: SGLANG_URL MODEL TOKENIZER CONCURRENCY DURATION SEED OUTPUT_DIR
            SMOKE_POLICY SMOKE_DURATION NUM_ENTRIES HEALTH_TIMEOUT STOP_SERVER
            BOOST_GAMMA BOOST_BIN_SIZE NUM_DATASET_ENTRIES GRACE_PERIOD FORCE_RESTART
-           TRAJECTORY_START_MIN_RATIO TRAJECTORY_START_MAX_RATIO
+           TRAJECTORY_START_MIN_RATIO TRAJECTORY_START_MAX_RATIO GPU_SAMPLER_INTERVAL
 EOF
     exit 2 ;;
 esac
