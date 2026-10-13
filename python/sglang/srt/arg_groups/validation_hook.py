@@ -204,6 +204,13 @@ def check_server_args(server_args: Any):
         assert cfg.schedule_policy == "boost", (
             "--boost-adaptive-gamma requires --schedule-policy boost"
         )
+        assert cfg.boost_clock == "wall", (
+            "--boost-adaptive-gamma requires --boost-clock wall "
+            "(the E2E-latency tail fit is wall seconds)"
+        )
+        assert cfg.boost_adaptive_max_jump_s > 0, (
+            "boost_adaptive_max_jump_s must be > 0"
+        )
     if cfg.boost_clock == "wall":
         assert cfg.schedule_policy == "boost", (
             "--boost-clock wall requires --schedule-policy boost"

@@ -1394,6 +1394,7 @@ class Scheduler(
             boost_gamma=get_schedule().boost_gamma,
             boost_bin_size=get_schedule().boost_bin_size,
             boost_adaptive_gamma=get_schedule().boost_adaptive_gamma,
+            boost_adaptive_max_jump_s=get_schedule().boost_adaptive_max_jump_s,
             boost_clock=get_schedule().boost_clock,
             in_batch_prefix_caching_max_pin_s=(
                 get_schedule().in_batch_prefix_caching_max_pin_s
@@ -4124,18 +4125,6 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
-        # gamma-Ada feed: first admissions only. The None check on the
-        # first-admission stamp is the first-admission detector, so this
-        # must run before stamp_admission_prefix_matches freezes it;
-        # retracted re-admissions and chunk continuations are excluded.
-        gamma = self.policy.record_first_admission_waits(
-            can_run_list,
-            processed_tokens=self.processed_tokens_counter,
-            now_s=time.perf_counter(),
-        )
-        if gamma is not None and self.schedule_eval_logger is not None:
-            # Per-record gamma in the eval log is the trajectory.
-            self.schedule_eval_logger.boost_gamma = gamma
         stamp_admission_prefix_matches(can_run_list)
 
         # Create a new batch
@@ -4849,6 +4838,13 @@ class Scheduler(
         # Opt-in schedule eval log: one line per req finished in this batch.
         if self.schedule_eval_logger is not None:
             self.schedule_eval_logger.log_finished_batch(batch.reqs)
+
+        # gamma-Ada (Eq. 9): the finished reqs' E2E latencies feed the
+        # response-tail fit; a moved gamma rides the eval log's per-record
+        # gamma field from the next finished record on.
+        gamma = self.policy.record_completed_latencies(batch.reqs)
+        if gamma is not None and self.schedule_eval_logger is not None:
+            self.schedule_eval_logger.boost_gamma = gamma
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()

@@ -120,9 +120,31 @@ class Schedule(msgspec.Struct):
     boost_adaptive_gamma: A[
         bool,
         Arg(
-            help="Adapt boost_gamma online from the admission wait tail (gamma-Ada): gamma_hat = ln5/(w99-w95) over the last 2048 first-admission waits in the active clock's unit (counted tokens, or wall seconds under --boost-clock wall), EMA-smoothed (beta 0.2) and clipped. Fatter tail -> smaller gamma (stronger locality bias); thinner tail -> larger gamma (more FCFS-like). Requires --schedule-policy boost; off by default.",
+            help=(
+                "Adapt boost_gamma online from the completed-request response-time "
+                "tail (gamma-Ada, UniBoost Eq. 9): gamma_hat = ln5/(t99-t95) over "
+                "the last 128 E2E latencies (wall seconds), EMA-smoothed (beta 0.2) "
+                "and clipped. Fatter tail -> smaller gamma (stronger locality "
+                "bias); thinner tail -> larger gamma (more FCFS-like). The low clip "
+                "is a max-jump bound (--boost-adaptive-max-jump-s), not a raw "
+                "gamma. Requires --schedule-policy boost and --boost-clock wall; "
+                "off by default."
+            ),
         ),
     ] = False
+    boost_adaptive_max_jump_s: A[
+        float,
+        Arg(
+            help=(
+                "gamma-Ada max-jump bound in wall seconds: gamma is floored so the "
+                "largest boost any newcomer can receive, b_gamma(bin_size / "
+                "token_rate), stays within this. Bounds cold-request starvation "
+                "independently of workload and concurrency (unlike a raw gamma "
+                "floor, whose effect scales with the service rate). Only used "
+                "with --boost-adaptive-gamma."
+            ),
+        ),
+    ] = 60.0
     boost_clock: A[
         str,
         Arg(
