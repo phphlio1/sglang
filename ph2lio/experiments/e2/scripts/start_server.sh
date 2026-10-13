@@ -13,7 +13,8 @@
 #
 # Boost-policy knobs (env): BOOST_GAMMA (default: unset -> clock-mode default,
 # 1e-4 tokens / 0.1 1/s wall), BOOST_BIN_SIZE (default 256), BOOST_CLOCK
-# (default wall; the fixed wall-clock boost), BOOST_ADAPTIVE_GAMMA (gamma-Ada).
+# (default wall; the fixed wall-clock boost), BOOST_ADAPTIVE_GAMMA (gamma-Ada,
+# requires wall clock) + BOOST_ADAPTIVE_MAX_JUMP_S (its gamma floor's jump bound).
 # IN_BATCH_PREFIX_CACHING_MAX_PIN_S (default 60) bounds the in-batch dedup
 # follower pin for every cache-aware policy. LOG_SCHEDULE_EVAL_PATH (absolute
 # .jsonl, default off) enables the per-request schedule-eval log; the file is
@@ -44,10 +45,13 @@ HOST="0.0.0.0"
 # empty = the server's clock-mode default (1e-4 tokens / 0.1 1/s wall).
 BOOST_GAMMA="${BOOST_GAMMA:-}"
 BOOST_BIN_SIZE="${BOOST_BIN_SIZE:-256}"
-# gamma-Ada (Task 8): 1 = adapt boost_gamma online from the admission wait
-# tail (gamma0 = BOOST_GAMMA or the clock-mode default); off by default,
-# static-gamma path untouched.
+# gamma-Ada (Task 8): 1 = adapt boost_gamma online from the completed-request
+# response-time tail (UniBoost Eq. 9; gamma0 = BOOST_GAMMA or the clock-mode
+# default); off by default, static-gamma path untouched.
 BOOST_ADAPTIVE_GAMMA="${BOOST_ADAPTIVE_GAMMA:-0}"
+# gamma-Ada max-jump bound (wall seconds): the gamma floor keeps
+# b_gamma(bin_size / token_rate) within this.
+BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-60}"
 # Boost clock: wall (default) stamps arrival in seconds and pins the
 # effective gamma / adaptive fixed point independent of cache state;
 # tokens is the paper-exact counted-token clock.
@@ -102,7 +106,7 @@ POLICY_FLAGS=()
 if [[ "${POLICY}" == "boost" ]]; then
   [[ -n "${BOOST_GAMMA}" ]] && POLICY_FLAGS+=(--boost-gamma "${BOOST_GAMMA}")
   POLICY_FLAGS+=(--boost-bin-size "${BOOST_BIN_SIZE}" --boost-clock "${BOOST_CLOCK}")
-  [[ "${BOOST_ADAPTIVE_GAMMA}" == "1" ]] && POLICY_FLAGS+=(--boost-adaptive-gamma)
+  [[ "${BOOST_ADAPTIVE_GAMMA}" == "1" ]] && POLICY_FLAGS+=(--boost-adaptive-gamma --boost-adaptive-max-jump-s "${BOOST_ADAPTIVE_MAX_JUMP_S}")
 fi
 # Follower-pin hold bound: applies to every cache-aware policy.
 POLICY_FLAGS+=(--in-batch-prefix-caching-max-pin-s "${IN_BATCH_PREFIX_CACHING_MAX_PIN_S}")

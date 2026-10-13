@@ -66,19 +66,25 @@ STOP_SERVER="${STOP_SERVER:-auto}"          # auto | always | never
 BOOST_GAMMA="${BOOST_GAMMA:-}"
 BOOST_BIN_SIZE="${BOOST_BIN_SIZE:-256}"
 # gamma-Ada arm (Task 8): 1 = server adapts boost_gamma online from the
-# admission wait tail (gamma0 = BOOST_GAMMA or the clock-mode default); arms
-# log to a distinct eval file and run label so they never mix with
-# static-gamma cells.
+# completed-request response-time tail (UniBoost Eq. 9; gamma0 = BOOST_GAMMA
+# or the clock-mode default); arms log to a distinct eval file and run label
+# so they never mix with static-gamma cells.
 BOOST_ADAPTIVE_GAMMA="${BOOST_ADAPTIVE_GAMMA:-0}"
+# gamma-Ada max-jump bound (wall seconds): gamma is floored so the largest
+# boost a newcomer can receive, b_gamma(bin_size / token_rate), stays within
+# this. 60 s ≈ the static-0.09 jump (~50 s) that held cold-request stretch
+# at the lpm level in the c16 sweep.
+BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-60}"
 # Boost clock (wall-clock fix): wall (default) pins the effective gamma and
 # the adaptive fixed point independent of cache state; tokens is the
-# paper-exact counted-token clock (the pre-fix behavior).
+# paper-exact counted-token clock (the pre-fix behavior). gamma-Ada requires
+# wall (the Eq. 9 fit is wall seconds).
 BOOST_CLOCK="${BOOST_CLOCK:-wall}"
 # In-batch dedup follower-pin hold bound (seconds), every cache-aware policy.
 IN_BATCH_PREFIX_CACHING_MAX_PIN_S="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S:-60}"
 # Exported so start_server.sh sees the resolved values (not just inherited
 # ones), keeping the two scripts' defaults from drifting apart.
-export BOOST_GAMMA BOOST_BIN_SIZE BOOST_ADAPTIVE_GAMMA BOOST_CLOCK IN_BATCH_PREFIX_CACHING_MAX_PIN_S
+export BOOST_GAMMA BOOST_BIN_SIZE BOOST_ADAPTIVE_GAMMA BOOST_ADAPTIVE_MAX_JUMP_S BOOST_CLOCK IN_BATCH_PREFIX_CACHING_MAX_PIN_S
 # Exported so the run_meta python block records the resolved values.
 export GRACE_PERIOD FORCE_RESTART
 # Dataset subsetting for policy mode (Task-4 targeted regime): empty = the
@@ -340,8 +346,14 @@ meta = {
     ),
     "boost_bin_size": int(__import__("os").environ.get("BOOST_BIN_SIZE", "256")),
     # gamma-Ada arm: true = boost_gamma above is the initial gamma (gamma0)
-    # and the server adapts it online from the admission wait tail.
+    # and the server adapts it online from the completed-request
+    # response-time tail (UniBoost Eq. 9).
     "boost_adaptive_gamma": __import__("os").environ.get("BOOST_ADAPTIVE_GAMMA", "0") == "1",
+    # gamma-Ada max-jump bound (wall seconds): the gamma floor keeps
+    # b_gamma(bin_size / token_rate) within this.
+    "boost_adaptive_max_jump_s": float(
+        __import__("os").environ.get("BOOST_ADAPTIVE_MAX_JUMP_S", "60")
+    ),
     # Boost clock: 'wall' (arrival in seconds, cache-state-pinned gamma) or
     # 'tokens' (paper-exact counted-token clock, the pre-fix behavior).
     "boost_clock": __import__("os").environ.get("BOOST_CLOCK", "wall"),
