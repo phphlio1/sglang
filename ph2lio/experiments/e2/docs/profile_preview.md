@@ -252,13 +252,14 @@ a2a + weight-loading là ứng viên bottleneck chính.
 
 ## 5. Kế hoạch chạy lại trên config đầy đủ
 
-1. **Lấy package dynamo**: prod dùng image nội bộ `sglang-runtime:1.5.0-kvoverlap1`
-   (chưa có trên node; cần credential registry VNG — hoanq3 bận, chưa xin được).
-   **Đường bootstrap đang chạy** với dynamo **1.4.2** trích từ image
+1. **Lấy package dynamo**: ~~prod dùng image nội bộ `sglang-runtime:1.5.0-kvoverlap1`
+   (chưa có trên node; cần credential registry VNG)~~ — **mentor chấp nhận
+   dynamo 1.4.2** (quyết định 2026-10-14): không cần swap 1.5.0. Đường chạy
+   hiện tại dùng dynamo **1.4.2** trích từ image
    `nvcr.io_nvidia_ai-dynamo_vllm-runtime_1.4.2.sqsh` team đặt sẵn trong
    /mnt/containers (đủ `dynamo.frontend` router-mode=kv + `dynamo.sglang` +
-   nats-server tĩnh; mọi flag prod đều có). Khi image prod về: swap package
-   trong `/shared/loipp/dynamo-pkg`, build lại venv — flags không đổi.
+   nats-server tĩnh; mọi flag prod đều có) — đây là config chính thức của
+   campaign.
 2. **Ghép engine**: `dynamo.sglang` chạy engine in-process qua `sgl.Engine` →
    venv-dynamo (py3.12) mang cả dynamo 1.4.2 lẫn sglang branch mình (shim 1
    file cho `server_args_config_parser` — dynamo chỉ import, không gọi khi
