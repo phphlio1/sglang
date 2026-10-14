@@ -1,35 +1,33 @@
 #!/usr/bin/env bash
 # E2 server start helper, 8x H200 / GLM-5.3 W4AFP8 (USER-EDITABLE).
 #
-# Serving config = the production GLM-5.3 engine config (PhalaCloud
-# GLM-5.3-W4AFP8, sglang 0.5.18, TP8 + dp-attention-8 + EP8, confirmed by
-# the user 2026-10-08), mapped onto this branch's flag spelling. The
-# topology rewrite is forced by a semantics change on this branch:
+# Serving config = the production GLM-5.3 engine config VERBATIM (13-10-2026
+# Config GLM5.3 Prod, image sglang-runtime:1.5.0, engine glm53-w4afp8-dynamo-
+# engine), on this branch's flag spelling. Mentor directive 2026-10-13: keep
+# the engine config exactly like prod so the bottleneck profile measures the
+# deployed configuration. Spellings that differ in text but not in resolved
+# config (branch renames; dp_size is the deprecated alias, server_args.py:
+# attn-dp-size > 1 implies enable-dp-attention):
 #
-#   production: --tp 8 --dp 8 --enable-dp-attention --ep 8
+#   production: --tp=8 --dp=8 --enable-dp-attention --ep=8
 #   here:       --tp-size 8 --attn-dp-size 8 --ep-size 8
 #
-# "--dp-size N --enable-dp-attention" is the deprecated spelling here and
-# resolves to attn_dp_size; dp_size now means full replicas, which we do
-# NOT want — production is one engine across the 8 GPUs. Production port
-# 8889 moves to 30000 (the harness's SGLANG_URL). Production
-# --schedule-policy dfs-weight is replaced by the experiment's $1 policy
-# (dfs-weight is one of the five arms). --dsa-decode-backend flashmla_kv
-# is spelled out (production left decode to auto-detect; flashmla_kv is
-# the Hopper pairing of the production prefill choice flashmla_sparse_q8,
-# which requires the kv-cache fp8_e4m3 already in the list). Everything
-# else is the production flag list verbatim.
+# Production port 8889 moves to 30000 (the harness's SGLANG_URL).
+# --dsa-decode-backend flashmla_kv is spelled out (production left decode to
+# auto-detect; flashmla_kv is the required Hopper pairing of the production
+# prefill choice flashmla_sparse_q8 on this branch, dsa_backend.py).
+# --schedule-policy comes from the experiment's $1 (prod runs dfs-weight;
+# dfs-weight is one of the five arms).
 #
-# Divergence from production (stage 1, by design): no external sgl-router
-# (cache_aware/dp-aware) in front — the engine's TokenizerManager
-# dispatches across the 8 attention-DP ranks round-robin. The router layer
-# is the stage-2 arm.
-#
-# Weights: the team-placed PhalaCloud/GLM-5.3-W4AFP8 checkpoint — flat
-# local-dir layout (41 shards, ~399.7 GB ≈ 373 GiB, verified 2026-10-09),
-# NOT an HF-cache entry, so --model-path points straight at the dir. This
-# account is not permitted to download models; HF_HUB_OFFLINE=1 enforces
-# local-only.
+# Divergence from production (unavoidable or by design):
+#   - no dynamo frontend (router-mode=kv) in front: stage-2 arm; the engine's
+#     TokenizerManager dispatches across the 8 attention-DP ranks round-robin
+#   - --model-path is the node-local /mnt copy of the same weights (this
+#     account cannot download models; HF_HUB_OFFLINE=1 enforces local-only)
+#   - deployment-env necessities absent from the prod ENV list: CUDA_HOME +
+#     NVCC_PREPEND_FLAGS (driver/toolchain), NVSHMEM_HCA_LIST (deepep NIC),
+#     SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT=600 (worker-death fix,
+#     verified by smoke 2925)
 #
 # Usage / env knobs: identical to start_server.sh (<policy> | --stop;
 # BOOST_*, IN_BATCH_PREFIX_CACHING_MAX_PIN_S, LOG_SCHEDULE_EVAL_PATH,
@@ -76,7 +74,6 @@ SERVER_FLAGS=(
   --quantization w4afp8
   --enable-dp-attention-local-control-broadcast
   --enable-dp-lm-head
-  --tokenizer-worker-num 8
   --dist-init-addr 127.0.0.1:10888
   --numa-node 0 0 0 0 1 1 1 1
   --moe-a2a-backend deepep
@@ -104,6 +101,12 @@ SERVER_FLAGS=(
   --speculative-eagle-topk 1
   --speculative-num-draft-tokens 4
   --enable-prefill-delayer
+  # Verbatim prod: KV event publisher feeding the dynamo KV router
+  # (stage-2 arm subscribes to this endpoint). Flag and value are separate
+  # array elements: one quoted "--flag value" element would expand to a
+  # single argv token and argparse rejects it (3023 boot failure).
+  --kv-events-config
+  "{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:8900\"}"
   --served-model-name "${SERVED_MODEL_NAME}"
 )
 # ==========================================================================
@@ -143,6 +146,8 @@ LOG="${RESULTS_ROOT}/${POLICY}/server_$(date +%Y%m%d_%H%M%S).log"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export SGLANG_DP_USE_GATHERV=1
 export SGLANG_ENABLE_METRICS_DP_ATTENTION=1
+# Verbatim prod ENV.
+export SGLANG_ENABLE_METRICS_DEVICE_TIMER=1
 export NCCL_P2P_LEVEL=NVL
 export HF_HUB_OFFLINE=1
 # deep_gemm JIT-compiles FP8 GEMM kernels at runtime and invokes nvcc,

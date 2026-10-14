@@ -9,9 +9,11 @@
 #SBATCH --nodelist=hgx-h200-02
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-# All 192 CPUs so the 8 replicas are not squeezed onto NUMA node 0 (the
-# node grants 64-core jobs node-0-only affinity).
-#SBATCH --cpus-per-task=192
+# The 8 dp replicas must not be squeezed onto NUMA node 0: each NUMA node
+# has 96 CPUs (2x48c/96t), so any request <= 96 lands on one node only
+# (the node grants 64-core jobs node-0-only affinity). 160 > 96 forces
+# Slurm to span both nodes.
+#SBATCH --cpus-per-task=160
 #SBATCH --time=04:00:00
 #SBATCH --output=/shared/loipp/logs/e2_qwen_smoke_%j.log
 

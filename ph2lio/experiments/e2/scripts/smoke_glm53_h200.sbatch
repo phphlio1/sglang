@@ -10,18 +10,20 @@
 #SBATCH --nodelist=hgx-h200-01
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-# All 192 CPUs: the server pins GPUs 4-7 to NUMA node 1 (--numa-node
-# 0 0 0 0 1 1 1 1); with only 64 cores Slurm granted them all on node 0,
-# so the node-1 binding was skipped at boot (see 2623 server log).
-#SBATCH --cpus-per-task=192
+# The server pins GPUs 4-7 to NUMA node 1 (--numa-node 0 0 0 0 1 1 1 1).
+# Each NUMA node has 96 CPUs (2x48c/96t), so any request <= 96 lands on one
+# node only and the node-1 binding is skipped at boot (2623, with 64). 160
+# > 96 forces Slurm to span both nodes (measured demand is only ~16-20
+# cores total).
+#SBATCH --cpus-per-task=160
 # GLM's 8 ranks allocate ~1.23 TB of host hicache/indexer pools (8 x 128 GB
-# KV + 8 x 25.8 GB DSA), which exceeds the default per-CPU memory grant
-# (5000M x 192 = 937.5G). --mem=0 grants the whole node (2.05 TB). NOTE: the
-# uvicorn worker deaths persisted with --mem=0 (smoke 2794), so the original
-# cgroup-OOM theory is disproven; the grant stays cause the pools really
-# do exceed 937.5G and the true worker-death cause is under investigation
-# (see /shared/loipp/probe_site/sitecustomize.py).
-#SBATCH --mem=0
+# KV + 8 x 25.8 GB DSA); measured peak RSS 146.5 GB/rank (sacct 2992) ~= 1.17
+# TB across 8 ranks, so the default per-CPU grant is not enough. 1600G covers
+# it and leaves ~430 GB for teammates (CR_Core_Memory makes --mem=0 exclude
+# every other job from the node). The uvicorn worker deaths were NOT cgroup
+# OOM (disproven by smoke 2794) — root cause was the uvicorn worker
+# healthcheck SIGKILL, fixed and verified by smoke 2925.
+#SBATCH --mem=1600G
 #SBATCH --time=04:30:00
 #SBATCH --output=/shared/loipp/logs/e2_glm53_smoke_%j.log
 

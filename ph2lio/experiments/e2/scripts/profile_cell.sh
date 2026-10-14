@@ -12,9 +12,15 @@
 # the richest corroborating metrics).
 #
 # Usage (arm must match the node the weights live on — override the default
-# #SBATCH nodelist below per arm: glm53 -> hgx-h200-01, qwen -> hgx-h200-02):
+# #SBATCH nodelist below per arm: glm53/dynamo -> hgx-h200-01, qwen -> hgx-h200-02):
 #   sbatch [--nodelist=<node>] scripts/profile_cell.sh <arm> <conc> <policy>
-#     arm: glm53 | qwen      policy: fcfs-match lpm hrrn dfs-weight boost
+#     arm: glm53 | qwen | dynamo   policy: fcfs-match lpm hrrn dfs-weight boost
+#
+# The dynamo arm is the FULL-STACK cell (dynamo frontend --router-mode=kv +
+# engine worker under `python -m dynamo.sglang`, prod config verbatim — see
+# start_dynamo_stack.sh): the engine-only glm53/qwen cells never exercised
+# the frontend/router path, so their numbers cannot back the mentor
+# deliverable's full-stack bottleneck claims.
 #
 # Env knobs (all optional):
 #   PROBE_DURATION_S       aiperf duration, default 900 (scenario minimum;
@@ -40,9 +46,14 @@
 #SBATCH --nodelist=hgx-h200-01
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-# All 192 CPUs: 64-cpu jobs get node-0-only affinity and the server's NUMA
-# binding silently skips the node-1 half (see the smoke 2623 log).
-#SBATCH --cpus-per-task=192
+# The server pins GPUs 4-7 to NUMA node 1 on the glm53 arm. Each NUMA node
+# has 96 CPUs (2x48c/96t), so any request <= 96 lands on one node only and
+# the node-1 binding is skipped at boot (2623, with 64). 160 > 96 forces
+# Slurm to span both nodes while leaving 32 CPUs for teammates.
+#SBATCH --cpus-per-task=160
+# Same server pools as the sweep (~1.17 TB measured, see
+# run_e2_h200_glm53.sbatch): the default per-CPU grant is below that.
+#SBATCH --mem=1600G
 #SBATCH --time=04:00:00
 #SBATCH --output=/shared/loipp/logs/e2_profile_cell_%j.log
 
@@ -51,13 +62,14 @@ set -euo pipefail
 BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
 
-ARM="${1:?usage: profile_cell.sh <glm53|qwen> <conc> <policy>}"
-CONC="${2:?usage: profile_cell.sh <glm53|qwen> <conc> <policy>}"
-POLICY="${3:?usage: profile_cell.sh <glm53|qwen> <conc> <policy>}"
+ARM="${1:?usage: profile_cell.sh <glm53|qwen|dynamo> <conc> <policy>}"
+CONC="${2:?usage: profile_cell.sh <glm53|qwen|dynamo> <conc> <policy>}"
+POLICY="${3:?usage: profile_cell.sh <glm53|qwen|dynamo> <conc> <policy>}"
 
 case "${ARM}" in
   glm53)
     export SERVER_SCRIPT="${E2_DIR}/scripts/start_server_h200_glm53.sh"
+    export SGLANG_URL="http://127.0.0.1:30000"
     export MODEL="zai-org/GLM-5.3"
     export TOKENIZER="/mnt/hf_hub_cache/GLM-5.3-W4AFP8"
     export RESULTS_ROOT="${E2_DIR}/results/8x-h200/glm53/agentx"
@@ -66,21 +78,75 @@ case "${ARM}" in
     ;;
   qwen)
     export SERVER_SCRIPT="${E2_DIR}/scripts/start_server_h200_qwen.sh"
+    export SGLANG_URL="http://127.0.0.1:30000"
     export MODEL="Qwen/Qwen3.8-27B-FP8"
     export TOKENIZER="/mnt/hf_hub_cache/Qwen3.8-27B-FP8"
     export RESULTS_ROOT="${E2_DIR}/results/8x-h200/qwen/agentx"
     export HEALTH_TIMEOUT=5400
     export AIPERF_DATASET_MMAP_CACHE_DIR="${BENCH}/aiperf_mmap_cache_n02"
     ;;
-  *) echo "ERROR: arm must be glm53 or qwen (got '${ARM}')" >&2; exit 2 ;;
+  dynamo)
+    # Full stack: dynamo frontend (:8888) + engine worker under dynamo.sglang
+    # (start_dynamo_stack.sh). run_e2.sh knobs specific to this stack:
+    #   READY_ON_MODEL        dynamo /health is 200 with zero workers — real
+    #                         readiness = served model on /v1/models
+    #   SERVER_PROC_PATTERN   boot fail-fast pattern for `python -m
+    #                         dynamo.sglang` (not sglang.launch_server)
+    #   SERVER_METRICS_URLS   engine sglang:* registry lives on DYN_SYSTEM_PORT
+    #                         8081 (smoke 3307), NOT on the frontend URL
+    #   SGLANG_ALLOW_PTRACE   schedulers call prctl(PR_SET_PTRACER_ANY)
+    #                         (branch scheduler.py) so sibling py-spy attach
+    #                         works under yama ptrace_scope=1 — without it
+    #                         every flame is lost (all of cell 3065's)
+    export SERVER_SCRIPT="${E2_DIR}/scripts/start_dynamo_stack.sh"
+    export SGLANG_URL="http://127.0.0.1:8888"
+    export MODEL="zai-org/GLM-5.3"
+    export TOKENIZER="/mnt/hf_hub_cache/GLM-5.3-W4AFP8"
+    export RESULTS_ROOT="${E2_DIR}/results/8x-h200/glm53/agentx_dynamo"
+    export HEALTH_TIMEOUT=12000   # mirror boot measured 281 s to registration
+    export AIPERF_DATASET_MMAP_CACHE_DIR="${BENCH}/aiperf_mmap_cache"
+    export READY_ON_MODEL=1
+    export SERVER_PROC_PATTERN='dynamo\.sglang'
+    export SERVER_METRICS_URLS="127.0.0.1:8081"
+    export SGLANG_ALLOW_PTRACE=1
+    ;;
+  *) echo "ERROR: arm must be glm53, qwen or dynamo (got '${ARM}')" >&2; exit 2 ;;
 esac
 
 # run_e2.sh knobs: identical regime to the sweep cells, except a shorter
 # duration and finer GPU sampling; results land under profiling/, never in
-# the sweep result tree.
-export SGLANG_URL="http://127.0.0.1:30000"
-export AIPERF="${BENCH}/venv-aiperf/bin/aiperf"
+# the sweep result tree. SGLANG_URL is exported per-arm above (dynamo = the
+# frontend :8888, engine-only arms = the sglang HTTP server :30000).
 export OUTPUT_DIR="${RESULTS_ROOT}/profiling"
+# --- node-local execution mirror (built by mirror_from_login.sh + ----------
+# --- mirror_node_side.sh, run from the login node) ----------------------------
+# venvs, the uv base interpreter, the sglang import tree, and the HOME
+# compile caches live on this node's /mnt after the mirror job: imports and
+# JIT-cache verification stop touching the ~1.4 MB/s NFS and survive
+# teammates' page-cache eviction. Falls back to the /shared paths (slow)
+# whenever the mirror is absent.
+NODE_LOCAL="${NODE_LOCAL:-/mnt/loipp}"
+if [ -x "${NODE_LOCAL}/venv-server/bin/python3" ] || [ -x "${NODE_LOCAL}/venv-dynamo/bin/python3" ]; then
+  export AIPERF="${NODE_LOCAL}/venv-aiperf/bin/aiperf"
+  # CUDA_HOME differs per stack: the engine-only server runs from venv-server
+  # (py3.11), the dynamo stack from venv-dynamo (py3.12) — each venv carries
+  # its own cu13 wheels and start_dynamo_stack.sh only fills CUDA_HOME when
+  # it is unset, so an inherited wrong-venv path would win there.
+  if [[ "${ARM}" == "dynamo" ]]; then
+    export CUDA_HOME="${NODE_LOCAL}/venv-dynamo/lib/python3.12/site-packages/nvidia/cu13"
+  else
+    export SERVER_PYTHON="${NODE_LOCAL}/venv-server/bin/python3"
+    export CUDA_HOME="${NODE_LOCAL}/venv-server/lib/python3.11/site-packages/nvidia/cu13"
+  fi
+  PYSPY="${NODE_LOCAL}/venv-server/bin/py-spy"
+  export HOME="${NODE_LOCAL}/home"
+else
+  echo "=== node-local mirror absent on $(hostname); running from /shared (slow NFS) ==="
+  export HOME="${BENCH}/home"
+  PYSPY="${BENCH}/venv-server/bin/py-spy"
+fi
+mkdir -p "${HOME}"
+
 export DURATION="${PROBE_DURATION_S:-900}"
 export FORCE_RESTART=1
 export GRACE_PERIOD=360
@@ -89,12 +155,6 @@ export BOOST_ADAPTIVE_GAMMA=1
 export GPU_SAMPLER_INTERVAL=1
 export HF_HOME="${BENCH}/hf"
 
-# Compute nodes get /home/loipp from the submitter but /home is login-local:
-# torch dynamo's cache bootstrap dies with EACCES at import otherwise.
-export HOME="${BENCH}/home"
-mkdir -p "${HOME}"
-
-PYSPY="${BENCH}/venv-server/bin/py-spy"
 PYSPY_RATE="${PYSPY_RATE:-25}"
 PYSPY_DURATION_S="${PYSPY_DURATION_S:-120}"
 PROFILE_STEPS="${PROFILE_STEPS:-30}"
@@ -153,8 +213,10 @@ mkdir -p "${probe_dir}"
 # py-spy: one flame per scheduler process (8 on either arm). Attach
 # failures (ptrace scope) are warned per pid, not fatal.
 pyspy_patterns=('sglang::scheduler')
-read -r -a extra_patterns <<< "${EXTRA_PYSPY_PATTERNS:-}" || true
-pyspy_patterns+=("${extra_patterns[@]:-}")
+if [[ -n "${EXTRA_PYSPY_PATTERNS:-}" ]]; then
+  # shellcheck disable=SC2206
+  pyspy_patterns+=(${EXTRA_PYSPY_PATTERNS})
+fi
 for pattern in "${pyspy_patterns[@]}"; do
   for pid in $(pgrep -f "${pattern}" || true); do
     # shellcheck disable=SC2024
@@ -166,8 +228,9 @@ for pattern in "${pyspy_patterns[@]}"; do
   done
 done
 
-# torch profiler: one window, auto-stops after the step budget.
-if ! curl -sf -X POST "${SGLANG_URL}/start_profile" \
+# torch profiler: one window, auto-stops after the step budget. -S keeps the
+# error message visible (a bare -sf swallows it; 3065 lost the reason).
+if ! curl -sfS --max-time 120 -X POST "${SGLANG_URL}/start_profile" \
     -d "{\"output_dir\": \"${probe_dir}/torch_traces\", \"num_steps\": ${PROFILE_STEPS}, \"activities\": [\"CPU\", \"GPU\"]}" \
     >"${probe_dir}/start_profile_response.json" 2>"${probe_dir}/start_profile_err.log"; then
   echo "WARN: /start_profile failed; see ${probe_dir}/start_profile_err.log" >&2
@@ -189,6 +252,16 @@ done
 newest_server_log="$(ls -t "${RESULTS_ROOT}/${POLICY}"/server_*.log 2>/dev/null | head -1 || true)"
 if [[ -n "${newest_server_log}" ]]; then
   ln -sf "${newest_server_log}" "${run_dir}/server_$(basename "${newest_server_log}")"
+fi
+# The dynamo stack instead writes engine/frontend/nats logs under
+# ${RESULTS_ROOT}/logs/ (start_dynamo_stack.sh); link the engine boot log
+# the same way (it is the one with the scheduler/boot evidence).
+if [[ "${ARM}" == "dynamo" ]]; then
+  for component in engine frontend; do
+    newest_log="$(ls -t "${RESULTS_ROOT}"/logs/${component}_*.log 2>/dev/null | head -1 || true)"
+    [[ -n "${newest_log}" ]] && \
+      ln -sf "${newest_log}" "${run_dir}/${component}_$(basename "${newest_log}")"
+  done
 fi
 
 wait "${RUN_PID}"

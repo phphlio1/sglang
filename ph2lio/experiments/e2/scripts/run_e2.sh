@@ -61,6 +61,25 @@ SMOKE_DURATION="${SMOKE_DURATION:-300}"     # s; below scenario min -> --unsafe-
 NUM_ENTRIES="${NUM_ENTRIES:-16}"            # dataset subset, smoke only
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-1800}"    # s; model load + first-run JIT can be slow
 STOP_SERVER="${STOP_SERVER:-auto}"          # auto | always | never
+# Readiness gate for stacks whose /health lies: the dynamo frontend returns
+# 200 on /health even with ZERO workers registered (measured; see
+# smoke_dynamo_stack.sbatch) — the served model only appears on /v1/models
+# after the engine finished booting and registered through discovery.
+# READY_ON_MODEL=1 makes server_healthy also require "${MODEL}" on
+# /v1/models (dynamo cells set this; the plain sglang HTTP server doesn't
+# need it — its /health is honest).
+READY_ON_MODEL="${READY_ON_MODEL:-0}"
+# Boot fail-fast pgrep pattern (server_start): the engine-only server boots
+# via sglang.launch_server; the dynamo stack boots via `python -m
+# dynamo.sglang`. Same job, different process spelling — env-overridable so
+# the dynamo cells don't die at the 60 s fail-fast check.
+SERVER_PROC_PATTERN="${SERVER_PROC_PATTERN:-sglang\\.launch_server}"
+# Extra Prometheus scrape endpoints appended to aiperf's --server-metrics
+# (space-separated, e.g. "127.0.0.1:8081"). aiperf always also scrapes
+# <SGLANG_URL>/metrics; under the dynamo frontend the engine's sglang:*
+# multiprocess registry serves on DYN_SYSTEM_PORT (start_dynamo_stack.sh,
+# confirmed by smoke 3307) instead, so dynamo cells set this to 8081.
+SERVER_METRICS_URLS="${SERVER_METRICS_URLS:-}"
 # Boost arm hyperparameters (larger gamma = more FCFS-like). BOOST_GAMMA empty
 # = the server's clock-mode default (1e-4 tokens / 0.1 1/s wall).
 BOOST_GAMMA="${BOOST_GAMMA:-}"
@@ -135,7 +154,21 @@ valid_policy() {
 
 # --- Server lifecycle --------------------------------------------------------
 
-server_healthy() { curl -sf "${SGLANG_URL}/health" >/dev/null 2>&1; }
+server_healthy() {
+  curl -sf "${SGLANG_URL}/health" >/dev/null 2>&1 || return 1
+  [[ "${READY_ON_MODEL}" == "1" ]] || return 0
+  # File-first grep (never `curl | grep -q` under pipefail: grep -q closes
+  # the pipe, curl dies SIGPIPE, pipefail fails a healthy poll — same
+  # artifact as smoke 3307 step 5a).
+  local m; m="$(mktemp)"
+  # Tolerate both spellings: sglang HTTP emits "id": "x" (with space), the
+  # dynamo frontend emits "id":"x" (no space; measured in smoke 3307).
+  curl -sf --max-time 10 "${SGLANG_URL}/v1/models" -o "${m}" 2>/dev/null \
+    && grep -qE "\"id\": *\"${MODEL}\"" "${m}"
+  local rc=$?
+  rm -f "${m}"
+  return "${rc}"
+}
 
 server_info_json() {
   # /server_info is the current endpoint; /get_server_info still answers.
@@ -225,12 +258,33 @@ server_start() {  # $1 = policy
   local waited=0
   until server_healthy; do
     if (( waited >= HEALTH_TIMEOUT )); then
-      tail -20 "$(ls -t ${OUTPUT_DIR}/$1/server_*.log 2>/dev/null | head -1)" >&2 || true
+      boot_log_tail "$1"
       die "server not healthy after ${HEALTH_TIMEOUT}s (log tail above)"
+    fi
+    # Fail fast when the boot process died (argparse error, port bind,
+    # crash): a dead server never turns healthy, so waiting the full
+    # HEALTH_TIMEOUT only burns the job wall (3023 lost 2 h to this).
+    # Grace: the wrapper needs a few seconds to spawn python.
+    if (( waited >= 60 )) && ! pgrep -f "${SERVER_PROC_PATTERN}" >/dev/null; then
+      boot_log_tail "$1"
+      die "server process died during boot (log tail above)"
     fi
     sleep 5; waited=$((waited + 5))
   done
-  log "server healthy: policy=$(server_policy)"
+  log "server healthy: policy=$(server_policy || echo 'unknown (no /server_info — dynamo frontend?)')"
+}
+
+boot_log_tail() {  # $1 = policy; the start script writes boot logs under its
+  # own results root (<root>/<policy>/), which equals OUTPUT_DIR in sweep
+  # mode but is OUTPUT_DIR's parent in profiling mode (OUTPUT_DIR=<root>/profiling).
+  local boot_log
+  boot_log="$(ls -t ${OUTPUT_DIR}/$1/server_*.log 2>/dev/null | head -1)"
+  [[ -z "${boot_log}" ]] && \
+    boot_log="$(ls -t ${OUTPUT_DIR%/*}/$1/server_*.log 2>/dev/null | head -1)"
+  # The dynamo stack writes engine_*.log under <results_root>/logs/ instead.
+  [[ -z "${boot_log}" ]] && \
+    boot_log="$(ls -t ${OUTPUT_DIR%/*}/logs/engine_*.log 2>/dev/null | head -1)"
+  [[ -n "${boot_log}" ]] && tail -20 "${boot_log}" >&2 || true
 }
 
 ensure_server() {  # $1 = policy; sets SERVER_FRESH_BOOT (1 = this run booted)
@@ -313,7 +367,7 @@ run_aiperf() {  # $1 = run_dir, $2 = concurrency, $3 = duration, extra flags in 
     --use-server-token-count
     --streaming                # required with --per-chunk-usage
     --per-chunk-usage
-    --server-metrics
+    --server-metrics ${SERVER_METRICS_URLS}   # extra scrape endpoints (empty = bare enable)
     --server-metrics-formats jsonl
     --artifact-dir "${run_dir}"
     "$@"
@@ -362,8 +416,14 @@ write_run_meta() {  # $1 = run_dir, $2 = policy, $3 = concurrency,
                     # $7 = server_fresh_boot (1 = this run booted the server)
   local sglang_commit
   sglang_commit="$(git -C "${E2_DIR}/../../.." rev-parse HEAD 2>/dev/null || echo unknown)"
+  # The dynamo frontend has no /server_info (that is the plain sglang HTTP
+  # server's endpoint): both curls fail and the `||` chain would abort the
+  # whole run under set -e AFTER aiperf already finished — write a stub so
+  # run_meta.json still lands (policy_params_match already handles absence
+  # by refusing reuse, which FORCE_RESTART cells bypass).
   curl -sf "${SGLANG_URL}/server_info" > "$1/server_info.json" 2>/dev/null \
-    || curl -sf "${SGLANG_URL}/get_server_info" > "$1/server_info.json"
+    || curl -sf "${SGLANG_URL}/get_server_info" > "$1/server_info.json" 2>/dev/null \
+    || printf '{"note": "no /server_info on this frontend (dynamo stack): schedule policy is recorded in run_meta.json and the engine log"}\n' > "$1/server_info.json"
   python3 - "$1/run_meta.json" "$2" "$3" "$MODEL" "$TOKENIZER" "$SGLANG_URL" \
       "$sglang_commit" "$(cat "$1/command.txt" | tr '\n' ' ')" \
       "$4" "$5" "$6" "$7" <<'PY'

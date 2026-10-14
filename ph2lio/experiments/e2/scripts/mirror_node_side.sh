@@ -40,6 +40,7 @@ fixup_venv() { # rewrite every /shared/loipp/ reference inside a mirrored
 say "rewriting venv-internal absolute paths (mirror copies only)"
 fixup_venv "${MNT}/venv-server"
 fixup_venv "${MNT}/venv-aiperf"
+fixup_venv "${MNT}/venv-dynamo"
 
 say "self-verify: import the whole stack from the mirror"
 export HOME="${MNT}/home"
@@ -64,6 +65,30 @@ fi
 "${MNT}/venv-aiperf/bin/aiperf" --help >/dev/null 2>&1 \
   || { echo "=== MIRROR FAIL: aiperf entrypoint broken ==="; exit 1; }
 echo "OK aiperf"
+
+# dynamo bootstrap venv (py3.12): dynamo frontend/sglang wrappers + our sglang
+# branch + torch, plus the static nats-server binary.
+export UV_PYTHON_INSTALL_DIR="${MNT}/uv-python"
+set +e
+"${MNT}/venv-dynamo/bin/python3" - <<'PY'
+import sys
+assert sys.executable.startswith("/mnt/loipp"), sys.executable
+import dynamo.frontend, dynamo.sglang, dynamo.runtime
+import sglang, torch
+assert "/mnt/loipp/sglang" in sglang.__file__, sglang.__file__
+print("OK dynamo python:", sys.executable)
+print("OK dynamo.frontend / dynamo.sglang / dynamo.runtime")
+print("OK torch:", torch.__version__, "cuda", torch.version.cuda)
+PY
+rc=$?
+set -e
+if [ "$rc" -ne 0 ]; then
+  echo "=== MIRROR FAIL: venv-dynamo verification failed (rc=${rc}) ==="
+  exit 1
+fi
+"${MNT}/bin/nats-server" --version >/dev/null 2>&1 \
+  || { echo "=== MIRROR FAIL: nats-server broken in mirror ==="; exit 1; }
+echo "OK nats-server $(${MNT}/bin/nats-server --version 2>&1 | tail -1)"
 NVCC="${MNT}/venv-server/lib/python3.11/site-packages/nvidia/cu13/bin/nvcc"
 "${NVCC}" --version >/dev/null 2>&1 \
   || { echo "=== MIRROR FAIL: mirror nvcc broken ==="; exit 1; }

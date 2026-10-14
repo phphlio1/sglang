@@ -24,9 +24,12 @@ BENCH=/shared/loipp
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"
 
 echo "[$(date +%H:%M:%S)] mirror driver start: /shared/loipp -> ${NODE}:/mnt/loipp"
-echo "[$(date +%H:%M:%S)] trees: uv-python venv-server home venv-aiperf sglang/python (~10.6G)"
+echo "[$(date +%H:%M:%S)] trees: uv-python venv-server home venv-aiperf venv-dynamo bin sglang/python (~16G)"
 
-tar -C "${BENCH}" -cf - uv-python venv-server home venv-aiperf sglang/python \
+# venv-dynamo + bin (nats-server): the dynamo full-stack bootstrap (see
+# build_venv_dynamo.sh / start_dynamo_stack.sh) — dynamo runs the engine
+# in-process, so its venv carries both dynamo 1.4.2 and our sglang branch.
+tar -C "${BENCH}" -cf - uv-python venv-server home venv-aiperf venv-dynamo bin sglang/python \
   | srun -p hardware-hcm -w "${NODE}" --cpus-per-task=8 --mem=16G \
       --time=03:00:00 bash "${SCRIPTS}/mirror_node_side.sh"
 

@@ -14,22 +14,25 @@
 #   - scripts/start_server_h200_glm53.sh smoke-tested (run_e2.sh smoke)
 #SBATCH --job-name=schedPolicies-glm53-h200
 #SBATCH --partition=hardware-hcm
-#SBATCH --nodelist=hgx-h200-01    # /mnt is node-local; GLM weights live here
+#SBATCH --nodelist=hgx-h200-01
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-# All 192 CPUs: the server pins GPUs 4-7 to NUMA node 1 (--numa-node
-# 0 0 0 0 1 1 1 1); with only 64 cores Slurm granted them all on node 0,
-# so the node-1 binding was skipped at boot (see 2623 server log).
-#SBATCH --cpus-per-task=192
+# The server pins GPUs 4-7 to NUMA node 1 (--numa-node 0 0 0 0 1 1 1 1).
+# Each NUMA node has 96 CPUs (2x48c/96t), so any request <= 96 lands on one
+# node only and the node-1 binding is skipped at boot (2623, with 64). 160
+# > 96 forces Slurm to span both nodes (measured demand is only ~16-20
+# cores total, ~155% per scheduler rank)
+#SBATCH --cpus-per-task=160
 # GLM's 8 ranks allocate ~1.23 TB of host hicache/indexer pools (8 x 128 GB
-# KV + 8 x 25.8 GB DSA); the default per-CPU memory grant (937.5G) is below
-# that, so keep --mem=0 (whole node, 2.05 TB). The uvicorn worker deaths
-# persisted with --mem=0 (smoke 2794) -- the worker-death root cause is
-# still under investigation; do not submit the sweep until the smoke passes.
-#SBATCH --mem=0
-# Jobs on this account must not exceed 4 h. A cold-boot cell = boot (~2h40m
-# from cold NFS) + warmup + 30 min bench + grace ~= 3.2-3.5 h, so each
-# submission completes ~1 cell; the wall kills the next cell's boot
+# KV + 8 x 25.8 GB DSA); measured peak RSS 146.5 GB/rank (sacct 2992) ~= 1.17
+# TB across 8 ranks. --mem=0 (whole node) blocked every other job: this
+# cluster schedules memory as a consumable (CR_Core_Memory), so a whole-node
+# grant excludes teammates even with 32 CPUs left free. 1600G covers the
+# measured demand with ~370 GB headroom and leaves ~430 GB for teammates.
+#SBATCH --mem=1600G
+# Jobs on this account must not exceed 4 h. A mirrored-boot cell = boot
+# (~7 min from /mnt) + warmup + 30 min bench + grace ~= 50-65 min, so a
+# submission completes ~4-5 cells; the wall kills the next cell's boot
 # mid-flight and the resume loop below re-runs it on resubmit.
 #SBATCH --time=04:00:00
 #SBATCH --output=/shared/loipp/logs/schedPolicies-glm53-h200_%j.log
@@ -110,7 +113,10 @@ cd "${E2_DIR}"
 # while other jobs execute it, and sbatch snapshots this file at submit time.
 # || echo keeps one failed cell (e.g. health timeout) from killing the rest.
 SWEEP_CONCS=(16 32 64)
-for p in fcfs-match lpm hrrn dfs-weight boost; do
+# dfs-weight runs FIRST: it is the prod config's own --schedule-policy, so
+# those cells double as the production-config profile cells; boost stays last
+# (waits on the teammate's adaptive-gamma code).
+for p in dfs-weight fcfs-match lpm hrrn boost; do
   for c in "${SWEEP_CONCS[@]}"; do
     # Mirrors run_label in run_e2.sh; BOOST_ADAPTIVE_GAMMA=1 is pinned above,
     # so the boost label is always the adaptive spelling.

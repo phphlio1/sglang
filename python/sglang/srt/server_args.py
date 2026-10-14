@@ -426,6 +426,12 @@ class ServerArgs:
         attrs = [attr.name for attr in record_fields(cls) if hasattr(args, attr.name)]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
+    def get_model_config(self):
+        # Upstream-spelled accessor: dynamo's SGLang integration reads
+        # server_args.get_model_config() right after from_cli_args; the
+        # branch's internal spelling is model_config_of(server_args).
+        return model_config_of(self)
+
     def get_tokenizer_worker_class(self):
         from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
 

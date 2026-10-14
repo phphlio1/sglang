@@ -1401,18 +1401,14 @@ class Scheduler(
         )
 
     def maybe_init_schedule_eval_logger(self):
-        """Opt-in per-request schedule eval log; None (zero cost) when off."""
-        path = get_schedule().log_schedule_eval_path
-        if path is None:
-            self.schedule_eval_logger: Optional[ScheduleEvalLogger] = None
-            return
-        self.schedule_eval_logger = ScheduleEvalLogger(
-            path=path,
-            policy=self.schedule_policy,
-            boost_gamma=get_schedule().boost_gamma,
-            boost_bin_size=get_schedule().boost_bin_size,
-            boost_clock=get_schedule().boost_clock,
-        )
+        """Opt-in per-request schedule eval log; None (zero cost) when off.
+
+        Everything in here runs unconditionally except the logger itself:
+        prefill_delayer/enable_priority_preemption/new_token_ratio_tracker
+        init used to sit below the eval-log early return, so launching
+        without --log-schedule-eval-path left them unset and the scheduler
+        loop crashed with AttributeError (dynamo smokes 3183/3185).
+        """
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
             window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
@@ -1435,6 +1431,21 @@ class Scheduler(
                     token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
                     debug_log_enabled=get_parallel().attn_tp_rank == 0,
                 )
+
+        # Opt-in per-request eval log; None (zero cost) when off. Everything
+        # below this must run unconditionally — an early return here used to
+        # skip enable_priority_preemption/new_token_ratio_tracker init and
+        # crash the scheduler loop (dynamo smokes 3183/3185).
+        path = get_schedule().log_schedule_eval_path
+        self.schedule_eval_logger: Optional[ScheduleEvalLogger] = None
+        if path is not None:
+            self.schedule_eval_logger = ScheduleEvalLogger(
+                path=path,
+                policy=self.schedule_policy,
+                boost_gamma=get_schedule().boost_gamma,
+                boost_bin_size=get_schedule().boost_bin_size,
+                boost_clock=get_schedule().boost_clock,
+            )
 
         # NOTE: preemption is enabled by default for priority scheduling.
         self.enable_priority_preemption = (
@@ -5959,6 +5970,18 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Opt-in ptrace permission for py-spy sampling on restricted-ptrace
+    # nodes (yama ptrace_scope=1: only an ancestor may trace, so a sibling
+    # py-spy attach is denied — this killed every flame capture in profile
+    # cell 3065). PR_SET_PTRACER_ANY lets any same-uid process attach to
+    # THIS process only; enabled per-run via SGLANG_ALLOW_PTRACE=1 in the
+    # profiling cell's env (never in benchmark sweeps — sampling perturbs
+    # the measured process). Validated on hgx-h200-01 (ptrace_scope=1,
+    # py-spy dump on a sibling succeeds after this prctl).
+    if os.environ.get("SGLANG_ALLOW_PTRACE") == "1":
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(0x59616D61, ctypes.c_ulong(-1), 0, 0, 0)  # PR_SET_PTRACER, PR_SET_PTRACER_ANY
     dp_rank = resolve_spawn_dp_rank(dp_rank)
     # Placement is needed before publish(): TP/PP select a WORLD rank;
     # ordinary DP replicas have separate WORLDs and need an explicit DP rank.

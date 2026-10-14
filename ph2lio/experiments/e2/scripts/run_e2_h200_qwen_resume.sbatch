@@ -9,9 +9,11 @@
 #SBATCH --nodelist=hgx-h200-02
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-# All 192 CPUs so the 8 replicas are not squeezed onto NUMA node 0 (the
-# node grants 64-core jobs node-0-only affinity).
-#SBATCH --cpus-per-task=192
+# The 8 dp replicas must not be squeezed onto NUMA node 0: each NUMA node
+# has 96 CPUs (2x48c/96t), so any request <= 96 lands on one node only
+# (the node grants 64-core jobs node-0-only affinity). 160 > 96 forces
+# Slurm to span both nodes while leaving 32 CPUs for teammates.
+#SBATCH --cpus-per-task=160
 # Jobs on this account must not exceed 4 h. One cell = boot (~2 h with the
 # per-rank load-weight stagger) + warmup + 30 min bench + grace ~= 3.2 h, so
 # each submission completes ~1 cell; the wall kills the next cell's boot
