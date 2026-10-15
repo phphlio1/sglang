@@ -215,8 +215,8 @@ curl -s --max-time 30 "${FRONTEND_URL}/metrics" -o "${SMOKE_TMP}/metrics_8888.tx
 grep -m 5 'sglang:' "${SMOKE_TMP}/metrics_8888.txt" || \
   echo "(no sglang:* on 8888 — harness must scrape :8081)"
 # dynamo's own frontend/router metrics live here (TTFT/ITL, kv_hit_rate,
-# routing overhead, per-worker gauges) — the profiling cell scrapes 8888
-# alongside 8081 for routing observability (cell 3320 missed these).
+# routing overhead, per-worker gauges). aiperf auto-scrapes <url>/metrics,
+# so the profiling cell's export gets these for free — assert they exist.
 grep -m 5 'dynamo_frontend_' "${SMOKE_TMP}/metrics_8888.txt" \
   || { echo "=== FAIL: no dynamo_frontend_* metrics on ${FRONTEND_URL}/metrics ==="; exit 1; }
 

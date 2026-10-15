@@ -93,12 +93,12 @@ case "${ARM}" in
     #   SERVER_PROC_PATTERN   boot fail-fast pattern for `python -m
     #                         dynamo.sglang` (not sglang.launch_server)
     #   SERVER_METRICS_URLS   engine sglang:* registry lives on DYN_SYSTEM_PORT
-    #                         8081 (smoke 3307), NOT on the frontend URL;
-    #                         the frontend 8888/metrics additionally carries
-    #                         dynamo's own dynamo_frontend_*/dynamo_router_*
-    #                         (TTFT/ITL, kv_hit_rate, routing overhead,
-    #                         per-worker gauges) — scrape both (cell 3320
-    #                         scraped 8081 only, routing metrics were lost)
+    #                         8081 (smoke 3307), NOT on the frontend URL.
+    #                         aiperf ALSO auto-scrapes <SGLANG_URL>/metrics
+    #                         (8888) on its own — cell 3320's export holds
+    #                         BOTH endpoints (9588 records each), so the
+    #                         dynamo_frontend_*/router metrics come for free;
+    #                         listing 8888 here would duplicate the scrape.
     #   SGLANG_ALLOW_PTRACE   schedulers call prctl(PR_SET_PTRACER_ANY)
     #                         (branch scheduler.py) so sibling py-spy attach
     #                         works under yama ptrace_scope=1 — without it
@@ -112,7 +112,7 @@ case "${ARM}" in
     export AIPERF_DATASET_MMAP_CACHE_DIR="${BENCH}/aiperf_mmap_cache"
     export READY_ON_MODEL=1
     export SERVER_PROC_PATTERN='dynamo\.sglang'
-    export SERVER_METRICS_URLS="127.0.0.1:8081 127.0.0.1:8888"
+    export SERVER_METRICS_URLS="127.0.0.1:8081"
     export SGLANG_ALLOW_PTRACE=1
     ;;
   *) echo "ERROR: arm must be glm53, qwen or dynamo (got '${ARM}')" >&2; exit 2 ;;

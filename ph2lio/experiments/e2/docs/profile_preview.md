@@ -158,17 +158,18 @@ Engine log (`engine_*.log`, dòng `Decode batch` steady-state):
 TTFT p99 75 s + queue-wait p99 247 s đối lập `#queue-req: 0` lúc decode —
 request chờ ở prefill backlog:
 
-> `Prefill batch, #new-seq: 1, #new-token: 4096, #cached-token: 0, ..., #pending-token: 23779, input throughput (token/s): 5766.03, fwd occupancy: 98.12%`
+> `Prefill batch, #new-seq: 1, #new-token: 4096, #cached-token: 0, ..., token usage: 0.83, #pending-token: 44029, input throughput (token/s): 7172.36, fwd occupancy: 96.15%`
 
-(engine_*.log, 11:31:45) — chunk 4096/rank, backlog ~24k token chờ cắt.
-*Cơ chế:* không phải "ưu tiên request nặng decode" — prefill-delayer +
-dfs-weight **bảo vệ request đang decode** (prefill chen vào làm ITL của
-request đang chạy giật) nên hoãn prefill mới; request input dài/ít cache
-hit nằm backlog (hàng admission rỗng mới có mâu thuẫn với queue-wait 247 s).
-Lưu ý: nhiều lúc đó `fwd occupancy` chỉ 58–86% — GPU không bận mà prefill
-vẫn chờ: chọn lối của policy (bảo vệ ITL), không phải cạn tài nguyên — và
-tương tác với #1: batch decode mỏng để GPU rảnh, khoảng rảnh đó lẽ ra cắt
-được prefill.
+(engine_*.log, 12:00:11, benchmark window) — chunk 4096/rank, backlog ~44k
+token chờ cắt; pending backlog 5–112k token **suốt** benchmark (per-minute
+tổng hợp). *Cơ chế:* không phải "ưu tiên request nặng decode" —
+prefill-delayer + dfs-weight **bảo vệ request đang decode** (prefill chen
+vào làm ITL của request đang chạy giật) nên hoãn prefill mới; request input
+dài/ít cache hit nằm backlog (hàng admission rỗng — `#queue-req` ~0–0.8 —
+mới có mâu thuẫn với queue-wait p99 247 s). Lưu ý: fwd occupancy cao
+(88–95%) — GPU "bận" nhưng bận với batch decode nhỏ (2.6–4.6 running-req,
+latency-bound như #1): bận ≠ hiệu quả, và prefill chờ là chọn lối policy
+bảo vệ ITL, không phải cạn tài nguyên.
 
 **#3 — EAGLE spec decode khỏe, không phải nguồn bottleneck.**
 
@@ -213,13 +214,19 @@ completed` (12:21:04).
   `matched_prefix_tokens` trong schedule_eval.jsonl.
 - Counter sglang:* bị reset lặp trong run (publisher re-register, không phải
   restart) → counter server-side có thể undercount; latency client không ảnh hưởng.
-- Frontend 8888/metrics có bộ `dynamo_*` riêng (TTFT/ITL, `kv_hit_rate`,
-  routing overhead, gauge per-worker) — cell này chưa scrape (chỉ 8081);
-  các cell sau thêm `127.0.0.1:8888` vào `--server-metrics`.
+- Frontend 8888/metrics **đã được scrape trong cell này** (aiperf tự lấy
+  `/metrics` của `--url` 8888 cộng `--server-metrics` 8081 — 9.588 record
+  mỗi endpoint trong `server_metrics_export.jsonl`): đủ `dynamo_frontend_*`
+  (TTFT/ITL, `kv_hit_rate`, gauge per-worker) lẫn `sglang:*` per dp_rank.
 
 ### 4.4 Artifacts (run dir `c64_20261014_112105`)
 
-`profile_export.jsonl` (1169 records) · `server_metrics_export.jsonl` (2.3 GB,
-phân tích qua slurm) · `gpu_samples.csv` (1 s) · `schedule_eval.jsonl` (1237)
-· `profiling/pyspy_*.svg` ×8 · `e2_metrics.json`/`run_meta.json` ·
-symlink `engine_*.log`/`frontend_*.log`.
+Phân tích sâu theo 2 hướng định hướng mentor (scheduling policy + routing
+imbalance, kèm health-check GPU/token/cache/KV): `docs/focus3320_routing_scheduling.md`.
+
+`profile_export.jsonl` (1169 records) · `server_metrics_export.jsonl` (4.4 GB,
+hai endpoint 8081+8888, 9.588 scrape mỗi cái, phân tích qua slurm) ·
+`gpu_samples.csv` (1 s) · `schedule_eval.jsonl` (1237) ·
+`profiling/pyspy_*.svg` ×8 · `e2_metrics.json`/`run_meta.json` ·
+symlink `engine_*.log`/`frontend_*.log` · `analysis/` (time series per rank
+trích từ metrics export).
