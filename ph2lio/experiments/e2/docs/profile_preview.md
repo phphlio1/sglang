@@ -1,29 +1,22 @@
-# Bottleneck Profile — GLM-5.3 Prod Config (13-10-2026)
+# Bottleneck Profile — GLM-5.3 Prod Config
 
-Trạng thái: **spec + kế hoạch cho bản đầy đủ (frontend dynamo + engine)**.
-Cell engine-only vừa rồi (3065) **bỏ không tính** — thiếu frontend dynamo;
-sẽ chạy lại cell mới trên config đầy đủ (§5). Artifacts của cell cũ giữ lại
-chỉ để audit (§6).
+RunID: **3320** (14-10-2026) — full stack dynamo 1.4.2 (frontend router-mode=kv +
+engine)
 
 ## 1. Workload: AgentX
 
 | Hạng mục | Cấu hình |
 |---|---|
-| Benchmark | AIPerf `aiperf profile`, scenario `inferencex-agentx-mvp`, streaming + per-chunk usage |
-| Dataset | `semianalysis_cc_traces_weka_062126_256k` (trace agent, context dài, 256K-capped) |
-| Model | `zai-org/GLM-5.3` (checkpoint GLM-5.3-W4AFP8, quant w4afp8) |
-| Hardware | 8×H200 (node hgx-h200-01, 2×NUMA 96c, ~2TB RAM) |
-| Scheduling Policy | `dfs-weight` (policy của prod) |
-| Concurrency | 64 (mức cao nhất của sweep 16/32/64) |
-| Duration | 30 phút (1800 s) + grace 360 s |
-| Seed | 42 |
-| Boot | fresh boot mỗi cell (FORCE_RESTART=1) — radix cache lạnh mỗi run |
+| Benchmark | AIPerf `inferencex-agentx-mvp`, streaming + per-chunk usage, seed 42 |
+| Dataset | `semianalysis_cc_traces_weka_062126_256k` (trace agent, 256K-capped) |
+| Model / Hardware | `zai-org/GLM-5.3` (W4AFP8) / 8×H200 hgx-h200-01 (2×NUMA 96c) |
+| Policy / Conc / Duration | `dfs-weight` (policy prod) / 64 / 30 min + drain 360 s |
+| Engine | SGLang v0.5.20 |
+| Boot | fresh mỗi cell (FORCE_RESTART=1, radix cache lạnh) |
 
 ## 2. Serving Configuration (prod verbatim)
 
-**Frontend / Router — glm53-w4afp8-dynamo-frontend**
-
-Image: `vcr.vngcloud.vn/60108-backend-worker/dynamo-stack/sglang-runtime:1.5.0-kvoverlap1`
+**Frontend — glm53-w4afp8-dynamo-frontend**:
 
 ```
 python3 -m dynamo.frontend \
@@ -38,9 +31,10 @@ python3 -m dynamo.frontend \
   --reasoning-parser=glm45
 ```
 
-**Engine — glm53-w4afp8-dynamo-engine**
+(Router kv chọn worker theo cost = `16×prefill_blocks + potential_decode +
+decode_active×active_reqs`, argmin; nguồn cost = kv-events ZMQ 8900+dp_rank.)
 
-Image: `vcr.vngcloud.vn/108942-public69/dynamo-stack/sglang-runtime:1.5.0`
+**Engine — glm53-w4afp8-dynamo-engine**:
 
 ```
 python3 -m dynamo.sglang \
@@ -79,236 +73,153 @@ python3 -m dynamo.sglang \
   --kv-events-config={"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:8900"}
 ```
 
-**ENV (prod k8s, mang nguyên văn):** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`,
+**ENV (prod k8s):** `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`,
 `SGLANG_DP_USE_GATHERV=1`, `SGLANG_ENABLE_METRICS_DP_ATTENTION=1`,
 `SGLANG_ENABLE_METRICS_DEVICE_TIMER=1`, `NCCL_P2P_LEVEL=NVL`, `HF_HUB_OFFLINE=1`.
 
-**Map sang branch này** (khác chính tả, cùng config sau khi resolve — server_args
-dump trong boot log xác nhận): `--tp=8 --dp=8 --enable-dp-attention --ep=8` →
-`--tp-size 8 --attn-dp-size 8 --ep-size 8` (dp_size là deprecated alias;
-attn-dp-size>1 tự bật dp-attention); `python3 -m dynamo.sglang` →
-`python3 -m sglang.launch_server` (cho tới khi gắn dynamo, §5); port 8888/8889 →
-30000 (harness); `--dsa-decode-backend flashmla_kv` viết rõ (prod để auto, auto
-chọn đúng flashmla_kv trên Hopper+fp8_e4m3).
+**Divergence vs prod CLI:**
+1. `HF_HUB_OFFLINE=1`
+2. ENV deployment thêm: `CUDA_HOME/nvcc 13.4, NVSHMEM_HCA_LIST=rocep41s0f0`,
+   memlock unlimited (deepep QP), openssl-dev headers từ mirror (JIT
+   hicache_hash_cpp trên node).
+3. `--page-size=64` (prod để auto): cùng giá trị resolve — FlashMLA
+   ép 64.
 
-**Divergence còn lại (3):**
-1. `--model-path` = bản /mnt của cùng weights (tài khoản không được download
-   model; HF_HUB_OFFLINE=1 ép local-only).
-2. ENV deployment bắt buộc mà prod không liệt kê: CUDA_HOME/nvcc 13.4,
-   NVSHMEM_HCA_LIST, `SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT=600`.
-3. `--page-size=64` tường minh (prod để auto): cùng giá trị resolve —
-   FlashMLA ép đúng 64 — nhưng dynamo publisher đọc `server_args.page_size`
-   ngay trên record input chưa resolve của branch (resolution nằm trong
-   overlay, field input giữ None) → auto làm `KvEventPublisher` crash
-   (smoke 3190). Set tường minh để dynamo đọc được 64.
+## 3. Thông số profiling (instrumentation)
 
-## 3. Thông số profiling bottleneck — toàn stack (frontend global → engine local)
-
-### 3.1 Frontend / Router (toàn cục — quyết định request đi rank nào)
-
-| Thông số | Giá trị | Vai trò trong bottleneck profile |
+| Công cụ | Thông số đo | Bắt được gì → file |
 |---|---|---|
-| HTTP ingress | `0.0.0.0:8888` | điểm vào client (aiperf); port harness 30000 |
-| `--router-mode=kv` | KV-aware routing | route theo radix-tree KV mỗi worker thay vì round-robin — biến chính triệt tiêu bottleneck rank-imbalance |
-| `--router-prefill-load-scale=16` | 16 | trọng số cache-affinity trong cost function router: `cost = 16×prefill_blocks + potential_decode + decode_active×active_reqs`, chọn argmin |
-| `--router-min-initial-workers=1` | 1 | số worker tối thiểu trước khi router bắt đầu quyết định |
-| `--dyn-chat-processor=sglang` | sglang | processor chat phía dynamo |
-| `--dyn-preprocess-workers=8` | 8 | 8 preprocess worker (tokenize/parse song song trước dispatch) |
-| `--tool-call-parser / --reasoning-parser` | glm47 / glm45 | parse tool-call/reasoning stream |
-| Nguồn dữ liệu router | kv-events ZMQ `tcp://*:8900` | engine publish KV events mỗi attn-tp rank 0 (8 endpoint 8900+dp_rank) — đã verify chạy đủ 8 rank ở boot |
-| Service discovery | dynamo component graph (NATS) | frontend tìm worker `dynamo.sglang`; lý do engine phải chạy dưới wrapper dynamo, không phải `sglang.launch_server` trần |
+| aiperf client | streaming, per-chunk usage, server token count, seed 42 | TTFT / ITL / TPOT per chunk, req + output throughput, starvation rate, cold/warm class → `profile_export.jsonl`, `e2_metrics.json` |
+| Engine log (stdout scheduler, 1 dòng/batch) | trạng thái mỗi forward batch | Decode: `#running-req`, `#token`, **token usage**, `accept len/rate`, **gen throughput**, `fwd occupancy`; Prefill: `#new-seq`, `#new-token`, `#cached-token` (cache reuse), `#pending-token`, input throughput → `engine_*.log` |
+| Frontend log (dynamo.frontend stdout) | per request | kv-router worker selection: `logit` (cost), `dp_rank`, `overlap_blocks`; `ttft_ms`/`elapsed_ms` per request; WARN stale-request → `frontend_*.log` |
+| /metrics scrape 3 Hz (theo benchmark_phase) | `sglang:*` gauges/counters theo dp_rank | #queue-req, #running-req, cache hit, retraction, stage seconds — endpoint DYN_SYSTEM_PORT **8081** (frontend 8888 không có) → `server_metrics_export.jsonl` |
+| GPU sampler | nvidia-smi 1 s (benchmark + drain window) | util/mem/power/clock mỗi GPU → `gpu_samples.csv` |
+| schedule-eval | per request | queue_wait, matched_prefix_tokens, host_hit, in-batch dedup → `schedule_eval.jsonl` |
+| py-spy | 25 Hz × 120 s × 8 scheduler, attach ở steady-state +120 s | flame CPU scheduler; attach được nhờ prctl(PR_SET_PTRACER_ANY) qua env `SGLANG_ALLOW_PTRACE=1` (node yama ptrace_scope=1) → `profiling/pyspy_*.svg` |
+| torch profiler | — | không khả dụng trên stack dynamo (frontend không proxy `/start_profile`) |
+| bottleneck_report.py | cây quyết định Q1–Q7 | verdict tổng hợp: GPU busy, client/server gap, TTFT front path, rank balance, KV, spec, hicache |
 
-### 3.2 Engine — topology / song song
 
-| Thông số | Giá trị | Ghi chú profiling |
-|---|---|---|
-| `--tp / --dp(attn) / --ep` | 8 / 8 / 8 | 8 attention-DP rank, mỗi rank 1 GPU; MoE expert song song 8 |
-| `--enable-dp-attention` (+`local-control-broadcast`, `dp-lm-head`) | on | DP-attention: prefill/decode batch độc lập mỗi rank — nơi đo imbalance per-rank |
-| `--dist-init-addr` | 127.0.0.1:10888 | khởi tạo process group nội node |
-| `--numa-node` | 0 0 0 0 1 1 1 1 | 4 rank đầu NUMA 0, 4 rank sau NUMA 1 (mỗi NUMA 96c) |
-| `--moe-a2a-backend` | deepep | all-to-all MoE qua DeepEP (NVSHMEM, HCA rocep41s0f0) |
+## 4. Kết quả bottleneck
 
-### 3.3 Engine — bộ nhớ / KV cache
+Cell `agentx_dynamo/profiling/dfs-weight/c64_20261014_112105`.
 
-| Thông số | Giá trị | Ghi chú profiling |
-|---|---|---|
-| `--mem-fraction-static` | 0.75 | ~121 GiB/GPU weights+KV pools (đo được 121.3/124 GiB) |
-| `--kv-cache-dtype` | fp8_e4m3 | KV nửa byte — ảnh hưởng lựa chọn DSA backend |
-| `--enable-hierarchical-cache` + `--hicache-size 128` + `direct` + `write_back` | 128 GB host/rank | đo cache hit: device/host/storage hit rate |
-| `--max-running-requests` | 256 | trần admission mỗi rank |
-| `--context-length` | 300000 | trần context (dataset cap 256K) |
-| `--allow-auto-truncate` | on | tự cắt input vượt context |
-
-### 3.4 Engine — compute / kernel
-
-| Thông số | Giá trị | Ghi chú profiling |
-|---|---|---|
-| `--quantization` | w4afp8 | weights 65.3 GB/rank (đo từ boot log) |
-| `--dsa-prefill-backend` | flashmla_sparse_q8 | DSA prefill sparse FP8 |
-| `--dsa-decode-backend` | flashmla_kv (auto→) | cặp decode bắt buộc trên Hopper+fp8 |
-| `--chunked-prefill-size` | 32768 | = 4096 token/rank sau chia attn-dp |
-| `--speculative-algorithm` (EAGLE) + steps/topk/draft | 3 / 1 / 4 | spec decode; đo accept len (ngưỡng khỏe ≥2.0) |
-| `--enable-prefill-delayer` | on | cân bằng prefill/decode tại admission |
-
-### 3.5 Engine — scheduler local (biến thí nghiệm)
-
-| Thông số | Giá trị | Ghi chú profiling |
-|---|---|---|
-| `--schedule-policy` | dfs-weight (cell profile) | 5 policy sweep: fcfs-match lpm hrrn dfs-weight boost |
-| `--in-batch-prefix-caching-max-pin-s` | 60 | trần follower-pin in-batch dedup |
-| Boost (chỉ policy `boost`) | adaptive gamma, bin 256, clock wall | chờ code Adaptive Gamma Boost của teammate |
-
-### 3.6 ENV runtime (ảnh hưởng hành vi đo)
-
-| ENV | Giá trị | Tác động |
-|---|---|---|
-| `PYTORCH_CUDA_ALLOC_CONF` | expandable_segments:True | phân bổ GPU memory — ảnh hưởng hicache pool |
-| `SGLANG_DP_USE_GATHERV` | 1 | gatherv cho DP-attention sync |
-| `NCCL_P2P_LEVEL` | NVL | P2P qua NVLink đúng fabric đơn node |
-| `SGLANG_ENABLE_METRICS_DP_ATTENTION` / `..._DEVICE_TIMER` | 1 / 1 | metrics per-DP-rank + device timer (mối quan hệ stage seconds) |
-| `HF_HUB_OFFLINE` | 1 | ép local weights (không chạm mạng) |
-
-### 3.7 Khung đo (instrumentation phía thí nghiệm)
-
-| Công cụ | Thông số | Đo gì |
-|---|---|---|
-| aiperf client | streaming, per-chunk usage, `--use-server-token-count` | TTFT/TPOT/ITL per chunk, cold/warm class |
-| `/metrics` scrape | 3 Hz, theo `benchmark_phase` (warmup/profiling) | scheduler stage seconds, queue/running per dp_rank, cache hit, retraction |
-| GPU sampler | nvidia-smi 1 s | util/memory/power mỗi GPU |
-| schedule-eval log | per-request | queue_wait, matched_prefix_tokens, host_hit, in_batch_dedup |
-| torch profiler | — | không khả dụng trên stack dynamo (frontend không proxy /start_profile); thay bằng py-spy + gpu_samples |
-| py-spy | 25 Hz × 120 s mỗi scheduler (8/8) | flame Python scheduler — attach được nhờ `SGLANG_ALLOW_PTRACE=1` → scheduler gọi prctl(PR_SET_PTRACER_ANY) trên node ptrace_scope=1 |
-| bottleneck_report.py | Q1–Q7 decision tree | verdict tổng hợp: GPU busy, client/server gap, TTFT front path, rank balance, KV, spec, hicache |
-
-## 4. Cell full-stack (3320) — CONFIG ĐẦY ĐỦ (frontend + engine)
-
-Cell `agentx_dynamo/profiling/dfs-weight/c64_20261014_112105`, job 3320
-(2026-10-14, ~68 phút). **Cấu hình đúng deliverable**: dynamo frontend
-`--router-mode=kv` (8888) + engine worker `python -m dynamo.sglang` với toàn
-bộ engine config prod (§2) — chạy qua `scripts/profile_cell.sh dynamo 64
-dfs-weight` (seed 42, 30 min, c64, drain 360 s, fresh boot).
-
-### 4.1 Kết quả tổng quan (client-side, aiperf)
+### 4.1 Tổng quan client (aiperf, 1169 records)
 
 | Chỉ số | Giá trị |
 |---|---|
-| Complete records | 1169 (warmup 65 loại; 19 error) |
-| Request throughput | 32.3 req/min (0.54 rps) |
-| Output throughput | 522 tok/s (31.3k tok/min); total 51.2k tok/s |
-| TTFT mean / p95 / p99 | 7.12 s / 20.5 s / 75.4 s |
-| Queue-wait (server, per-request) | mean ~4.8 s warm-class / 3.9 s cold-class; p99 ~247 s (queue metric) |
-| Starvation rate | ~10% (threshold 10 s) |
+| Request / output throughput | 32.3 req/min / 522 tok/s (total 51.2k tok/s) |
+| TTFT mean / p95 / p99 | 7.12 s / 20.5 s / **75.4 s** |
+| Queue-wait (server) | mean 4.8 s (warm) / 3.9 s (cold); **p99 ≈ 247 s** |
+| Starvation rate | ~10% (ngưỡng 10 s) |
 
-Tham chiếu audit: cell engine-only 3065 (cùng điểm dfs-weight × c64) chỉ thu
-277 records, TTFT mean 108 s, 8 req/min — cell đó bị lỗi đo (boot lạnh NFS +
-mất in-flight lúc close), không dùng so sánh; 3320 là số chuẩn.
+### 4.2 Bottleneck
 
-### 4.2 Flame py-spy 8/8 scheduler (25 Hz × 120 s, steady-state)
+**#1 — Batch decode chỉ 1–4 request/rank + chi phí cố định MoE all-to-all là
+nút thắt throughput.**
 
-Lần đầu cell nào có flame đầy đủ (3065 mất sạch vì ptrace). Top frames
-(inclusive, trung bình trên 8 scheduler):
+*Hiện tượng:* mỗi bước decode, scheduler mỗi rank gom toàn bộ request đang
+chạy của rank đó thành một batch rồi forward một lượt. Log cho thấy
+`#running-req: 1–4` — mỗi bước chỉ 1–4 request (~4–16 token với EAGLE draft 4)
+dù trần admission là 256/rank.
+
+*Vì sao batch nhỏ:* concurrency 64 của workload chia đều qua 8 attn-DP rank
+≈ 8 request/rank tại một thời điểm; trừ lúc request đang chờ/kẹt prefill thì
+còn ít hơn.
+
+*Cơ chế MoE a2a:* GLM-5.3 là MoE chạy EP=8 — expert của token nằm rải trên
+8 rank, mỗi bước decode rank phải trao đổi all-to-all: `dispatch_b` gửi
+token tới rank sở hữu expert → expert tính → `combine_b` gom kết quả về
+(DeepEP). Chi phí một lần trao đổi gần như cố định: 4 token hay 400 token
+vẫn phải exchange đủ 8 rank + sync + round-trip, cộng kernel launch và
+EAGLE verify 3 bước. Tok/s/rank ≈ token_mỗi_bước / (chi_phí_cố_định +
+chi_phí_theo_token) — batch mỏng làm tử số nhỏ, mẫu số gần nguyên cố định
+→ a2a chạy **latency-bound** thay vì bandwidth-bound, throughput tụt
+27–317 tok/s/rank.
+
+Flame py-spy 8/8 scheduler (`profiling/pyspy_*.svg`, inclusive, TB 8 rank)
+xác nhận cùng chuyện:
 
 | % samples/scheduler | Frame |
 |---|---|
 | ~52% | `forward_impl` MoE (`moe/ep_moe/layer.py:267`) |
-| ~51% | `run_moe_core` → `forward_cutlass_w4afp8` → `apply_deepep_normal` |
-| ~25% | DeepEP dispatch: `dispatch_b` (`token_dispatcher/deepep.py`) qua TBO (`two_batch_overlap.py`) |
-| ~11.5% | model forward tổng (`deepseek_v2.py`) |
+| ~25% | DeepEP `dispatch_b` (`token_dispatcher/deepep.py`) qua TBO |
+| ~11.5% | model forward (`deepseek_v2.py`) |
 
-Đọc: hơn nửa thời gian CPU scheduler nằm trong path MoE, trong đó a2a
-DeepEP (dispatch_b normal mode) chiếm ~1/4 — phần còn lại là grouped GEMM
-w4afp8 (`cutlass_w4a8_moe_deepep_normal`). Tương thích observation từ
-engine log: fwd occupancy prefill chỉ 13-15% (idle chờ a2a/gather), tức MoE
-a2a + weight-loading là ứng viên bottleneck chính.
+Engine log (`engine_*.log`, dòng `Decode batch` steady-state):
 
-### 4.3 Ghi chú / giới hạn cell full-stack
+> `Decode batch, #running-req: 4, #token: 312576, token usage: 0.54, accept len: 2.16, ..., gen throughput (token/s): 35.88, fwd occupancy: 58.90%`
 
-- **torch-profiler không có**: frontend dynamo không proxy `/start_profile`,
-  engine dưới dynamo không có mặt HTTP riêng → không có trace kernel-level;
-  flame py-spy + gpu_samples 1 s thay thế.
-- **`prompt_tokens_details.cached_tokens` vắng trong usage** dù engine bật
-  `--enable-cache-report` — frontend dynamo không thông qua field này →
-  prompt-cache metrics phía client trống; dùng `matched_prefix_tokens`
-  trong `schedule_eval.jsonl` (1237 records) thay thế.
-- **Counter reset sglang:\***: aiperf detect counter reset lặp lại trong run
-  (worker_id không đổi → không phải restart; khả năng dynamo publisher
-  re-register counter) → thống kê counter server-side (decode/prefill
-  counts) có thể undercount; không ảnh hưởng latency records phía client.
-- GPU telemetry DCGM (9400/9401) không có trên node → aiperf drop; gpu_samples
-  (nvidia-smi 1 s) vẫn đầy đủ.
+> `Decode batch, #running-req: 1, ... gen throughput (token/s): 27.04, ...`
 
-### 4.4 File dữ liệu cell 3320
+(11:51:37 / 11:51:58)
 
-| File | Nội dung |
-|---|---|
-| `profile_export.jsonl` (926 KB) | per-request client records (1169) |
-| `server_metrics_export.jsonl` (2.3 GB) | /metrics 3 Hz — chỉ phân tích qua slurm |
-| `gpu_samples.csv` (1.1 MB) | util/memory/power 1 s mỗi GPU |
-| `schedule_eval.jsonl` (1237) | queue_wait, matched_prefix_tokens, host_hit per request |
-| `profiling/pyspy_*.svg` ×8 | flame 8 scheduler |
-| `e2_metrics.json` / `run_meta.json` | tổng quan + config verbatim |
-| `engine_*.log` / `frontend_*.log` (symlink) | boot + serving log |
+**#2 — Đuôi TTFT nằm ở admission/prefill, không phải engine chậm.**
+TTFT p99 75 s + queue-wait p99 247 s đối lập `#queue-req: 0` lúc decode —
+request chờ ở prefill backlog:
 
+> `Prefill batch, #new-seq: 1, #new-token: 4096, #cached-token: 0, ..., #pending-token: 23779, input throughput (token/s): 5766.03, fwd occupancy: 98.12%`
 
-## 5. Kế hoạch chạy lại trên config đầy đủ
+(engine_*.log, 11:31:45) — chunk 4096/rank, backlog ~24k token chờ cắt.
+*Cơ chế:* không phải "ưu tiên request nặng decode" — prefill-delayer +
+dfs-weight **bảo vệ request đang decode** (prefill chen vào làm ITL của
+request đang chạy giật) nên hoãn prefill mới; request input dài/ít cache
+hit nằm backlog (hàng admission rỗng mới có mâu thuẫn với queue-wait 247 s).
+Lưu ý: nhiều lúc đó `fwd occupancy` chỉ 58–86% — GPU không bận mà prefill
+vẫn chờ: chọn lối của policy (bảo vệ ITL), không phải cạn tài nguyên — và
+tương tác với #1: batch decode mỏng để GPU rảnh, khoảng rảnh đó lẽ ra cắt
+được prefill.
 
-1. **Lấy package dynamo**: ~~prod dùng image nội bộ `sglang-runtime:1.5.0-kvoverlap1`
-   (chưa có trên node; cần credential registry VNG)~~ — **mentor chấp nhận
-   dynamo 1.4.2** (quyết định 2026-10-14): không cần swap 1.5.0. Đường chạy
-   hiện tại dùng dynamo **1.4.2** trích từ image
-   `nvcr.io_nvidia_ai-dynamo_vllm-runtime_1.4.2.sqsh` team đặt sẵn trong
-   /mnt/containers (đủ `dynamo.frontend` router-mode=kv + `dynamo.sglang` +
-   nats-server tĩnh; mọi flag prod đều có) — đây là config chính thức của
-   campaign.
-2. **Ghép engine**: `dynamo.sglang` chạy engine in-process qua `sgl.Engine` →
-   venv-dynamo (py3.12) mang cả dynamo 1.4.2 lẫn sglang branch mình (shim 1
-   file cho `server_args_config_parser` — dynamo chỉ import, không gọi khi
-   chạy thuần CLI). **Đã build xong** (BUILD VENV DYNAMO OK: imports dynamo
-   frontend/sglang/runtime + torch 2.14.1+cu130 + shim). Engine worker expose
-   metrics `sglang:*` multiprocess qua `DYN_SYSTEM_PORT=8081` (harness đổi URL
-   scrape); frontend 8888 là mặt HTTP (aiperf bắn vào đây). NATS 4222 làm
-   discovery/event plane. Stack start = `scripts/start_dynamo_stack.sh`
-   (nats → frontend → engine, prod flags nguyên văn).
-3. **Smoke full stack** (`scripts/smoke_dynamo_stack.sbatch`): **PASSED**
-   (smoke 3307, 2026-10-14). Chain xanh end-to-end: hicache_hash_cpp
-   pre-compile (openssl headers từ mirror) → frontend :8888 listen → model
-   register sau 281 s → GET /v1/models → chat completion non-stream (64
-   tokens, prompt 26) → `sglang:*` metrics đầy đủ 8 dp_rank trên
-   `http://127.0.0.1:8081/metrics` (DYN_SYSTEM_PORT). Dòng "FAIL 5a" trong
-   log 3307 là artifact `set -o pipefail` của chính smoke (`curl | grep -m`
-   → SIGPIPE), không phải lỗi stack — đã sửa (curl ghi file rồi grep).
-   9 vòng smoke 3167→3307, mỗi vòng đúng 1 lỗi: etcd discovery → blake3 →
-   `get_model_config` (API upstream vs branch) → 2 bug scheduler branch
-   (init sau early-return) → `page_size` (dynamo đọc field chưa resolve) →
-   openssl JIT trên node. Vòng smoke kế tiếp verify thêm: chat **streaming
-   SSE** (path aiperf `--streaming`, chưa từng test) + py-spy attach vào
-   `sglang::scheduler` (xem mục 4).
-4. Chạy cell profiling mới: dfs-weight × c64, seed 42, 30 min, full stack
-   (frontend + engine) qua `scripts/profile_cell.sh dynamo 64 dfs-weight`
-   (arm mới). Wiring harness đã xong trong `run_e2.sh`: `READY_ON_MODEL=1`
-   (/health của dynamo trả 200 cả khi 0 worker — readiness thật = model trên
-   /v1/models), `SERVER_PROC_PATTERN='dynamo\.sglang'` (fail-fast pgrep),
-   `SERVER_METRICS_URLS=127.0.0.1:8081` (aiperf scrape engine registry;
-   endpoint unreachable chỉ bị skip, không giết run), /server_info fallback
-   (frontend dynamo không có endpoint này). **Flame py-spy**: node bật yama
-   `ptrace_scope=1`, không sudo → attach sibling bị deny (mất toàn bộ flame
-   cell 3065). Fix trên branch: `run_scheduler_process` gọi
-   `prctl(PR_SET_PTRACER, ANY)` khi `SGLANG_ALLOW_PTRACE=1` (env-gated, đã
-   validate trên node: py-spy dump sibling OK sau prctl; scheduler.py đã
-   push lên mirror). torch-profiler qua HTTP không còn (frontend không proxy
-   /start_profile; engine dưới dynamo không có mặt HTTP riêng) → flame là
-   py-spy, ghi nhận là giới hạn của cell full-stack.
+**#3 — EAGLE spec decode khỏe, không phải nguồn bottleneck.**
 
-## 6. File dữ liệu (cell engine-only 3065 — chỉ để audit)
+> `accept len: 2.58, accept rate: 0.53` (engine_*.log, 11:52:37) — ≥ ngưỡng 2.0 mọi mẫu.
 
-| File | Nội dung |
-|---|---|
-| `server_server_20261013_200032.log` (3.0 MB) | boot log: server_args dump, timeline boot, decode/prefill batch, accept len, retract |
-| `bottleneck_report.json` | 7 verdict Q1–Q7 |
-| `schedule_eval.jsonl` (345 records) | per-request: queue_wait, matched_prefix_tokens, host_hit |
-| `server_metrics_export.jsonl` (2.35 GB) | /metrics 3 Hz theo benchmark_phase (chỉ phân tích qua slurm) |
-| `gpu_samples.csv` (30,096 mẫu) | util/memory/power 1 s mỗi GPU |
-| `e2_metrics.json` / `run_meta.json` | metrics tổng quan + config/seed/command verbatim |
+**#4 — Memory áp lực muộn run nhưng không phải nút thắt chính.**
+Hicache host pool đúng 128 GB/rank — boot, engine_*.log, 8 rank:
 
-Tất cả nằm trong
-`results/8x-h200/glm53/agentx/profiling/dfs-weight/c64_20261013_200031/`.
+> `11:25:06 INFO base.__init__: Allocating kv hierarchical KV host pool: 2469952 tokens, 128.00 GB host memory`
+
+Token usage (field trong mọi dòng batch của engine_*.log, 9.518 dòng) chạm
+1.00 muộn run: 486 dòng ≥ 0.95 (5%), 115 dòng ≥ 0.99, tập trung 12:00–12:21;
+kèm 3 retract đơn lẻ:
+
+> `12:10:11 WARN scheduler.update_running_batch: KV cache pool is full. Retract requests. #retracted_reqs: 1, #new_tokens_gained: 192`
+
+(engine_*.log; thêm 12:18:16 gained 1408, 12:20:06 gained 256) — workload
+256K-context nặng memory thật; hicache offload giữ ổn định, retract rải rác
+không sập throughput.
+
+**#5 — Routing/frontend path không phải bottleneck.**
+Frontend HTTP rẻ — `frontend_*.log`, dòng `http response sent`:
+`latency_ms` 6436×0 ms / 4240×1 / 188×2 / 36×3 / 7×4. TTFT đo ở frontend
+− TTFT engine = 0.26 s median (mean 0.42 s): join theo timestamp 1.151
+request giữa `ttft_ms` trong dòng `request completed` (frontend_*.log) và
+`ttft_s` trong `schedule_eval.jsonl` (request_id frontend ≠ rid engine nên
+không join trực tiếp được). KV-router phân bổ lệch về số request
+(84–221/rank sau warmup — đếm `dp_rank` trong dòng `Selected worker ... logit=`,
+frontend_*.log) nhưng theo cost, không phải hot-rank: rank nhận ít request
+mang input lớn nhất (rank 0: 107K token trung bình → queue-wait 9.6 s), rank
+nhiều request nhỏ input nhất (rank 3/7: 79–85K → TTFT ~4 s) — độ lệch rank
+là hệ quả của #2, không phải router thất thường. WARN (frontend_*.log):
+25 `Expiring stale request` (ví dụ 11:56:37), 1 `Failed to mark prefill
+completed` (12:21:04).
+
+### 4.3 Giới hạn đo (ghi nhận)
+
+- Không torch-profiler: frontend dynamo không proxy `/start_profile`, engine
+  không có mặt HTTP riêng → flame py-spy + gpu_samples 1 s thay thế.
+- `cached_tokens` vắng trong usage (frontend không thông qua field dù engine
+  bật --enable-cache-report) → prompt-cache client metrics trống; thay bằng
+  `matched_prefix_tokens` trong schedule_eval.jsonl.
+- Counter sglang:* bị reset lặp trong run (publisher re-register, không phải
+  restart) → counter server-side có thể undercount; latency client không ảnh hưởng.
+- Frontend 8888/metrics có bộ `dynamo_*` riêng (TTFT/ITL, `kv_hit_rate`,
+  routing overhead, gauge per-worker) — cell này chưa scrape (chỉ 8081);
+  các cell sau thêm `127.0.0.1:8888` vào `--server-metrics`.
+
+### 4.4 Artifacts (run dir `c64_20261014_112105`)
+
+`profile_export.jsonl` (1169 records) · `server_metrics_export.jsonl` (2.3 GB,
+phân tích qua slurm) · `gpu_samples.csv` (1 s) · `schedule_eval.jsonl` (1237)
+· `profiling/pyspy_*.svg` ×8 · `e2_metrics.json`/`run_meta.json` ·
+symlink `engine_*.log`/`frontend_*.log`.

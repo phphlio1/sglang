@@ -214,6 +214,11 @@ curl -s --max-time 30 -o /dev/null -w 'http_code=%{http_code}\n' "${FRONTEND_URL
 curl -s --max-time 30 "${FRONTEND_URL}/metrics" -o "${SMOKE_TMP}/metrics_8888.txt" 2>/dev/null
 grep -m 5 'sglang:' "${SMOKE_TMP}/metrics_8888.txt" || \
   echo "(no sglang:* on 8888 — harness must scrape :8081)"
+# dynamo's own frontend/router metrics live here (TTFT/ITL, kv_hit_rate,
+# routing overhead, per-worker gauges) — the profiling cell scrapes 8888
+# alongside 8081 for routing observability (cell 3320 missed these).
+grep -m 5 'dynamo_frontend_' "${SMOKE_TMP}/metrics_8888.txt" \
+  || { echo "=== FAIL: no dynamo_frontend_* metrics on ${FRONTEND_URL}/metrics ==="; exit 1; }
 
 # --- 5c. schedulers + py-spy attach (profiling-cell prerequisites) -----------
 # SGLANG_ALLOW_PTRACE is exported above so the schedulers (branch
