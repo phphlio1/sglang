@@ -352,7 +352,7 @@ class AdaptiveBoostGamma:
     BETA = 0.2
     # Outer clip in 1/s; the jump floor usually binds first on the low side.
     GAMMA_MIN_S = 1e-3
-    GAMMA_MAX_S = 10.0
+    GAMMA_MAX_S = 15.0
     LN5 = math.log(5.0)
     # epsilon floor on the band width: a compressed tail (t99 == t95) is the
     # degenerate thin tail (FCFS-ward, gamma_hat -> GAMMA_MAX_S), not an error.
@@ -370,7 +370,7 @@ class AdaptiveBoostGamma:
         window: int = WINDOW,
         min_samples: int = MIN_SAMPLES,
     ) -> None:
-        self._latencies: deque = deque(maxlen=window)
+        self._samples: deque = deque(maxlen=window)
         self._min_samples = min_samples
         self._bin_size = bin_size
         self._max_jump_s = max_jump_s
@@ -383,28 +383,83 @@ class AdaptiveBoostGamma:
         return self._gamma
 
     def record_latencies(
-        self, latencies_s: Iterable[float], rate_tokens_per_s: Optional[float]
+        self,
+        latencies_s: Iterable[float],
+        rate_tokens_per_s: Optional[float],
+        works: Optional[Iterable[int]] = None,
     ) -> Optional[float]:
         """Feed completed-request E2E latencies (wall seconds); returns the
         updated gamma when this call applied an update, None while the
-        window is still filling below min_samples."""
-        self._latencies.extend(max(0.0, float(t)) for t in latencies_s)
-        if len(self._latencies) < self._min_samples:
+        window is still filling below min_samples.
+
+        When works is provided, uses a size-aware tail fit: computes gamma_hat
+        separately for short and long requests (split at median work). If long
+        requests have a fatter tail (giant starvation), uses the short-request
+        gamma_hat instead of the overall -- the paper's tail fit assumes the
+        fat tail comes from short-request starvation, which is inverted under
+        overload where giants are starved by the policy itself."""
+        lat_list = [max(0.0, float(t)) for t in latencies_s]
+        if works is not None:
+            work_list = list(works)
+            self._samples.extend(zip(lat_list, work_list))
+        else:
+            self._samples.extend((lat, 0) for lat in lat_list)
+        if len(self._samples) < self._min_samples:
             return None
-        ordered = sorted(self._latencies)
-        delta = max(
-            _percentile(ordered, 99) - _percentile(ordered, 95), self.TAIL_EPS_S
-        )
-        gamma_hat = self.LN5 / delta
+
         gamma_floor = self._gamma_floor(rate_tokens_per_s)
-        gamma_hat = min(max(gamma_hat, gamma_floor), self.GAMMA_MAX_S)
+        gamma_hat = self._size_aware_gamma_hat(gamma_floor)
         gamma = min(
             max((1.0 - self.BETA) * self._gamma + self.BETA * gamma_hat, gamma_floor),
             self.GAMMA_MAX_S,
         )
-        self._maybe_log(gamma, gamma_hat, delta, len(ordered))
+        delta = self.LN5 / max(gamma_hat, self.GAMMA_MIN_S)
+        self._maybe_log(gamma, gamma_hat, delta, len(self._samples))
         self._gamma = gamma
         return gamma
+
+    def _size_aware_gamma_hat(self, gamma_floor: float) -> float:
+        """Overall tail fit (paper Eq. 9), corrected for giant starvation.
+
+        Under overload, giants starved by the policy inflate the overall tail,
+        driving gamma_hat toward zero (positive feedback). Splitting at median
+        work isolates the short-request tail, which reflects the exogenous
+        service variance the paper's fit targets -- not the policy-induced
+        giant starvation."""
+        lats = [s[0] for s in self._samples]
+        works = [s[1] for s in self._samples]
+        gamma_overall = self._tail_gamma_hat(lats)
+
+        if len(works) < 2 * self._min_samples or all(w == works[0] for w in works):
+            return min(max(gamma_overall, gamma_floor), self.GAMMA_MAX_S)
+
+        sorted_works = sorted(works)
+        median_w = sorted_works[(len(sorted_works) - 1) // 2]
+        short_lats = [l for l, w in self._samples if w <= median_w]
+        long_lats = [l for l, w in self._samples if w > median_w]
+        if len(short_lats) < self._min_samples // 2 or len(long_lats) < self._min_samples // 2:
+            return min(max(gamma_overall, gamma_floor), self.GAMMA_MAX_S)
+
+        gamma_short = self._tail_gamma_hat(short_lats)
+        gamma_long = self._tail_gamma_hat(long_lats)
+
+        # Giant starvation: long tail fatter than short (gamma_long < gamma_short).
+        # Use gamma_short to ignore the policy-induced giant tail.
+        if gamma_long < gamma_short:
+            gamma_hat = gamma_short
+        else:
+            gamma_hat = gamma_overall
+        return min(max(gamma_hat, gamma_floor), self.GAMMA_MAX_S)
+
+    @staticmethod
+    def _tail_gamma_hat(lats: list[float]) -> float:
+        """Paper Eq. 9: ln(5) / (t99 - t95), floored at TAIL_EPS_S."""
+        ordered = sorted(lats)
+        delta = max(
+            _percentile(ordered, 99) - _percentile(ordered, 95),
+            AdaptiveBoostGamma.TAIL_EPS_S,
+        )
+        return AdaptiveBoostGamma.LN5 / delta
 
     def _gamma_floor(self, rate_tokens_per_s: Optional[float]) -> float:
         """Smallest gamma whose max boost b_gamma(bin_size / rate) fits
@@ -641,7 +696,6 @@ class SchedulePolicy:
             in (
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
-                CacheAwarePolicy.BOOST,
             )
             and len(waiting_queue) > 128
         ):
@@ -658,6 +712,7 @@ class SchedulePolicy:
         if self.adaptive_gamma is None:
             return None
         latencies = []
+        works = []
         for r in reqs:
             ts = r.time_stats
             # Unstamped (0.0) sides mean the req never reached the scheduler
@@ -670,6 +725,7 @@ class SchedulePolicy:
             ):
                 continue
             latencies.append(ts.completion_time - ts.scheduler_recv_time)
+            works.append(len(r.origin_input_ids) + len(r.output_ids))
         if not latencies:
             return None
         gamma = self.adaptive_gamma.record_latencies(
@@ -679,6 +735,7 @@ class SchedulePolicy:
                 if self.prefill_token_rate is not None
                 else None
             ),
+            works=works,
         )
         if gamma is not None:
             self.boost_gamma = gamma
@@ -820,7 +877,8 @@ class SchedulePolicy:
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            self.policy
+            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.BOOST)
             or budget < 2 * page_size
         ):
             return None

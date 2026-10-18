@@ -144,7 +144,7 @@ server_policy() {
 # a gamma value means different things under tokens vs wall.
 requested_eval_path() {  # $1 = policy
   if [[ "$1" == "boost" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
-    printf '%s/schedule_eval_ada_%s_k%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}"
+    printf '%s/schedule_eval_ada_%s_k%s_j%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_ADAPTIVE_MAX_JUMP_S}"
   elif [[ "$1" == "boost" ]]; then
     printf '%s/schedule_eval_%s_g%s_k%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_CLOCK}" "${BOOST_GAMMA:-def}" "${BOOST_BIN_SIZE}"
   else
@@ -155,19 +155,19 @@ requested_eval_path() {  # $1 = policy
 policy_params_match() {  # $1 = policy; 0 when the running server's full spec matches
   local info
   info="$(server_info_json)" || return 1
-  python3 - "$1" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}" "${BOOST_CLOCK}" "$(requested_eval_path "$1")" "${info}" <<'PY'
+  python3 - "$1" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}" "${BOOST_CLOCK}" "${BOOST_ADAPTIVE_GAMMA}" "${BOOST_ADAPTIVE_MAX_JUMP_S}" "$(requested_eval_path "$1")" "${info}" <<'PY'
 import json, sys
 
-policy, gamma_s, k_s, clock, want_path, info_s = sys.argv[1:7]
+policy, gamma_s, k_s, clock, ada_s, jump_s, want_path, info_s = sys.argv[1:9]
 srv = json.loads(info_s)
 ok = (
     srv.get("schedule_policy") == policy
     and (srv.get("log_schedule_eval_path") or "") == want_path
 )
 if policy == "boost":
-    # Two boost runs with different (clock, gamma, k) must not silently reuse
-    # the first server: the triple is the reuse key; an empty gamma arg means
-    # the clock-mode default (1e-4 tokens / 0.1 1/s wall).
+    # Two boost runs with different (clock, gamma, k, adaptive, jump) must
+    # not silently reuse the first server: the tuple is the reuse key; an
+    # empty gamma arg means the clock-mode default (1e-4 tokens / 0.1 1/s wall).
     default_gamma = 0.1 if clock == "wall" else 1e-4
     want_gamma = float(gamma_s) if gamma_s else default_gamma
     ok = (
@@ -177,6 +177,9 @@ if policy == "boost":
         and srv.get("boost_bin_size") is not None
         and int(srv["boost_bin_size"]) == int(k_s)
         and srv.get("boost_clock") == clock
+        and bool(srv.get("boost_adaptive_gamma")) == (ada_s == "1")
+        and srv.get("boost_adaptive_max_jump_s") is not None
+        and float(srv["boost_adaptive_max_jump_s"]) == float(jump_s)
     )
 sys.exit(0 if ok else 1)
 PY
@@ -427,7 +430,7 @@ mode_smoke() {
 
 run_label() {  # $1 = policy, $2 = concurrency; boost arms carry clock/gamma/k
   if [[ "$1" == "boost" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
-    printf 'c%s_gada_%s_k%s' "$2" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}"
+    printf 'c%s_gada_%s_k%s_j%s' "$2" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_ADAPTIVE_MAX_JUMP_S}"
   elif [[ "$1" == "boost" ]]; then
     printf 'c%s_g%s_%s_k%s' "$2" "${BOOST_GAMMA:-def}" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}"
   else
@@ -500,7 +503,9 @@ Usage: $0 <mode> [args]
   array                    Slurm array mode (SLURM_ARRAY_TASK_ID 0..5 -> policies)
 Env knobs: SGLANG_URL MODEL TOKENIZER CONCURRENCY DURATION SEED OUTPUT_DIR
            SMOKE_POLICY SMOKE_DURATION NUM_ENTRIES HEALTH_TIMEOUT STOP_SERVER
-           BOOST_GAMMA BOOST_BIN_SIZE NUM_DATASET_ENTRIES GRACE_PERIOD FORCE_RESTART
+           BOOST_GAMMA BOOST_BIN_SIZE BOOST_ADAPTIVE_GAMMA BOOST_ADAPTIVE_MAX_JUMP_S
+           BOOST_CLOCK IN_BATCH_PREFIX_CACHING_MAX_PIN_S
+           NUM_DATASET_ENTRIES GRACE_PERIOD FORCE_RESTART
            TRAJECTORY_START_MIN_RATIO TRAJECTORY_START_MAX_RATIO
 EOF
     exit 2 ;;

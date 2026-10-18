@@ -260,6 +260,19 @@ class TestShortestPrefillFirst(CustomTestCase):
             )
         )
 
+    def test_boost_policy_gets_chunk_limit(self):
+        # Boost shares the chunk-limit cap so a giant chunked prefill reserves
+        # tokens for shorter high-boost waiting requests (the c16 giant-prefill
+        # blocking fix). A regression that removes BOOST from the policy guard
+        # turns this red.
+        self.policy.policy = CacheAwarePolicy.BOOST
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            2560,
+        )
+
 
 class TestGammaBoostMath(CustomTestCase):
     """gamma_boost numerics (UniBoost Eq. 2): the expm1-stable form must stay
@@ -488,9 +501,10 @@ class TestBoostSort(CustomTestCase):
             policy.calc_priority(queue)
         self.assertEqual([r.rid for r in queue], ["hot", "cold"])
 
-    def test_large_queue_falls_back_to_fcfs_like_lpm(self):
-        # Cost parity with lpm/hrrn: past 128 waiting reqs the active policy
-        # is FCFS and the expensive match+sort pass is skipped.
+    def test_large_queue_stays_boost_not_fcfs(self):
+        # Unlike lpm/hrrn whose prefix matching is O(n * tree_depth), boost's
+        # sort is O(n log n) and safe at scale. A regression that re-adds
+        # BOOST to the _determine_active_policy fallback list turns this red.
         policy = SchedulePolicy(
             policy="boost",
             tree_cache=RadixCache.create_simulated(),
@@ -501,7 +515,7 @@ class TestBoostSort(CustomTestCase):
         small = [_make_boost_req(f"r{i}", 256, arrival=0) for i in range(128)]
         large = small + [_make_boost_req("r129", 256, arrival=0)]
         self.assertIs(policy._determine_active_policy(small), CacheAwarePolicy.BOOST)
-        self.assertIs(policy._determine_active_policy(large), CacheAgnosticPolicy.FCFS)
+        self.assertIs(policy._determine_active_policy(large), CacheAwarePolicy.BOOST)
 
     def test_boost_without_prefix_cache_degrades_to_fcfs_with_warning(self):
         with self.assertLogs("sglang.srt.managers.schedule_policy", level="WARNING"):
@@ -861,7 +875,7 @@ class TestInBatchDedupStamping(CustomTestCase):
         # does not classify dedup; a flag left from an earlier sort would
         # exempt a non-follower from the invariant bound.
         policy = SchedulePolicy(
-            policy="boost",
+            policy="lpm",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
@@ -1028,7 +1042,7 @@ class TestCompletedLatencyFeed(CustomTestCase):
         unstamped.time_stats.completion_time = 0.0
         valid = self._finished_req("valid", recv_s=100.0, done_s=160.0)
         policy.record_completed_latencies([streaming, unstamped, valid])
-        self.assertEqual(list(policy.adaptive_gamma._latencies), [60.0])
+        self.assertEqual(list(policy.adaptive_gamma._samples), [(60.0, 256)])
 
     def test_feed_moves_gamma_and_rebinds_sort_gamma(self):
         # boost + flag -> a full window of completions moves gamma and the
@@ -1043,7 +1057,7 @@ class TestCompletedLatencyFeed(CustomTestCase):
         self.assertIsNotNone(gamma)
         self.assertNotEqual(gamma, 0.09)
         self.assertEqual(policy.boost_gamma, gamma)
-        self.assertEqual(len(policy.adaptive_gamma._latencies), 34)
+        self.assertEqual(len(policy.adaptive_gamma._samples), 34)
 
     def test_off_and_mismatched_paths(self):
         # Without the flag gamma-Ada stays off (the fixed-gamma path must

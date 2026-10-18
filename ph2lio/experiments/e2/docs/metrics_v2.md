@@ -113,6 +113,201 @@ gamma tĩnh γ̂ offline = 0.09 1/s (wall clock), không adaptive.
 | dfs-weight | 143 | 146 | 81.58% | 27.500 | 51.702 | 365.985 | 35114.19 | 171258.53 | 383571.18 | 95.34 | 53.81 | 191.56 | 81.4 | 0.140 | 31.60 | 65.52 | 56.89% |
 
 
+## Full run 2026-10-13 — commit 2991704690 (5 cells)
+
+Static-gamma sweep ở c16 (γ = 0.05 / 0.075 / 0.12 / 0.2, wall, k = 256,
+adaptive **off** — tách trục static γ thuần) + boost-ada (γ0 = 0.09,
+adaptive bật). Cùng protocol: fresh boot (FORCE_RESTART=1), seed 42,
+1800 s; GRACE_PERIOD=600 (có cận, khác 10-09 dùng inf) để né drain hang.
+γ = 0.02 fail hạ tầng (server không lên sau đợt dọn double-launch) —
+chưa có cell. Baseline so sánh: lpm/c16 block 10-09.
+
+γ adaptive hội tụ 0.09 → ~0.042 (final-50 mean; range 0.035–0.096) —
+fixed point do workload tự sinh, γ0 bị quên sau ~100 admission đầu.
+
+Caveat harness cell ada: aiperf treo ở drain sau khi profiling xong
+(sinh token cuối 00:16, không còn in-flight; bị kill 02:51) — exports
+profiling đầy đủ, run_meta + e2_metrics_v2.json dựng tay sau; không có
+`profile_export_aiperf.json` (v1).
+
+### c16 — concurrency 16 (đường cong static γ)
+
+| arm | gamma | n done | n wait | cache hit (%) | queue mean (s) | queue p90 (s) | queue p99 (s) | TTFT mean (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL mean (ms) | ITL p90 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 | worst-5% wait (%) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| lpm (10-09) | — | 169 | 173 | 84.81% | 19.892 | 57.810 | 153.131 | 23958.37 | 74285.69 | 130670.55 | 77.16 | 52.70 | 211.51 | 87.8 | 0.282 | 38.05 | 53.58 | 30.57% |
+| boost static | 0.05 | 172 | 172 | 82.36% | 22.354 | 65.546 | 158.679 | 30241.97 | 119295.97 | 198668.34 | 92.82 | 53.39 | 217.03 | 81.6 | 0.297 | 38.80 | 126.24 | 31.35% |
+| boost static | 0.075 | 172 | 172 | 82.18% | 23.037 | 96.996 | 141.697 | 31001.43 | 142436.69 | 177753.08 | 93.83 | 53.31 | 223.17 | 82.0 | 0.267 | 34.61 | 91.63 | 31.20% |
+| boost static (10-09) | 0.09 | 164 | 168 | 83.03% | 19.536 | 53.201 | 173.198 | 23028.70 | 84795.82 | 117749.90 | 92.71 | 53.32 | 245.14 | 85.5 | 0.261 | 31.07 | 54.27 | 35.18% |
+| boost static | 0.12 | 166 | 166 | 80.91% | 25.802 | 97.049 | 159.991 | 33552.21 | 143737.99 | 186807.42 | 89.55 | 53.11 | 211.54 | 82.9 | 0.296 | 34.81 | 98.99 | 30.50% |
+| boost static | 0.2 | 173 | 173 | 82.95% | 21.027 | 78.365 | 130.136 | 28600.72 | 134871.47 | 156883.69 | 90.06 | 52.85 | 230.24 | 84.6 | 0.278 | 33.50 | 59.48 | 31.37% |
+| boost-ada (hội tụ ~0.042) | 0.09→ | 166 | 166 | 81.66% | 22.325 | 63.775 | 135.108 | 30026.49 | 134694.66 | 180039.78 | 90.87 | 52.85 | 193.38 | 83.2 | 0.309 | 21.60 | 148.51 | 31.05% |
+
+**Đọc sweep (1 run/cell, mọi khác biệt nằm trong band nhiễu — không
+đơn điệu theo γ trên bất kỳ metric nào):** TTFT mean 23.0–33.6 s và
+queue mean 19.5–25.8 s lật qua lật lại giữa các γ không theo thứ bậc;
+"vùng ngọt γ=0.09" (TTFT mean 23.0 s thấp nhất) không replicate thành
+xu hướng — 0.05 (30.2) tệ hơn 0.075 (31.0)? rồi 0.09 (23.0) tốt, 0.12
+(33.6) tệ, 0.2 (28.6) giữa. Ở thống kê vững (mean trên ~170 request),
+**lpm ≥ mọi arm boost ở mọi γ** (queue mean 19.9, TTFT mean 24.0, ITL
+mean 77.2, tok/s 87.8). Kết luận stage-1: ở c16/1 GPU, chọn γ không có
+tác dụng phân biệt được ngoài nhiễu; boost phải chứng minh ở CCU cao
+hơn / nhiều GPU / có repeat.
+
+## Full run 2026-10-14 — commit 60060211ce + cap patch (working tree) (3 cells + 1 void crash)
+
+Quét max-jump bound J của boost-Ada Eq. 9: J ∈ {50, 40} so với J = 60
+(cell 2026-10-13). J thấp hơn → floor γ cao hơn (giải bisection
+b_γ(k/rate) ≤ J, rate ~2000 tok/s: J = 50 → floor ≈ 0.090 = static-0.09;
+J = 40 → floor ≈ 0.107). Cùng protocol: fresh boot (FORCE_RESTART=1),
+seed 42, 1800 s, GRACE_PERIOD=600; γ0 = 0.09, wall, k = 256.
+
+Trạng thái code: cell J = 40 chạy đúng 60060211ce; cell J = 50 chạy với
+patch chunk-preempt (Φ-keyed cap, xem block dưới khi có) có mặt trong
+working tree nhưng flag OFF — behaviorally inert (server_args không có
+`boost_chunk_preempt`).
+
+### c16 — concurrency 16
+
+| arm | J | gamma | n done | n wait | cache hit (%) | queue mean (s) | queue p90 (s) | queue p99 (s) | TTFT mean (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL mean (ms) | ITL p90 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 | worst-5% wait (%) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| boost-ada Eq.9 (13-10, tham chiếu) | 60 | 0.09→~0.085 | 171 | 171 | 82.49% | 22.522 | 73.364 | 126.404 | 30045.91 | 131392.25 | 158347.13 | 85.95 | 52.79 | 195.92 | 85.6 | 0.299 | 57.61 | 79.68 | 29.27% |
+| boost-ada Eq.9 | 50 | 0.09→0.106 | 167 | 167 | 81.68% | 22.189 | 70.970 | 119.619 | 30099.72 | 105729.70 | 140758.66 | 91.94 | 52.97 | 218.80 | 82.8 | 0.365 | 34.90 | 157.74 | 26.12% |
+| boost-ada Eq.9 | 40 | 0.09→0.120 | 166 | 166 | 82.00% | 23.710 | 70.544 | 132.833 | 31223.94 | 125026.49 | 146188.66 | 87.10 | 52.91 | 183.33 | 84.3 | 0.335 | 35.43 | 69.26 | 28.27% |
+| boost-ada Eq.9 + cap ON (rerun, guard) | 60 | 0.09→0.088 | 166 | 166 | 81.41% | 21.277 | 71.497 | 157.544 | 29539.16 | 132596.88 | 191496.17 | 99.43 | 53.20 | 243.18 | 81.3 | 0.272 | 25.27 | 77.47 | 33.58% |
+
+**Đọc (J-sweep):** floor hoạt động đúng thiết kế — J = 50: γ min
+0.0900 bị pin đúng floor (= static-0.09, như dự đoán), final-50 mean
+0.1056 (adaptive nhích lên khi tail mỏng đi); J = 40: γ min 0.0900 =
+γ0 đầu chạy (chưa chạm floor ~0.107), final-50 mean 0.1200; J = 60: min
+0.0804 > floor 0.077 (tự do). **J = 50 là điểm both-wins đầu tiên của
+boost-ada:** so J = 60, cả 4 metric cùng cải thiện — queue p99 126.4 →
+**119.6 s** (−22% vs lpm 153.1, chỉ sau hrrn 111.3), TTFT p99 158.3 →
+**140.8 s** (≈ hrrn 141.7; tệ hơn lpm 7.8% nhưng tốt hơn mọi arm boost
+trước đó), Jain 0.299 → **0.365** (cao nhất mọi arm đã đo, > hrrn
+0.321), worst-5% 29.27 → **26.12%** (thấp nhất bảng). J = 40 (floor
+~0.107, nghiêng FCFS hơn) đánh mất queue p99 (132.8) — J = 50 là mép
+giữa của dãy. Giá của J = 50: TTFT mean 30.1 s (lpm 24.0), stretch p99
+157.7× (outlier 1 request — stretch p95 34.9 lại tốt hơn lpm 38.05 và
+J = 60 57.6), ITL p99 218.8 (tệ nhất trong 3 arm J), tok/s 82.8 (−5.7%
+vs lpm). Non-monotonic theo J ở 1 run (stretch p99 79.7/157.7/69.3,
+ITL p99 195.9/218.8/183.3, tok/s 85.6/82.8/84.3) — cùng kết luận như γ
+sweep: tín hiệu đơn run < nhiễu. Cái phân biệt được: floor pin đúng
+nơi dự đoán + J = 50 cải thiện đồng thời 4 metric. Cold/warm queue
+p99: J = 50 117.8/117.0 (đều nhau); J = 40 117.8/133.0. Retractions 0
+cả hai cell.
+
+### c16 — crash VOID: cap ON lần đầu, server chết OOM prefill ở phút 24
+
+Cell `c16_gada_wall_k256_j60_pre_20261014_104817` (10:48 boot, flag
+`boost_chunk_preempt` ON — cell đầu tiên chạy cap thật): boot witness
+`boost chunk preempt: enabled` xuất hiện 10:50:26 (factory
+`from_schedule` nối flag tới policy — đúng thiết kế). Cap fire đúng
+một lần trong 257 lần gọi: 11:04:45, bước 2 của chunk giant ~184k,
+cắt 8192 → 7242 token và admit 1 waiting req giữa chunk — đúng cơ chế
+mid-chunk admission.
+
+11:14:01 scheduler chết: `alloc_token_slots` raise `RuntimeError: Out
+of memory. Try to lower your batch size. Try to allocate 1343 tokens.
+Available full tokens: 559 (full_evictable_size_=0)` trong
+`prepare_for_extend` của prefill batch kế tiếp. Cơ chế: một giant ~149k
+uncached (khác giant 184k ở trên) được adder admit vào chunked prefill
+lúc usage 0.72 (3 req decode giữ ~393k / pool ~546k; budget =
+available + evictable vừa đủ ở mép); chunk của nó đẩy usage 0.75 →
+1.00 trong 45 s, evictable cạn về 0; alloc bước chunk kế thiếu ~784
+token. Build này coi prefill alloc failure là fatal (không có đường
+retract cho prefill như decode) → kill cả server: 52 success / 639
+errors, cell void (không có run_meta.json/e2_metrics.json —
+`write_run_meta` chết ở curl `/server_info` khi server đã chết, `set
+-e` cắt runner).
+
+**Attribution: không phải do cap.** (1) Batch crash là chính bước
+continuation của giant — cap chỉ đổi kích thước alloc 8192 → 1343,
+cả hai đều > 559 token còn lại, fail y hệt khi không có cap; (2)
+giant được admit lúc `chunked_req=None` — code cap không nằm trong
+path admission; (3) cell no-cap J = 60 (13-10) cũng từng đẩy pool lên
+1.00 nhiều lần và sống — vì alloc kế tiếp của nó (1644 token, 98k
+cached) vừa với ~2.7k token dư. Pool chạm 1.00 là trạng thái thường
+xuyên của regime c16 này (16 × ~100k input ≈ 1.6M token cầu vs pool
+546k) — sống/chết là coin-flip theo mép dư, không phụ thuộc policy.
+Falsification: rerun cùng config — sống → timing luck; crash lại →
+quỹ đạo cap/policy (premium fresh-giant của Φ đẩy admit giant ở mép
+budget) chạm edge một cách hệ thống → guard degrade-thay-vì-crash
+thành điều kiện tiên quyết production. Ghi chú production (8×H200):
+prefill alloc failure fatal là lỗ hổng reliability của build này,
+độc lập với policy.
+
+### c16 — cap rerun (guard ON): sống hết run, 6/6 prediction bị bác
+
+Rerun `c16_gada_wall_k256_j60_pre_20261014_132712` (13:27 boot, RUN
+DONE 14:20:47, 180 records) sau khi guard PrefillBudget (clamp
+continuation step vào live capacity + gate load-back) vào working
+tree. **Guard hoạt động:** pool chạm `full token usage: 1.00` **12
+lần** và sống hết (cell void trước chết ngay lần chạm đầu có alloc
+fail; 0 "Scheduler hit an exception"); 5 dòng retract decode —
+degrade đúng thiết kế thay vì crash. Cap fire **23/513 lần gọi** (vs
+1/257 của cell void).
+
+**6/6 prediction của giả thuyết giant-budget-hog bị bác** (điều kiện
+falsify đã định trước: "queue p99 không giảm hoặc TTFT p99 tệ hơn"):
+queue p99 dự đoán 100-115 s → thực tế **157.5 s** (tệ hơn cả lpm 153.1,
+tệ hơn no-cap J = 60 là 126.4); TTFT p99 dự đoán 120-140 s → **191.5 s**
+(tệ nhất mọi arm đã đo); worst-5% dự đoán ≤29.3% → **33.58%**; Jain
+dự đoán ≥0.30 → **0.272**; tok/s dự đoán −1-2% → **−5.0%** (81.3 vs
+85.6); γ dự đoán rising >0.085 → cuối 0.0884 (danh nghĩa đạt, nhưng
+quỹ đạo là decay từ đỉnh 0.326 xuống band 0.084-0.088, min 0.0838 —
+không phải rise; band cuối ~ giống no-cap 0.0845). Chỉ 2 metric phụ
+không tệ hơn: stretch p99 77.5 (vs 79.7) và TTFT mean 29.5 (vs 30.0).
+
+**Kết luận:** cơ chế dominant của queue-tail ở regime này không phải
+"giant chiếm budget, small đói queue" — cắt giant giữa chunk để
+admit small làm tail **tệ hơn** (giant chậm đi: mỗi lần fire thêm 1
+chu kỳ pause/resume; small được admit giữa chunk giữ KV + decode,
+pool thêm áp lực → ITL p99 196→243 ms, 12 lần pool 1.00, 5 retract).
+→ đóng hướng chunk-preempt cap, chuyển **stage-2: unified
+prefill+decode queue + cross-phase yielding** đúng Phase-2 của paper.
+
+Confound phải ghi: guard là mới trong run này — clamp/skip chunk step
+và retract ở pool 1.00 tự thêm queue/TTFT latency; cell no-cap
+tham chiếu không bao giờ sống qua các thời điểm đó nên không thể tách
+hoàn toàn chi phí cap khỏi chi phí sống-sót áp lực. Nhưng hướng xấu
+đồng nhất trên 6/7 metric chính là tín hiệu suy biến nhất quán, không
+phải lật nhiễu. Guard giữ nguyên như điều kiện tiên quyết production
+(8×H200) — nó là reliability fix, không phải policy.
+
+
+## Full run 2026-10-13 — commit 60060211ce (1 cell)
+
+boost-Ada **Eq. 9** (code commit 4751c6068d): estimator fit **E2E latency
+của request hoàn thành** (UniBoost Eq. 9 — thay cho wait tail nội sinh
+của arm ada 2991704690), window 128 / min 32, feed từ
+process_batch_result; low clip = **max-jump bound** b_γ(k/rate) ≤ 60 s
+(`--boost-adaptive-max-jump-s`, giải bisection từ rate EMA) thay γ_min
+thô. γ0 = 0.09, wall, k = 256. Cùng protocol: fresh boot (FORCE_RESTART=1),
+seed 42, 1800 s, GRACE_PERIOD=600.
+
+γ trajectory: 0.09 → **~0.085** (final-50 mean 0.0845; min 0.0804 > floor
+~0.077, max 0.284 sớm-run) — hết feedback loop ada-wait (0.09 → 0.042);
+jump hiệu dụng ~54 s ≈ static 0.09.
+
+### c16 — concurrency 16
+
+| arm | gamma | n done | n wait | cache hit (%) | queue mean (s) | queue p90 (s) | queue p99 (s) | TTFT mean (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL mean (ms) | ITL p90 (ms) | ITL p99 (ms) | tok/s | Jain | stretch p95 | stretch p99 | worst-5% wait (%) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| boost-ada Eq.9 (hội tụ ~0.085) | 0.09→ | 171 | 171 | 82.49% | 22.522 | 73.364 | 126.404 | 30045.91 | 131392.25 | 158347.13 | 85.95 | 52.79 | 195.92 | 85.6 | 0.299 | 57.61 | 79.68 | 29.27% |
+
+**Đọc (so các arm c16 cùng seed/protocol):** so ada-wait cùng γ0
+(2991704690): stretch p99 148.5 → **79.7** (−46%), TTFT p99 180.0 →
+**158.3 s** (−12%), queue p99 135.1 → **126.4 s** — hết regression
+starvation của estimator wait. So static 0.09 (10-09): queue p99 **−27%**
+(126.4 vs 173.2 — thấp nhất mọi arm kể cả lpm 153.1), worst-5% **29.27%**
+thấp nhất bảng, Jain 0.299, n done 171, ITL p99 195.9 (thứ 2 sau
+ada-wait); đổi lại TTFT p99 +34% (158.3 vs 117.7 s), stretch p99 +47%
+(79.7 vs 54.3). Eq. 9 tự chọn γ ≈ 0.085 (giữa static 0.075–0.09), floor
+gần không phải chặn (min 0.0804 > floor 0.077) — giá trị của floor là
+bảo hiểm khi workload đổi (tail béo hơn → γ̂ nhỏ hơn → trần jump vẫn
+60 s), không phải chốt ngưỡng hôm nay.
+
+
 ## Full run 2026-10-08 — commit 0083303206 (5 cells)
 
 ### c16 — concurrency 16
