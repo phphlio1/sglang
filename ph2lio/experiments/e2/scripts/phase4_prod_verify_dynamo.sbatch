@@ -23,6 +23,7 @@ set -euo pipefail
 BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
 BOOST_SWEEP_GAMMA="${BOOST_SWEEP_GAMMA:-5.0}"   # phase-1 winner
+SEEDS_LIST="${SEEDS_LIST:-42}"                 # paired seeds, seed-major
 
 NODE_LOCAL="${NODE_LOCAL:-/mnt/loipp}"
 if [ -x "${NODE_LOCAL}/venv-dynamo/bin/python3" ]; then
@@ -59,30 +60,45 @@ export IN_BATCH_PREFIX_CACHING_MAX_PIN_S=60
 
 cd "${E2_DIR}"
 
-run_cell() {  # $1 = policy, $2 = boost gamma (empty for non-boost)
-  local p="$1" g="$2" label
+run_cell() {  # $1 = policy, $2 = boost gamma (empty for non-boost), $3 = seed
+  local p="$1" g="$2" seed="$3" label
   if [[ "${p}" == "boost" ]]; then
     label="c64_g${g}_wall_k256"
   else
     label="c64"
   fi
-  if ls "${OUTPUT_DIR}/${p}/${label}_"*/e2_metrics.json >/dev/null 2>&1; then
-    echo "=== E2 resume: skip completed ${p} ${label} ==="
+  if seed_done "${p}" "${label}" "${seed}"; then
+    echo "=== E2 resume: skip completed ${p} ${label} seed=${seed} ==="
     return 0
   fi
-  echo "=== E2 phase4 prod-verify cell: policy=${p} c64 ${g:+gamma=${g} }==="
+  echo "=== E2 phase4 prod-verify cell: policy=${p} c64 ${g:+gamma=${g} }seed=${seed} ==="
   if [[ "${p}" == "boost" ]]; then
-    BOOST_GAMMA="${g}" bash scripts/run_e2.sh policy boost 64 \
-      || echo "=== E2 cell failed: ${p} ${label} (will retry on resubmit) ==="
+    BOOST_GAMMA="${g}" SEED="${seed}" bash scripts/run_e2.sh policy boost 64 \
+      || echo "=== E2 cell failed: ${p} ${label} seed=${seed} (will retry on resubmit) ==="
   else
-    bash scripts/run_e2.sh policy "${p}" 64 \
-      || echo "=== E2 cell failed: ${p} ${label} (will retry on resubmit) ==="
+    SEED="${seed}" bash scripts/run_e2.sh policy "${p}" 64 \
+      || echo "=== E2 cell failed: ${p} ${label} seed=${seed} (will retry on resubmit) ==="
   fi
 }
 
-run_cell dfs-weight ""
-run_cell boost "${BOOST_SWEEP_GAMMA}"
-if [[ "${BOOST_SWEEP_GAMMA}" != "15.0" ]]; then
-  run_cell boost "15.0"
-fi
+seed_done() {  # $1 = policy, $2 = label, $3 = seed: completed cell with this seed?
+  local d
+  for d in "${OUTPUT_DIR}/$1/$2"_*/; do
+    [[ -f "${d}e2_metrics.json" && -f "${d}run_meta.json" ]] || continue
+    grep -q "\"seed\": $3," "${d}run_meta.json" && return 0
+  done
+  return 1
+}
+
+# Seed-major (paired; see phase2 header for the seed-variance rationale).
+# NB: phase-4 cells keep raw server_metrics_export.jsonl (focus analysis) —
+# multi-seed multiplies that disk cost linearly (~GB-scale per cell).
+read -ra SEEDS <<< "${SEEDS_LIST}"
+for seed in "${SEEDS[@]}"; do
+  run_cell dfs-weight "" "${seed}"
+  run_cell boost "${BOOST_SWEEP_GAMMA}" "${seed}"
+  if [[ "${BOOST_SWEEP_GAMMA}" != "15.0" ]]; then
+    run_cell boost "15.0" "${seed}"
+  fi
+done
 echo "=== PHASE4 DONE (keep raw exports; run focus analysis next) ==="

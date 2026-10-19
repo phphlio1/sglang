@@ -1,13 +1,22 @@
 #!/usr/bin/env bash
 # E2 boost campaign — Phase 3: adaptive gamma (gamma-Ada, UniBoost Eq. 9) on
 # the dynamo arm. BOOST_ADAPTIVE_GAMMA=1, gamma0=0.09, wall clock, k=256.
-# J=60 vs J=120 (per gamma_sweep.sh: the 2026-10-13 RTX run converged toward
-# ~0.042 but J=60 floors gamma at ~0.077; J=120 lets it approach the fixed
-# point). Concurrency = PHASE3_CONC (phase-0 band).
+# J=60 vs J=120: the 2026-10-19 RTX audit (plan §5.5) found that under heavy
+# overload the raw E2E-tail fit always sits below the jump floor, so gamma
+# pins at gamma_floor(J) — the controller is inert and J is the effective
+# knob (J=60 vs J=120 = two floor levels). With ~8x H200 prefill rate,
+# tau = k/rate shrinks ~8x, so the same J gives a higher floor and the
+# lighter load may let the raw fit exceed it: the controller may actually
+# be active here. Concurrency = PHASE3_CONC (phase-0 band).
+#
+# Paired seeds (SEEDS_LIST, default "42"): seed variance dwarfs the J
+# effect in RTX replicates, so multi-seed (--export=SEEDS_LIST="42 43 44")
+# is recommended for the J comparison. Seed-major order.
 #
 # Gates: engine log carries the "boost adaptive gamma: gamma=..." trajectory
-# (schedule_policy.py:493; needs >=128 finished latencies) and
-# schedule_eval.jsonl records show the live gamma moving.
+# (schedule_policy.py:504; logs the raw pre-floor fit, its tail source
+# "overall"/"short", the raw width, and the floor; needs >=128 finished
+# latencies) and schedule_eval.jsonl records show the live gamma moving.
 #SBATCH --job-name=e2boost-p3-adaptive
 #SBATCH --partition=hardware-hcm
 #SBATCH --nodelist=hgx-h200-01
@@ -27,6 +36,7 @@ set -euo pipefail
 BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
 PHASE3_CONC="${PHASE3_CONC:-16}"   # from the phase-0 gate
+SEEDS_LIST="${SEEDS_LIST:-42}"     # paired seeds, seed-major (see header)
 
 NODE_LOCAL="${NODE_LOCAL:-/mnt/loipp}"
 if [ -x "${NODE_LOCAL}/venv-dynamo/bin/python3" ]; then
@@ -65,18 +75,30 @@ export IN_BATCH_PREFIX_CACHING_MAX_PIN_S=60
 cd "${E2_DIR}"
 
 # run_label: adaptive boost = c<conc>_gada_<clock>_k<bin>_j<jump>
-for j in 60 120; do
-  label="c${PHASE3_CONC}_gada_wall_k256_j${j}"
-  if ls "${OUTPUT_DIR}/boost/${label}_"*/e2_metrics.json >/dev/null 2>&1; then
-    echo "=== E2 resume: skip completed boost ${label} ==="
-    continue
-  fi
-  echo "=== E2 phase3 adaptive cell: J=${j} c${PHASE3_CONC} ==="
-  BOOST_ADAPTIVE_MAX_JUMP_S="${j}" bash scripts/run_e2.sh policy boost "${PHASE3_CONC}" \
-    || echo "=== E2 cell failed: boost ${label} (will retry on resubmit) ==="
-  find "${OUTPUT_DIR}" -name e2_metrics.json | while read -r m; do
-    d="$(dirname "${m}")"
-    [[ -f "${d}/server_metrics_export.jsonl" ]] && gzip -f "${d}/server_metrics_export.jsonl"
+seed_done() {  # $1 = policy, $2 = label, $3 = seed: completed cell with this seed?
+  local d
+  for d in "${OUTPUT_DIR}/$1/$2"_*/; do
+    [[ -f "${d}e2_metrics.json" && -f "${d}run_meta.json" ]] || continue
+    grep -q "\"seed\": $3," "${d}run_meta.json" && return 0
+  done
+  return 1
+}
+
+read -ra SEEDS <<< "${SEEDS_LIST}"
+for seed in "${SEEDS[@]}"; do
+  for j in 60 120; do
+    label="c${PHASE3_CONC}_gada_wall_k256_j${j}"
+    if seed_done boost "${label}" "${seed}"; then
+      echo "=== E2 resume: skip completed boost ${label} seed=${seed} ==="
+      continue
+    fi
+    echo "=== E2 phase3 adaptive cell: J=${j} c${PHASE3_CONC} seed=${seed} ==="
+    BOOST_ADAPTIVE_MAX_JUMP_S="${j}" SEED="${seed}" bash scripts/run_e2.sh policy boost "${PHASE3_CONC}" \
+      || echo "=== E2 cell failed: boost ${label} seed=${seed} (will retry on resubmit) ==="
+    find "${OUTPUT_DIR}" -name e2_metrics.json | while read -r m; do
+      d="$(dirname "${m}")"
+      [[ -f "${d}/server_metrics_export.jsonl" ]] && gzip -f "${d}/server_metrics_export.jsonl"
+    done
   done
 done
 echo "=== PHASE3 DONE (check the gamma trajectory before phase 4) ==="
