@@ -68,7 +68,7 @@ export SGLANG_URL="http://127.0.0.1:30000"
 # aiperf client never touches the network.
 export MODEL="zai-org/GLM-5.3"
 export TOKENIZER="/mnt/hf_hub_cache/GLM-5.3-W4AFP8"
-export OUTPUT_DIR="${E2_DIR}/results/8x-h200/glm53/agentx"
+export OUTPUT_DIR="${E2_DIR}/results/glm53/agentx"
 export SERVER_SCRIPT="${E2_DIR}/scripts/start_server_h200_glm53.sh"
 # Cold boot measured ~2.5-3 h (2758: prefill-graph JIT to 05:16, still short
 # of ready at the 7200 s cutoff — no crash, just slow; /shared HOME JIT

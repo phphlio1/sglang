@@ -21,7 +21,7 @@ from collections import defaultdict
 
 # default = cell 3320 (historical); any run dir may be passed as argv[1]
 RUN = (sys.argv[1] if len(sys.argv) > 1 else
-       "/shared/loipp/sglang/ph2lio/experiments/e2/results/8x-h200/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261014_112105")
+       "/shared/loipp/sglang/ph2lio/experiments/e2/results/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261014_112105")
 SRC = f"{RUN}/server_metrics_export.jsonl"
 OUT = f"{RUN}/analysis"
 os.makedirs(OUT, exist_ok=True)

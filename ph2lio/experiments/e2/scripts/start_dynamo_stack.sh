@@ -20,7 +20,7 @@
 set -euo pipefail
 
 E2_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESULTS_ROOT="${E2_DIR}/results/8x-h200/glm53/agentx_dynamo"
+RESULTS_ROOT="${E2_DIR}/results/glm53/agentx_dynamo"
 
 BENCH=/shared/loipp
 # Node-local execution mirror (mirror_from_login.sh): when present, run the

@@ -15,7 +15,7 @@
 #     "--dp-size N --enable-dp-attention" spelling — that resolves to
 #     attn_dp_size, not replicas.
 #   - SERVER_PYTHON: /shared venv (compute nodes see /shared, not /home).
-#   - Results root results/8x-h200/qwen/agentx.
+#   - Results root results/qwen/agentx.
 #   - RTX Blackwell env workarounds dropped (CUDA shim, JIT DeepGEMM off,
 #     flashinfer CCCL flag): H200 is SM90.
 #
@@ -27,12 +27,12 @@
 # The pre-existing cache-style entry models--Qwen--Qwen3.8-27B-FP8 is a
 # 366 MB stub owned by another user, so we use our own flat dir instead).
 # Served name pinned to the HF id so the harness MODEL is unchanged.
-# Log: results/8x-h200/qwen/agentx/<policy>/server_<timestamp>.log
+# Log: results/qwen/agentx/<policy>/server_<timestamp>.log
 
 set -euo pipefail
 
 E2_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESULTS_ROOT="${E2_DIR}/results/8x-h200/qwen/agentx"
+RESULTS_ROOT="${E2_DIR}/results/qwen/agentx"
 
 # ===== User-editable serving configuration (E2 H200, set 2026-10-08) =======
 # RTX config (2026-10-05) unchanged; only the topology and the interpreter

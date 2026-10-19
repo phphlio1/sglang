@@ -50,7 +50,7 @@ set -euo pipefail
 
 BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
-RESULTS_ROOT="${E2_DIR}/results/8x-h200/glm53/agentx_dynamo"
+RESULTS_ROOT="${E2_DIR}/results/glm53/agentx_dynamo"
 LOGS_DIR="${RESULTS_ROOT}/logs"
 
 NODE_LOCAL="${NODE_LOCAL:-/mnt/loipp}"

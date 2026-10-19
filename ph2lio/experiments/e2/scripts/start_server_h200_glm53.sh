@@ -32,12 +32,12 @@
 # Usage / env knobs: identical to start_server.sh (<policy> | --stop;
 # BOOST_*, IN_BATCH_PREFIX_CACHING_MAX_PIN_S, LOG_SCHEDULE_EVAL_PATH,
 # GLM_MODEL_PATH).
-# Log: results/8x-h200/glm53/agentx/<policy>/server_<timestamp>.log
+# Log: results/glm53/agentx/<policy>/server_<timestamp>.log
 
 set -euo pipefail
 
 E2_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RESULTS_ROOT="${E2_DIR}/results/8x-h200/glm53/agentx"
+RESULTS_ROOT="${E2_DIR}/results/glm53/agentx"
 
 # ===== User-editable serving configuration (E2 H200, set 2026-10-08) =======
 # Production engine config (han/glm53-w4afp8-h200-8x), flag-mapped as above.

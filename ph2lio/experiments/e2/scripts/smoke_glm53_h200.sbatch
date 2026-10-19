@@ -75,7 +75,7 @@ fi
 export SGLANG_URL="http://127.0.0.1:30000"
 export MODEL="zai-org/GLM-5.3"
 export TOKENIZER="/mnt/hf_hub_cache/GLM-5.3-W4AFP8"
-export OUTPUT_DIR="${E2_DIR}/results/8x-h200/glm53/agentx"
+export OUTPUT_DIR="${E2_DIR}/results/glm53/agentx"
 export SERVER_SCRIPT="${E2_DIR}/scripts/start_server_h200_glm53.sh"
 # Cold boot on the NFS venv measured > 60 min (2623: ~50 min of imports
 # + arg resolution before schedulers spawned, still loading at the 3600 s

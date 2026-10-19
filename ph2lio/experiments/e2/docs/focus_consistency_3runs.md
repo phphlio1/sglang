@@ -5,9 +5,9 @@ Trả lời câu hỏi: bottleneck thấy ở baseline 3320 có lặp lại ở 
 
 | Run | Stamp | Run dir |
 |---|---|---|
-| 1 (baseline 3320) | c64_20261014_112105 | `results/8x-h200/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261014_112105` |
-| 2 | c64_20261015_133031 | `results/8x-h200/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261015_133031` |
-| 3 | c64_20261015_144717 | `results/8x-h200/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261015_144717` |
+| 1 (baseline 3320) | c64_20261014_112105 | `results/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261014_112105` |
+| 2 | c64_20261015_133031 | `results/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261015_133031` |
+| 3 | c64_20261015_144717 | `results/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261015_144717` |
 
 ## 1. Bảng so sánh (mọi số tính trong benchmark window, nguồn như focus report từng run)
 

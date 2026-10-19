@@ -2,7 +2,7 @@
 
 So sánh thông số Engine SGLang để profile bottleneck giữa 5 run có cùng cấu hình Production GLM5.3, workload AgentX
 
-`BASE_DIR = /shared/loipp/sglang/ph2lio/experiments/e2/results/8x-h200/glm53/agentx_dynamo/profiling/dfs-weight/`
+`BASE_DIR = /shared/loipp/sglang/ph2lio/experiments/e2/results/glm53/agentx_dynamo/profiling/dfs-weight/`
 
 | Run | Stamp | Run dir |
 |---|---|---|

@@ -72,7 +72,7 @@ case "${ARM}" in
     export SGLANG_URL="http://127.0.0.1:30000"
     export MODEL="zai-org/GLM-5.3"
     export TOKENIZER="/mnt/hf_hub_cache/GLM-5.3-W4AFP8"
-    export RESULTS_ROOT="${E2_DIR}/results/8x-h200/glm53/agentx"
+    export RESULTS_ROOT="${E2_DIR}/results/glm53/agentx"
     export HEALTH_TIMEOUT=7200    # cold NFS boot measured > 60 min (2623)
     export AIPERF_DATASET_MMAP_CACHE_DIR="${BENCH}/aiperf_mmap_cache"
     ;;
@@ -81,7 +81,7 @@ case "${ARM}" in
     export SGLANG_URL="http://127.0.0.1:30000"
     export MODEL="Qwen/Qwen3.8-27B-FP8"
     export TOKENIZER="/mnt/hf_hub_cache/Qwen3.8-27B-FP8"
-    export RESULTS_ROOT="${E2_DIR}/results/8x-h200/qwen/agentx"
+    export RESULTS_ROOT="${E2_DIR}/results/qwen/agentx"
     export HEALTH_TIMEOUT=5400
     export AIPERF_DATASET_MMAP_CACHE_DIR="${BENCH}/aiperf_mmap_cache_n02"
     ;;
@@ -107,7 +107,7 @@ case "${ARM}" in
     export SGLANG_URL="http://127.0.0.1:8888"
     export MODEL="zai-org/GLM-5.3"
     export TOKENIZER="/mnt/hf_hub_cache/GLM-5.3-W4AFP8"
-    export RESULTS_ROOT="${E2_DIR}/results/8x-h200/glm53/agentx_dynamo"
+    export RESULTS_ROOT="${E2_DIR}/results/glm53/agentx_dynamo"
     export HEALTH_TIMEOUT=12000   # mirror boot measured 281 s to registration
     export AIPERF_DATASET_MMAP_CACHE_DIR="${BENCH}/aiperf_mmap_cache"
     export READY_ON_MODEL=1
