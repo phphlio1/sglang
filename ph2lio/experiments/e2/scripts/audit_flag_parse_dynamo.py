@@ -97,7 +97,8 @@ def build_parsers():
 
 
 def parse_case(parser, sglang_only_parser, label, policy, extra):
-    args = [f.format(policy=policy) for f in ENGINE_FLAGS] + extra
+    # replace, not format: the kv-events-config JSON braces would be format placeholders
+    args = [f.replace("{policy}", policy) for f in ENGINE_FLAGS] + extra
     dynamo_args, unknown = parser.parse_known_args(args)
     parsed = sglang_only_parser.parse_args(unknown)
 
