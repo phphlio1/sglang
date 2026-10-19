@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # E2 boost campaign — Phase 0: load-band recalibration on the dynamo arm.
-# 3 short probe cells (DURATION=600) with dfs-weight at c16/c32/c64 to find
+# 3 short probe cells (DURATION=900 — the scenario's minimum; 600 was rejected
+# by aiperf's scenario invariant) with dfs-weight at c16/c32/c64 to find
 # the concurrency band where #queue-req is persistently > 0 but not drowned
 # (the 5 old c64 cells showed 73k-132k pending = saturated). The chosen band
 # feeds phase 1's gamma sweep. Gate (evaluated after the cells, from the
@@ -51,7 +52,10 @@ export HEALTH_TIMEOUT=3600
 export FORCE_RESTART=1
 export GRACE_PERIOD=360
 export SEED=42
-export DURATION=600          # probe cells only — not comparable to 1800s cells
+export DURATION=900          # probe cells — scenario invariant requires >=900s
+                             # (steady state + KV offloading); 900 is the min,
+                             # still half a full 1800s cell. NOT directly
+                             # comparable to the 1800s campaign cells.
 export STOP_SERVER=always
 export HF_HOME="${BENCH}/hf"
 
