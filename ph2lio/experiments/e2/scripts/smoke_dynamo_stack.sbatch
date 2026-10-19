@@ -25,6 +25,11 @@
 #      schedulers prctl(PR_SET_PTRACER_ANY) — branch scheduler.py; without
 #      it every flame capture is denied under yama ptrace_scope=1, which is
 #      how profile cell 3065 lost all its flames)
+#   6.  boost + adaptive-gamma boot (post boost-merge): new flags parse under
+#      the dynamo wrapper, schedule-eval records carry gamma/boost_clock/
+#      bin_size, and SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0 (OOM
+#      recovery guard) reaches the engine env. shortest-prefill-first is
+#      covered offline by audit_flag_parse_dynamo.py instead of a 3rd boot.
 #
 # Submit AFTER mirror_from_login.sh hgx-h200-01 printed MIRROR OK — without
 # the /mnt mirror the boot reads the venv over ~1.4 MB/s NFS (hours).
@@ -243,6 +248,80 @@ if [ -x "${PYSPY}" ]; then
 else
   echo "(py-spy not on the mirror; skipping the attach test)"
 fi
+
+# --- 6. boost + adaptive-gamma boot (post-merge gate) ------------------------
+# The merged boost scheduler under the real dynamo wrapper: policy=boost,
+# gamma-Ada on (wall clock, J=60), schedule-eval log on. Proves the new flags
+# (argparse surface), the eval-log field parity (gamma/boost_clock/bin_size),
+# and the OOM-recovery env (SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0 now
+# exported by start_dynamo_stack.sh) reaches the engine process.
+# shortest-prefill-first is covered offline by audit_flag_parse_dynamo.py
+# (argparse choices), not by a third 8-GPU boot.
+echo "=== 6. stopping dfs-weight stack; booting boost adaptive stack ==="
+bash "${E2_DIR}/scripts/start_dynamo_stack.sh" --stop || true
+sleep 10
+BOOST_SMOKE_EVAL="${SMOKE_TMP}/schedule_eval_smoke.jsonl"
+rm -f "${BOOST_SMOKE_EVAL}"
+SGLANG_ALLOW_PTRACE=1 \
+BOOST_GAMMA=0.09 BOOST_ADAPTIVE_GAMMA=1 BOOST_ADAPTIVE_MAX_JUMP_S=60 \
+BOOST_CLOCK=wall BOOST_BIN_SIZE=256 \
+LOG_SCHEDULE_EVAL_PATH="${BOOST_SMOKE_EVAL}" \
+  bash "${E2_DIR}/scripts/start_dynamo_stack.sh" boost &
+STACK_PID=$!
+T0=$(date +%s)
+until curl -sf --max-time 10 "${FRONTEND_URL}/v1/models" -o "${SMOKE_TMP}/models_boost.json" 2>/dev/null \
+    && grep -q 'zai-org/GLM-5.3' "${SMOKE_TMP}/models_boost.json"; do
+  NOW=$(date +%s); ELAPSED=$((NOW - T0))
+  if ! kill -0 "${STACK_PID}" 2>/dev/null; then
+    echo "=== FAIL: boost stack driver died at ${ELAPSED}s (argparse/validation?) ==="
+    tail -n 80 "${LOGS_DIR}"/engine_*.log 2>/dev/null | tail -n 100 || true
+    exit 1
+  fi
+  if [ "${ELAPSED}" -ge "${MODELS_TIMEOUT}" ]; then
+    echo "=== FAIL: boost stack model never registered after ${ELAPSED}s ==="
+    tail -n 80 "${LOGS_DIR}"/engine_*.log 2>/dev/null | tail -n 100 || true
+    exit 1
+  fi
+  sleep 10
+done
+echo "=== boost stack MODEL REGISTERED after $(( $(date +%s) - T0 ))s ==="
+
+echo "=== 6a. STRICT_MEM_CHECK env reaches the engine process ==="
+ENGINE_PID="$(pgrep -f 'dynamo\.sglang' | head -1)"
+[[ -n "${ENGINE_PID}" ]] || { echo "=== FAIL: no dynamo.sglang process ==="; exit 1; }
+tr '\0' '\n' < "/proc/${ENGINE_PID}/environ" | grep -q \
+  'SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0' \
+  || { echo "=== FAIL: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0 not in engine env ==="; \
+       tr '\0' '\n' < "/proc/${ENGINE_PID}/environ" | grep SGLANG || true; exit 1; }
+echo "engine pid ${ENGINE_PID} carries SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0"
+
+echo "=== 6b. 3 tiny chats on the boost stack (finish -> eval-log records) ==="
+for i in 1 2 3; do
+  curl -sf --max-time 300 "${FRONTEND_URL}/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"zai-org/GLM-5.3","messages":[{"role":"user","content":"Nói một câu ngắn về trời hôm nay."}],"max_tokens":32,"temperature":0}' \
+    -o "${SMOKE_TMP}/chat_boost_${i}.json" \
+    || { echo "=== FAIL: boost chat ${i} errored ==="; exit 1; }
+done
+echo "3 boost chats OK"
+
+echo "=== 6c. schedule-eval records carry the boost fields ==="
+sleep 5  # eval logger flushes on request finish
+[ -s "${BOOST_SMOKE_EVAL}" ] || { echo "=== FAIL: ${BOOST_SMOKE_EVAL} empty/missing ==="; exit 1; }
+"${NODE_LOCAL}/venv-dynamo/bin/python3" - "${BOOST_SMOKE_EVAL}" <<'PY' \
+  || { echo "=== FAIL: schedule-eval field parity (see above) ==="; exit 1; }
+import json, sys
+recs = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+assert recs, "no records"
+bad = [r.get("rid") for r in recs
+       if r.get("policy") != "boost"
+       or r.get("gamma") is None
+       or r.get("boost_clock") != "wall"
+       or r.get("bin_size") != 256]
+assert not bad, f"records missing boost fields: {bad}"
+print(f"schedule-eval OK: {len(recs)} records, policy=boost, "
+      f"gamma={recs[0]['gamma']}, boost_clock=wall, bin_size=256")
+PY
 
 echo "=== DYNAMO SMOKE PASS $(date) ==="
 echo "stack logs: ${LOGS_DIR}/"
