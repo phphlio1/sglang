@@ -155,7 +155,10 @@ valid_policy() {
 # --- Server lifecycle --------------------------------------------------------
 
 server_healthy() {
-  curl -sf "${SGLANG_URL}/health" >/dev/null 2>&1 || return 1
+  # --max-time is load-bearing: a half-dead frontend (SIGTERM'd, socket still
+  # open, never answering) makes a bare curl block forever — cell 3437 hung
+  # ~100 min in server_stop's poll on exactly that until it was scancelled.
+  curl -sf --max-time 10 "${SGLANG_URL}/health" >/dev/null 2>&1 || return 1
   [[ "${READY_ON_MODEL}" == "1" ]] || return 0
   # File-first grep (never `curl | grep -q` under pipefail: grep -q closes
   # the pipe, curl dies SIGPIPE, pipefail fails a healthy poll — same

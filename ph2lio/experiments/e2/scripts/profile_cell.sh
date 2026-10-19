@@ -164,7 +164,12 @@ PYSPY_RATE="${PYSPY_RATE:-25}"
 PYSPY_DURATION_S="${PYSPY_DURATION_S:-120}"
 PROFILE_STEPS="${PROFILE_STEPS:-30}"
 STEADY_STATE_DELAY_S="${STEADY_STATE_DELAY_S:-120}"
-PROBE_WAIT_TIMEOUT_S="${PROBE_WAIT_TIMEOUT_S:-300}"
+# 900 covers a cold-mirror boot end to end: frontend :8888 answers /health
+# within seconds (before any worker registers), so with the readiness gate
+# below the clock starts at true readiness and aiperf's command.txt lands
+# within seconds — but keep headroom anyway (3436's cold-JIT boot was 433 s
+# from frontend-up to aiperf start and lost every probe at the old 300 s).
+PROBE_WAIT_TIMEOUT_S="${PROBE_WAIT_TIMEOUT_S:-900}"
 
 PROBE_PIDS=()
 
@@ -176,7 +181,21 @@ cleanup_probes() {
 }
 trap cleanup_probes EXIT
 
-server_healthy() { curl -sf "${SGLANG_URL}/health" >/dev/null 2>&1; }
+# Same readiness gate as run_e2.sh: the dynamo frontend answers /health 200
+# with ZERO workers (READY_ON_MODEL), so gate on the served model too —
+# otherwise the PROBE_WAIT clock starts at frontend-up and the whole engine
+# boot (5–7+ min cold) counts against it (3436 skipped all probes this way).
+# --max-time: a half-dead frontend makes a bare curl block forever (3437).
+server_healthy() {
+  curl -sf --max-time 10 "${SGLANG_URL}/health" >/dev/null 2>&1 || return 1
+  [[ "${READY_ON_MODEL:-0}" == "1" ]] || return 0
+  local m; m="$(mktemp)"
+  curl -sf --max-time 10 "${SGLANG_URL}/v1/models" -o "${m}" 2>/dev/null \
+    && grep -qE "\"id\": *\"${MODEL}\"" "${m}"
+  local rc=$?
+  rm -f "${m}"
+  return "${rc}"
+}
 
 echo "=== E2 profiling cell: arm=${ARM} policy=${POLICY} conc=${CONC} duration=${DURATION}s ==="
 cd "${E2_DIR}"
