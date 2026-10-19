@@ -1,4 +1,5 @@
 import math
+import re
 import time
 import unittest
 from array import array
@@ -976,6 +977,35 @@ class TestAdaptiveBoostGamma(CustomTestCase):
                 [0.0] * 15 + [1e9], rate_tokens_per_s=None
             )
         self.assertAlmostEqual(gamma, AdaptiveBoostGamma.GAMMA_MIN_S)
+
+    def test_trajectory_log_reports_raw_fit_and_floor(self):
+        # Regression (e2 c16 investigation, 2026-10-19): the log line printed
+        # the post-floor gamma_hat and a width derived from it, so a
+        # floor-pinned overload run logged a 4-20 s "tail" while the raw tail
+        # was 86-560 s -- the floor-bound state was invisible and the
+        # trajectory read as a converged fit. The line must carry the raw
+        # pre-floor fit, which tail it came from, and the floor, so a pinned
+        # run shows fit << floor.
+        adaptive = AdaptiveBoostGamma(
+            gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
+        )
+        with self.assertLogs(
+            "sglang.srt.managers.schedule_policy", level="INFO"
+        ) as cm:
+            # Degenerate fat tail: raw fit ~ ln5/(6e8) far below the floor.
+            for _ in range(200):
+                adaptive.record_latencies(
+                    [0.0] * 15 + [1e9], rate_tokens_per_s=2000.0
+                )
+        fit_m = re.search(r"fit=([\d.eE+-]+)", cm.output[-1])
+        floor_m = re.search(r"floor=([\d.eE+-]+)", cm.output[-1])
+        self.assertIsNotNone(fit_m, "log must report the raw fit")
+        self.assertIsNotNone(floor_m, "log must report the floor")
+        fit = float(fit_m.group(1))
+        floor = float(floor_m.group(1))
+        self.assertLess(fit, 1e-6, "fit must be the pre-floor raw estimate")
+        self.assertGreater(floor, 0.07, "floor is the J=60 jump bound at 2k tok/s")
+        self.assertIn("tail", cm.output[-1])
 
     def test_warmup_returns_none_below_min_samples(self):
         # Below min_samples percentiles are noise; the caller must be able to
