@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-BENCH="${BENCH:-/shared/lopp}"
+BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
 BOOST_SWEEP_GAMMA="${BOOST_SWEEP_GAMMA:-5.0}"   # phase-1 winner
 

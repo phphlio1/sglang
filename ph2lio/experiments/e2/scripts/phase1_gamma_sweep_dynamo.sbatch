@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-BENCH="${BENCH:-/shared/lopp}"
+BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
 PHASE1_CONC="${PHASE1_CONC:-16}"   # from the phase-0 gate; submit with --export
 

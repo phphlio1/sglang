@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-BENCH="${BENCH:-/shared/lopp}"
+BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
 
 # --- node-local execution mirror (see run_e2_h200_glm53.sbatch for the why) ---
