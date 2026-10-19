@@ -29,7 +29,14 @@ echo "[$(date +%H:%M:%S)] trees: uv-python venv-server home venv-aiperf venv-dyn
 # venv-dynamo + bin (nats-server): the dynamo full-stack bootstrap (see
 # build_venv_dynamo.sh / start_dynamo_stack.sh) — dynamo runs the engine
 # in-process, so its venv carries both dynamo 1.4.2 and our sglang branch.
+# The trailing .mirror_commit member records the pushed commit so
+# push_python_delta.sh (fast path for small python/ edits) can diff against
+# it instead of re-streaming the whole tree.
+STAMP_DIR="$(mktemp -d)"
+git -C "${BENCH}/sglang" rev-parse HEAD > "${STAMP_DIR}/.mirror_commit"
+trap 'rm -rf "${STAMP_DIR}"' EXIT
 tar -C "${BENCH}" -cf - uv-python venv-server home venv-aiperf venv-dynamo bin sglang/python \
+  -C "${STAMP_DIR}" .mirror_commit \
   | srun -p hardware-hcm -w "${NODE}" --cpus-per-task=8 --mem=16G \
       --time=03:00:00 bash "${SCRIPTS}/mirror_node_side.sh"
 
