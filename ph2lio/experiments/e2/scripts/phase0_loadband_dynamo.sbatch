@@ -7,7 +7,9 @@
 # samples, max queue 1-2, throughput still scaling ~linearly 162->368 tok/s)
 # while c64 is known drowned on this exact stack (the 5 old dynamo c64 cells,
 # now in agentx_pilot_preprod, showed 73k-132k pending). So the band is
-# between 32 and 64: probe c48. The chosen band feeds phase 1's gamma sweep.
+# between 32 and 64: probe c40 and c48 (old data suggests c48 may already
+# start drowning — its throughput sat below c40's). The chosen band feeds
+# phase 1's gamma sweep.
 # Gate (evaluated after the cells, from the engine log + schedule_eval
 # queue_wait mass): persistent but modest queue.
 #
@@ -78,7 +80,7 @@ gzip_cell_exports() {  # rolling disk policy (plan §H.3): completed probe cells
   done
 }
 
-for c in 16 32 48; do
+for c in 16 32 40 48; do
   if ls "${OUTPUT_DIR}/dfs-weight/c${c}_"*/e2_metrics.json >/dev/null 2>&1; then
     echo "=== E2 resume: skip completed dfs-weight c${c} ==="
     continue
