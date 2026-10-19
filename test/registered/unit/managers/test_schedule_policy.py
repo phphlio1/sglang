@@ -5,7 +5,7 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.schedule_policy import (
     AdaptiveBoostGamma,
     BoostClock,
@@ -260,6 +260,19 @@ class TestShortestPrefillFirst(CustomTestCase):
             )
         )
 
+    def test_boost_policy_gets_chunk_limit(self):
+        # Boost shares the chunk-limit cap so a giant chunked prefill reserves
+        # tokens for shorter high-boost waiting requests (the c16 giant-prefill
+        # blocking fix). A regression that removes BOOST from the policy guard
+        # turns this red.
+        self.policy.policy = CacheAwarePolicy.BOOST
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            2560,
+        )
+
 
 class TestGammaBoostMath(CustomTestCase):
     """gamma_boost numerics (UniBoost Eq. 2): the expm1-stable form must stay
@@ -488,9 +501,10 @@ class TestBoostSort(CustomTestCase):
             policy.calc_priority(queue)
         self.assertEqual([r.rid for r in queue], ["hot", "cold"])
 
-    def test_large_queue_falls_back_to_fcfs_like_lpm(self):
-        # Cost parity with lpm/hrrn: past 128 waiting reqs the active policy
-        # is FCFS and the expensive match+sort pass is skipped.
+    def test_large_queue_stays_boost_not_fcfs(self):
+        # Unlike lpm/hrrn whose prefix matching is O(n * tree_depth), boost's
+        # sort is O(n log n) and safe at scale. A regression that re-adds
+        # BOOST to the _determine_active_policy fallback list turns this red.
         policy = SchedulePolicy(
             policy="boost",
             tree_cache=RadixCache.create_simulated(),
@@ -501,7 +515,7 @@ class TestBoostSort(CustomTestCase):
         small = [_make_boost_req(f"r{i}", 256, arrival=0) for i in range(128)]
         large = small + [_make_boost_req("r129", 256, arrival=0)]
         self.assertIs(policy._determine_active_policy(small), CacheAwarePolicy.BOOST)
-        self.assertIs(policy._determine_active_policy(large), CacheAgnosticPolicy.FCFS)
+        self.assertIs(policy._determine_active_policy(large), CacheAwarePolicy.BOOST)
 
     def test_boost_without_prefix_cache_degrades_to_fcfs_with_warning(self):
         with self.assertLogs("sglang.srt.managers.schedule_policy", level="WARNING"):
@@ -861,7 +875,7 @@ class TestInBatchDedupStamping(CustomTestCase):
         # does not classify dedup; a flag left from an earlier sort would
         # exempt a non-follower from the invariant bound.
         policy = SchedulePolicy(
-            policy="boost",
+            policy="lpm",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
@@ -875,199 +889,203 @@ class TestInBatchDedupStamping(CustomTestCase):
 
 class TestAdaptiveBoostGamma(CustomTestCase):
     # window/min_samples shrunk per instance so the estimator math stays
-    # testable without 2048 admissions; the formulas are window-agnostic.
+    # testable without 128 completions; the formulas are window-agnostic.
     LN5 = math.log(5.0)
 
     def test_estimator_math_and_ema(self):
-        # waits = {0, 1000, ..., 99000}: linear-interpolated p95 = 94050,
-        # p99 = 98010, so tail width = 3960 and gamma_hat = ln5/3960. One
+        # latencies = {0, 1, ..., 99} s: linear-interpolated p95 = 94.05,
+        # p99 = 98.01, so tail width = 3.96 s and gamma_hat = ln5/3.96. One
         # update from gamma0 applies the 0.2 EMA weight to that estimate.
-        # Guards the percentile definition (nearest-rank would give 95000 /
-        # 98000 -> width 3000) and the beta placement (weighting the old
-        # value instead of the estimate changes the result).
-        adaptive = AdaptiveBoostGamma(gamma0=1e-4, window=128, min_samples=64)
-        waits = list(range(0, 100_000, 1000))
-        gamma = adaptive.record_admissions(waits)
-        expected = 0.8 * 1e-4 + 0.2 * (self.LN5 / 3960.0)
+        # Guards the percentile definition (nearest-rank would give 95/98
+        # -> width 3) and the beta placement (weighting the old value
+        # instead of the estimate changes the result).
+        adaptive = AdaptiveBoostGamma(
+            gamma0=0.1, bin_size=256, max_jump_s=60.0, window=128, min_samples=64
+        )
+        gamma = adaptive.record_latencies(
+            [float(t) for t in range(100)], rate_tokens_per_s=None
+        )
+        expected = 0.8 * 0.1 + 0.2 * (self.LN5 / 3.96)
         self.assertIsNotNone(gamma)
         self.assertAlmostEqual(gamma, expected, delta=expected * 1e-12)
         self.assertAlmostEqual(adaptive.gamma, expected, delta=expected * 1e-12)
 
-    def test_clip_bounds(self):
-        # Degenerate tails clip, never saturate past the bounds: an all-equal
-        # window (width 0) is the maximally thin tail -> GAMMA_MAX; a huge
-        # spread is the fat tail -> GAMMA_MIN. The floor 3e-7 is the task's
-        # corrected value (1e-5 would clip off the c16 equilibrium gamma).
-        thin = AdaptiveBoostGamma(gamma0=1e-4, window=16, min_samples=8)
-        for _ in range(200):
-            thin_gamma = thin.record_admissions([1000] * 16)
-        self.assertLessEqual(thin_gamma, AdaptiveBoostGamma.GAMMA_MAX)
-        self.assertGreater(thin_gamma, 9.9e-4)
-
-        fat = AdaptiveBoostGamma(gamma0=1e-4, window=16, min_samples=8)
-        for _ in range(200):
-            fat_gamma = fat.record_admissions([0] * 15 + [10**12])
-        self.assertGreaterEqual(fat_gamma, AdaptiveBoostGamma.GAMMA_MIN)
-        self.assertLess(fat_gamma, 3.05e-7)
-
-    def test_direction_load_step_burst(self):
-        # The corrected direction: a fat wait tail -> smaller gamma (stronger
-        # boosts, locality/LAS-ward); a thin tail after the load step ends ->
-        # gamma recovers (FCFS-ward). An inverted estimator goes red here.
-        adaptive = AdaptiveBoostGamma(gamma0=1e-4, window=16, min_samples=8)
-        for _ in range(40):
-            fat_gamma = adaptive.record_admissions([0] * 15 + [50_000_000])
-        self.assertLess(fat_gamma, 1e-6)
-        for _ in range(40):
-            thin_gamma = adaptive.record_admissions([1000] * 16)
-        self.assertGreater(thin_gamma, 5e-4)
-        self.assertLess(fat_gamma, 1e-4, "fat tail must push gamma below gamma0")
-        self.assertGreater(thin_gamma, fat_gamma, "recovery must raise gamma")
-
-    def test_wall_fixed_point_invariant_under_clock_rate(self):
-        # The c8 drift bug in unit form: the same wall waits denominated in a
-        # clock whose rate swings with cache state (fresh 5k vs warm 36.7k
-        # tok/s) move the tokens-mode fixed point ~7.3x, while the wall-mode
-        # estimate of the same waits is one number, ln5/width_s. Fractional
-        # waits also pin the float coercion: the old int() cast would crush
-        # sub-second waits to 0 and degenerate the tail to GAMMA_MAX.
-        wall_waits = [0.0] * 59 + [1.0, 2.0, 3.0, 4.0, 5.0]
-        # p95 = 1.85, p99 = 4.37 of the sorted 64-wait window.
-        width_s = 2.52
-
-        def converged(clock, waits, gamma0):
-            adaptive = AdaptiveBoostGamma(
-                gamma0=gamma0, window=64, min_samples=64, clock=clock
-            )
-            gamma = None
-            for _ in range(200):
-                gamma = adaptive.record_admissions(waits)
-            return gamma
-
-        wall = converged(BoostClock.WALL, wall_waits, 0.1)
-        self.assertAlmostEqual(
-            wall, self.LN5 / width_s, delta=self.LN5 / width_s * 1e-6
-        )
-
-        fresh = converged(BoostClock.TOKENS, [w * 5_000.0 for w in wall_waits], 1e-4)
-        warm = converged(BoostClock.TOKENS, [w * 36_700.0 for w in wall_waits], 1e-4)
-        self.assertAlmostEqual(
-            fresh,
-            self.LN5 / (width_s * 5_000.0),
-            delta=self.LN5 / width_s / 5_000.0 * 1e-6,
-        )
-        self.assertAlmostEqual(
-            warm,
-            self.LN5 / (width_s * 36_700.0),
-            delta=self.LN5 / width_s / 36_700.0 * 1e-6,
-        )
-        self.assertGreater(
-            fresh / warm, 5.0, "token-denominated waits drift with the clock rate"
-        )
-
-    def test_wall_clip_bounds(self):
-        # Wall-mode clip bounds are 1/s scale: the degenerate thin tail lands
-        # at GAMMA_MAX_S (not the 1e-3 tokens bound), the fat tail at
-        # GAMMA_MIN_S.
-        thin = AdaptiveBoostGamma(
-            gamma0=0.1, window=16, min_samples=8, clock=BoostClock.WALL
-        )
-        for _ in range(200):
-            thin_gamma = thin.record_admissions([0.001] * 16)
-        self.assertLessEqual(thin_gamma, AdaptiveBoostGamma.GAMMA_MAX_S)
-        self.assertGreater(thin_gamma, 9.9)
-
-        fat = AdaptiveBoostGamma(
-            gamma0=0.1, window=16, min_samples=8, clock=BoostClock.WALL
-        )
-        for _ in range(200):
-            fat_gamma = fat.record_admissions([0.0] * 15 + [10**9])
-        self.assertGreaterEqual(fat_gamma, AdaptiveBoostGamma.GAMMA_MIN_S)
-        self.assertLess(fat_gamma, 1.001e-3)
-
-    def test_wall_gamma0_outside_bounds_clips(self):
-        # A tokens-scale gamma0 (1e-4 per-token) in wall mode is below the
-        # 1/s floor; it must clip up, not run unclipped (mode-mismatch guard
-        # for the default-resolution path).
+    def test_jump_floor_bounds_max_boost(self):
+        # The low clip is the max-jump invariant, not a raw gamma: with
+        # k=256, rate=2000 tok/s (tau=0.128 s) and J=60 s, a degenerate fat
+        # tail (gamma_hat ~ 0) must still converge to gamma ~ 0.077, where
+        # b_gamma(k/rate) = 60 s. A raw gamma floor (1e-3) would let gamma
+        # collapse and the newcomer jump grow unbounded with the tail.
         adaptive = AdaptiveBoostGamma(
-            gamma0=1e-4, window=16, min_samples=8, clock=BoostClock.WALL
+            gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
+        )
+        for _ in range(200):
+            gamma = adaptive.record_latencies(
+                [0.0] * 15 + [1e9], rate_tokens_per_s=2000.0
+            )
+        self.assertGreater(gamma, 0.07)
+        self.assertLess(gamma, 0.08)
+        jump_s = gamma_boost(256 / 2000.0, gamma)
+        self.assertLessEqual(jump_s, 60.0)
+        self.assertGreaterEqual(jump_s, 59.9, "floor must be tight, not slack")
+
+    def test_jump_floor_tracks_rate_not_gamma(self):
+        # Same jump budget at 10x the service rate: tau shrinks 10x, the
+        # floor gamma moves (0.077 -> ~0.11) so the *jump* stays 60 s. A
+        # fixed-gamma floor regression (one gamma for every rate) fails
+        # here: at 0.077 the 20k-tok/s jump would be ~2.4x the budget.
+        for rate, lo, hi in ((2000.0, 0.07, 0.08), (20000.0, 0.10, 0.11)):
+            adaptive = AdaptiveBoostGamma(
+                gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
+            )
+            for _ in range(200):
+                gamma = adaptive.record_latencies(
+                    [0.0] * 15 + [1e9], rate_tokens_per_s=rate
+                )
+            self.assertGreater(gamma, lo)
+            self.assertLess(gamma, hi)
+            jump_s = gamma_boost(256 / rate, gamma)
+            self.assertLessEqual(jump_s, 60.0)
+            self.assertGreaterEqual(jump_s, 59.9)
+
+    def test_thin_tail_hits_gamma_max_despite_floor(self):
+        # An all-equal window is the degenerate thin tail: width 0 -> the
+        # eps floor -> gamma_hat = ln5/eps clipped to GAMMA_MAX_S, above the
+        # jump floor (0.077 here). The floor must not cap the FCFS-ward
+        # direction, only the locality-ward collapse.
+        adaptive = AdaptiveBoostGamma(
+            gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
+        )
+        for _ in range(200):
+            gamma = adaptive.record_latencies(
+                [30.0] * 16, rate_tokens_per_s=2000.0
+            )
+        # EMA approaches the clip asymptotically (0.8-weighted), so it
+        # stalls an ulp or two below GAMMA_MAX_S.
+        self.assertAlmostEqual(gamma, AdaptiveBoostGamma.GAMMA_MAX_S, places=10)
+
+    def test_rate_unmeasured_uses_outer_floor(self):
+        # Rate None (early boot, no positive token-delta interval yet): the
+        # jump bound is not computable and the outer floor applies. The
+        # sort gives boost 0 while the rate is None, so nothing is unbounded.
+        adaptive = AdaptiveBoostGamma(
+            gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
+        )
+        for _ in range(200):
+            gamma = adaptive.record_latencies(
+                [0.0] * 15 + [1e9], rate_tokens_per_s=None
+            )
+        self.assertAlmostEqual(gamma, AdaptiveBoostGamma.GAMMA_MIN_S)
+
+    def test_warmup_returns_none_below_min_samples(self):
+        # Below min_samples percentiles are noise; the caller must be able to
+        # skip (no gamma move, no eval-log mutation) until the window fills.
+        adaptive = AdaptiveBoostGamma(
+            gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
+        )
+        self.assertIsNone(
+            adaptive.record_latencies([5.0] * 7, rate_tokens_per_s=None)
+        )
+        self.assertEqual(adaptive.gamma, 0.09)
+        self.assertIsNotNone(
+            adaptive.record_latencies([5.0], rate_tokens_per_s=None)
+        )
+
+    def test_gamma0_outside_outer_bounds_clips_at_init(self):
+        # A tokens-scale gamma0 (1e-4 per-token) is below the 1/s outer
+        # floor; it must clip up at construction, not run unclipped until
+        # the first completion arrives (mode-mismatch guard for the
+        # default-resolution path).
+        adaptive = AdaptiveBoostGamma(
+            gamma0=1e-4, bin_size=256, max_jump_s=60.0
         )
         self.assertEqual(adaptive.gamma, AdaptiveBoostGamma.GAMMA_MIN_S)
 
 
-class TestFirstAdmissionWaits(CustomTestCase):
-    """record_first_admission_waits: the scheduler's gamma-Ada feed, unit-aware.
-    Wall mode computes waits from the wall entry stamp (cache-state-free);
-    tokens mode from the processed-token counter; first admissions only."""
+class TestCompletedLatencyFeed(CustomTestCase):
+    """record_completed_latencies: the scheduler's gamma-Ada feed. Only
+    finished reqs with both stamps count, in wall seconds; a moved gamma
+    rebinds the live sort's gamma."""
 
-    def _adaptive_policy(self, clock):
+    def _policy(self, **kw):
         return SchedulePolicy(
             policy="boost",
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
+            boost_gamma=0.09,
+            boost_bin_size=256,
             boost_adaptive_gamma=True,
-            boost_clock=clock,
+            boost_clock="wall",
+            **kw,
         )
 
-    def test_wait_unit_follows_the_clock(self):
-        first = _make_boost_req("first", 256, arrival=4_000)
-        second = _make_boost_req("second", 256, arrival=7_000)
-        first.first_queue_entry_time = 40.0
-        second.first_queue_entry_time = 60.0
-        readmitted = _make_boost_req("readmitted", 256, arrival=0)
-        readmitted.first_queue_entry_time = 0.0
-        # Already stamped at an earlier admission: excluded from the feed.
-        readmitted.matched_prefix_tokens_first_admission = 64
-        queue = [readmitted, first, second]
+    @staticmethod
+    def _finished_req(rid, *, recv_s, done_s):
+        req = _make_wall_req(rid, 256, entry_s=recv_s)
+        req.time_stats.set_scheduler_recv_time(recv_s)
+        req.time_stats.set_completion_time(done_s)
+        req.finished_reason = FINISH_LENGTH(length=8)
+        return req
 
-        wall = self._adaptive_policy("wall")
-        wall.record_first_admission_waits(queue, processed_tokens=10_000, now_s=100.0)
-        self.assertEqual(list(wall.adaptive_gamma._waits), [60.0, 40.0])
+    def test_feed_filters_unfinished_and_unstamped(self):
+        # The tail fit's population contract: an unfinished req (still
+        # streaming) and a finished-but-unstamped one (completion_time 0 --
+        # the eval log's e2e_s guard) must stay out of the window, else the
+        # fit mixes in-flight and phantom latencies.
+        policy = self._policy()
+        streaming = _make_wall_req("streaming", 256, entry_s=0.0)
+        # completion_time left at its 0.0 default (set_completion_time
+        # treats 0.0 as "unset" and stamps perf_counter, so poke the field).
+        unstamped = self._finished_req("unstamped", recv_s=100.0, done_s=100.0)
+        unstamped.time_stats.completion_time = 0.0
+        valid = self._finished_req("valid", recv_s=100.0, done_s=160.0)
+        policy.record_completed_latencies([streaming, unstamped, valid])
+        self.assertEqual(list(policy.adaptive_gamma._samples), [(60.0, 256)])
 
-        tokens = self._adaptive_policy("tokens")
-        tokens.record_first_admission_waits(queue, processed_tokens=10_000, now_s=100.0)
-        self.assertEqual(list(tokens.adaptive_gamma._waits), [6_000, 3_000])
+    def test_feed_moves_gamma_and_rebinds_sort_gamma(self):
+        # boost + flag -> a full window of completions moves gamma and the
+        # moved value rebinds the live sort's gamma (policy.boost_gamma),
+        # which is the whole point of the feed.
+        policy = self._policy()
+        reqs = [
+            self._finished_req(f"r{i}", recv_s=100.0, done_s=100.0 + t)
+            for i, t in enumerate(range(1, 35))
+        ]
+        gamma = policy.record_completed_latencies(reqs)
+        self.assertIsNotNone(gamma)
+        self.assertNotEqual(gamma, 0.09)
+        self.assertEqual(policy.boost_gamma, gamma)
+        self.assertEqual(len(policy.adaptive_gamma._samples), 34)
 
-    def test_warmup_returns_none_below_min_samples(self):
-        # Below min_samples percentiles are noise; the caller must be able to
-        # skip (no gamma move, no eval-log mutation) until the window fills.
-        adaptive = AdaptiveBoostGamma(gamma0=1e-4, window=16, min_samples=8)
-        self.assertIsNone(adaptive.record_admissions([5] * 7))
-        self.assertEqual(adaptive.gamma, 1e-4)
-        self.assertIsNotNone(adaptive.record_admissions([5]))
-
-    def test_schedule_policy_wiring(self):
-        # boost + flag -> the window feeds rebind the live sort's gamma;
-        # without the flag, or on another policy, gamma-Ada stays off (the
-        # fixed-gamma path must be bit-identical to before).
-        def make(policy="boost", **kw):
+    def test_off_and_mismatched_paths(self):
+        # Without the flag gamma-Ada stays off (the fixed-gamma path must
+        # be bit-identical to before); on another policy it stays off; and
+        # a tokens-clock construction is a unit mismatch (the feed is wall
+        # seconds, gamma would be per-token) -> rejected at construction.
+        def make(**kw):
             return SchedulePolicy(
-                policy=policy,
+                policy=kw.pop("policy", "boost"),
                 tree_cache=RadixCache.create_simulated(),
                 enable_hierarchical_cache=True,
                 enable_priority_scheduling=False,
                 schedule_low_priority_values_first=False,
-                boost_gamma=1e-4,
+                boost_gamma=0.09,
                 boost_bin_size=256,
                 **kw,
             )
 
-        on = make(boost_adaptive_gamma=True)
-        self.assertIsNotNone(on.adaptive_gamma)
-        gamma = on.record_admission_waits(list(range(0, 70_000, 700)))
-        self.assertIsNotNone(gamma)
-        self.assertNotEqual(gamma, 1e-4)
-        self.assertEqual(on.boost_gamma, gamma)
-
         off = make()
         self.assertIsNone(off.adaptive_gamma)
-        self.assertIsNone(off.record_admission_waits(list(range(0, 70_000, 700))))
-        self.assertEqual(off.boost_gamma, 1e-4)
+        self.assertIsNone(off.record_completed_latencies([]))
+        self.assertEqual(off.boost_gamma, 0.09)
 
         other = make(policy="fcfs", boost_adaptive_gamma=True)
         self.assertIsNone(other.adaptive_gamma)
+
+        with self.assertRaises(ValueError):
+            make(boost_adaptive_gamma=True, boost_clock="tokens")
 
 
 if __name__ == "__main__":

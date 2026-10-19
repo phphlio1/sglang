@@ -703,6 +703,15 @@ class Scheduler(
 
         self.init_invariant_checker()
 
+        # Grace steps after OOM recovery: evict_from_tree_cache inside the
+        # failed alloc_token_slots evicts entries as a side effect, leaving a
+        # small transient accounting gap that trips the idle leak invariant.
+        self._oom_recovery_grace_steps = 0
+        # Consecutive OOM count: when high, cap chunked_prefill_size to
+        # available memory so giants make progress with smaller chunks
+        # instead of spinning on the same oversized chunk.
+        self._consecutive_oom_count = 0
+
         self.init_kv_events_publisher()
 
         self.init_load_publisher()
@@ -1394,6 +1403,7 @@ class Scheduler(
             boost_gamma=get_schedule().boost_gamma,
             boost_bin_size=get_schedule().boost_bin_size,
             boost_adaptive_gamma=get_schedule().boost_adaptive_gamma,
+            boost_adaptive_max_jump_s=get_schedule().boost_adaptive_max_jump_s,
             boost_clock=get_schedule().boost_clock,
             in_batch_prefix_caching_max_pin_s=(
                 get_schedule().in_batch_prefix_caching_max_pin_s
@@ -1454,6 +1464,18 @@ class Scheduler(
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
+
+        path = get_schedule().log_schedule_eval_path
+        if path is None:
+            self.schedule_eval_logger: Optional[ScheduleEvalLogger] = None
+            return
+        self.schedule_eval_logger = ScheduleEvalLogger(
+            path=path,
+            policy=self.schedule_policy,
+            boost_gamma=get_schedule().boost_gamma,
+            boost_bin_size=get_schedule().boost_bin_size,
+            boost_clock=get_schedule().boost_clock,
+        )
 
     def init_soft_watchdog(self):
         if (x := get_device().soft_watchdog_timeout) is not None:
@@ -3943,6 +3965,14 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
+        if self._consecutive_oom_count >= 3:
+            # OOM backoff: cap chunk to available memory so a giant makes
+            # progress with smaller chunks instead of spinning on the same
+            # oversized chunk that never fits.
+            avail = self.tree_cache.token_to_kv_pool_allocator.available_size()
+            chunked_prefill_size = min(
+                chunked_prefill_size, max(avail, self.page_size)
+            )
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
@@ -4135,18 +4165,6 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
-        # gamma-Ada feed: first admissions only. The None check on the
-        # first-admission stamp is the first-admission detector, so this
-        # must run before stamp_admission_prefix_matches freezes it;
-        # retracted re-admissions and chunk continuations are excluded.
-        gamma = self.policy.record_first_admission_waits(
-            can_run_list,
-            processed_tokens=self.processed_tokens_counter,
-            now_s=time.perf_counter(),
-        )
-        if gamma is not None and self.schedule_eval_logger is not None:
-            # Per-record gamma in the eval log is the trajectory.
-            self.schedule_eval_logger.boost_gamma = gamma
         stamp_admission_prefix_matches(can_run_list)
 
         # Create a new batch
@@ -4171,7 +4189,37 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        # alloc_req_slots inside prepare_for_extend allocates req pool rows
+        # only for reqs that don't already hold KV; reusing reqs keep their row.
+        new_reqs_for_oom_recovery = [r for r in can_run_list if not r.kv.holds_kv]
+
+        try:
+            new_batch.prepare_for_extend()
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            # The admission budget said this batch fits but the KV pool
+            # disagreed. Back out: free req pool rows just allocated, return
+            # reqs to the waiting queue, skip this prefill step. Running
+            # decodes (if any) free memory naturally; the next step retries.
+            for req in new_reqs_for_oom_recovery:
+                if req.kv.req_pool_idx is not None:
+                    self.req_to_token_pool.free(req)
+            self.waiting_queue = can_run_list + self.waiting_queue
+            if adder.new_chunked_req is not None:
+                self.chunked_req = None
+            if self.chunked_req is not None:
+                self.chunked_req.inflight_middle_chunks -= 1
+            logger.warning(
+                "Prefill OOM under overload: skipped this prefill step "
+                "(%d reqs returned to queue). Decode will free memory.",
+                len(can_run_list),
+            )
+            self._oom_recovery_grace_steps = 10
+            self._consecutive_oom_count += 1
+            return None, running_batch
+
+        self._consecutive_oom_count = 0
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -4861,6 +4909,13 @@ class Scheduler(
         if self.schedule_eval_logger is not None:
             self.schedule_eval_logger.log_finished_batch(batch.reqs)
 
+        # gamma-Ada (Eq. 9): the finished reqs' E2E latencies feed the
+        # response-tail fit; a moved gamma rides the eval log's per-record
+        # gamma field from the next finished record on.
+        gamma = self.policy.record_completed_latencies(batch.reqs)
+        if gamma is not None and self.schedule_eval_logger is not None:
+            self.schedule_eval_logger.boost_gamma = gamma
+
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
 
@@ -5029,8 +5084,11 @@ class Scheduler(
             self.disaggregation_mode == DisaggregationMode.DECODE
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
+        if self._oom_recovery_grace_steps > 0:
+            self._oom_recovery_grace_steps -= 1
+        oom_grace = self._oom_recovery_grace_steps > 0
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
-            if not self.enable_hisparse and not deferred_pending:
+            if not self.enable_hisparse and not deferred_pending and not oom_grace:
                 has_leak, messages = self.invariant_checker._check_all_pools(
                     self.pool_stats_observer.get_pool_stats(),
                 )

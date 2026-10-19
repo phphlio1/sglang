@@ -326,30 +326,37 @@ class TokenClockRate:
 
 
 class AdaptiveBoostGamma:
-    """Adaptive gamma for the boost policy (gamma-Ada).
+    """Adaptive gamma for the boost policy (gamma-Ada, UniBoost Eq. 9).
 
-    gamma_hat = ln(0.05/0.01) / (w99 - w95) = ln 5 / tail_width, over the
-    last WINDOW first-admission waits measured in the active clock's unit
-    (counted tokens, or wall seconds under --boost-clock wall).
+    gamma_hat = ln(0.05/0.01) / (t99 - t95) = ln 5 / tail_width: the
+    log-linear tail-slope fit of the completed-request E2E latency CCDF in
+    the [t95, t99] band, in wall seconds. The fitted variable is response
+    time, not queue wait: waits are endogenous to the policy's own ordering
+    (fat wait tail -> smaller gamma -> longer giant waits -> fatter tail),
+    while response time keeps the exogenous service component in the fit.
+    Wall mode only -- E2E latency is wall seconds and gamma is then in 1/s
+    (--boost-adaptive-gamma requires --boost-clock wall).
 
-    Fatter wait tail -> smaller gamma_hat -> larger boosts (locality/LAS-ward);
-
-    Thin tail -> larger gamma_hat (FCFS-ward).
-
-    The estimate is EMA-smoothed (BETA) and clipped to the clock's unit bounds.
-    Off by default; see --boost-adaptive-gamma.
+    The low clip is a max-jump bound, not a raw gamma: gamma is floored so
+    the largest boost any newcomer can receive, b_gamma(bin_size / rate),
+    stays <= max_jump_s wall seconds. "How far a newcomer may cut ahead" is
+    workload- and CCU-independent; a raw gamma floor is not (its starvation
+    effect scales with the service rate). Measured basis (E2 c16 sweep,
+    2026-10-13): jump ~50 s (gamma 0.09, k 256, ~2k tok/s) holds
+    cold-request stretch at the lpm level; jump ~101 s (gamma 0.042)
+    doubles it.
     """
 
-    WINDOW = 2048
-    MIN_SAMPLES = 64
+    WINDOW = 128
+    MIN_SAMPLES = 32
     BETA = 0.2
-    GAMMA_MIN = 3e-7
-    GAMMA_MAX = 1e-3
-    # Wall clip bounds in 1/s; measured c4-c16 fixed points land in
-    # [0.017, 0.62] 1/s (ln5 / wall tail width).
+    # Outer clip in 1/s; the jump floor usually binds first on the low side.
     GAMMA_MIN_S = 1e-3
-    GAMMA_MAX_S = 10.0
+    GAMMA_MAX_S = 15.0
     LN5 = math.log(5.0)
+    # epsilon floor on the band width: a compressed tail (t99 == t95) is the
+    # degenerate thin tail (FCFS-ward, gamma_hat -> GAMMA_MAX_S), not an error.
+    TAIL_EPS_S = 1e-6
     # Trajectory log lines: at most one per LOG_MIN_UPDATES updates, or on a
     # >= LOG_REL_CHANGE move since the last logged gamma.
     LOG_MIN_UPDATES = 64
@@ -358,20 +365,16 @@ class AdaptiveBoostGamma:
     def __init__(
         self,
         gamma0: float,
+        bin_size: int,
+        max_jump_s: float,
         window: int = WINDOW,
         min_samples: int = MIN_SAMPLES,
-        clock: BoostClock = BoostClock.TOKENS,
     ) -> None:
-        self._waits: deque = deque(maxlen=window)
+        self._samples: deque = deque(maxlen=window)
         self._min_samples = min_samples
-        self._unit = "s" if clock is BoostClock.WALL else "tokens"
-        self._gamma_min = (
-            self.GAMMA_MIN_S if clock is BoostClock.WALL else self.GAMMA_MIN
-        )
-        self._gamma_max = (
-            self.GAMMA_MAX_S if clock is BoostClock.WALL else self.GAMMA_MAX
-        )
-        self._gamma = min(max(gamma0, self._gamma_min), self._gamma_max)
+        self._bin_size = bin_size
+        self._max_jump_s = max_jump_s
+        self._gamma = min(max(gamma0, self.GAMMA_MIN_S), self.GAMMA_MAX_S)
         self._updates_since_log = 0
         self._last_logged_gamma = self._gamma
 
@@ -379,28 +382,105 @@ class AdaptiveBoostGamma:
     def gamma(self) -> float:
         return self._gamma
 
-    def record_admissions(self, waits: Iterable[float]) -> Optional[float]:
-        """Feed first-admission waits (in the active clock's unit); returns
-        the updated gamma when this call applied an update, None while the
-        window is still filling below min_samples."""
-        self._waits.extend(max(0.0, float(w)) for w in waits)
-        if len(self._waits) < self._min_samples:
+    def record_latencies(
+        self,
+        latencies_s: Iterable[float],
+        rate_tokens_per_s: Optional[float],
+        works: Optional[Iterable[int]] = None,
+    ) -> Optional[float]:
+        """Feed completed-request E2E latencies (wall seconds); returns the
+        updated gamma when this call applied an update, None while the
+        window is still filling below min_samples.
+
+        When works is provided, uses a size-aware tail fit: computes gamma_hat
+        separately for short and long requests (split at median work). If long
+        requests have a fatter tail (giant starvation), uses the short-request
+        gamma_hat instead of the overall -- the paper's tail fit assumes the
+        fat tail comes from short-request starvation, which is inverted under
+        overload where giants are starved by the policy itself."""
+        lat_list = [max(0.0, float(t)) for t in latencies_s]
+        if works is not None:
+            work_list = list(works)
+            self._samples.extend(zip(lat_list, work_list))
+        else:
+            self._samples.extend((lat, 0) for lat in lat_list)
+        if len(self._samples) < self._min_samples:
             return None
-        ordered = sorted(self._waits)
-        # delta == 0 (no tail spread) -> gamma_hat -> inf -> gamma_max: the
-        # degenerate thin tail is maximally FCFS-ward, not an error.
-        delta = _percentile(ordered, 99) - _percentile(ordered, 95)
-        gamma_hat = self.LN5 / delta if delta > 0 else float("inf")
-        gamma_hat = min(max(gamma_hat, self._gamma_min), self._gamma_max)
+
+        gamma_floor = self._gamma_floor(rate_tokens_per_s)
+        gamma_hat = self._size_aware_gamma_hat(gamma_floor)
         gamma = min(
-            max(
-                (1.0 - self.BETA) * self._gamma + self.BETA * gamma_hat, self._gamma_min
-            ),
-            self._gamma_max,
+            max((1.0 - self.BETA) * self._gamma + self.BETA * gamma_hat, gamma_floor),
+            self.GAMMA_MAX_S,
         )
-        self._maybe_log(gamma, gamma_hat, delta, len(ordered))
+        delta = self.LN5 / max(gamma_hat, self.GAMMA_MIN_S)
+        self._maybe_log(gamma, gamma_hat, delta, len(self._samples))
         self._gamma = gamma
         return gamma
+
+    def _size_aware_gamma_hat(self, gamma_floor: float) -> float:
+        """Overall tail fit (paper Eq. 9), corrected for giant starvation.
+
+        Under overload, giants starved by the policy inflate the overall tail,
+        driving gamma_hat toward zero (positive feedback). Splitting at median
+        work isolates the short-request tail, which reflects the exogenous
+        service variance the paper's fit targets -- not the policy-induced
+        giant starvation."""
+        lats = [s[0] for s in self._samples]
+        works = [s[1] for s in self._samples]
+        gamma_overall = self._tail_gamma_hat(lats)
+
+        if len(works) < 2 * self._min_samples or all(w == works[0] for w in works):
+            return min(max(gamma_overall, gamma_floor), self.GAMMA_MAX_S)
+
+        sorted_works = sorted(works)
+        median_w = sorted_works[(len(sorted_works) - 1) // 2]
+        short_lats = [l for l, w in self._samples if w <= median_w]
+        long_lats = [l for l, w in self._samples if w > median_w]
+        if len(short_lats) < self._min_samples // 2 or len(long_lats) < self._min_samples // 2:
+            return min(max(gamma_overall, gamma_floor), self.GAMMA_MAX_S)
+
+        gamma_short = self._tail_gamma_hat(short_lats)
+        gamma_long = self._tail_gamma_hat(long_lats)
+
+        # Giant starvation: long tail fatter than short (gamma_long < gamma_short).
+        # Use gamma_short to ignore the policy-induced giant tail.
+        if gamma_long < gamma_short:
+            gamma_hat = gamma_short
+        else:
+            gamma_hat = gamma_overall
+        return min(max(gamma_hat, gamma_floor), self.GAMMA_MAX_S)
+
+    @staticmethod
+    def _tail_gamma_hat(lats: list[float]) -> float:
+        """Paper Eq. 9: ln(5) / (t99 - t95), floored at TAIL_EPS_S."""
+        ordered = sorted(lats)
+        delta = max(
+            _percentile(ordered, 99) - _percentile(ordered, 95),
+            AdaptiveBoostGamma.TAIL_EPS_S,
+        )
+        return AdaptiveBoostGamma.LN5 / delta
+
+    def _gamma_floor(self, rate_tokens_per_s: Optional[float]) -> float:
+        """Smallest gamma whose max boost b_gamma(bin_size / rate) fits
+        within max_jump_s. b_gamma(tau) = tau * g(gamma * tau) with
+        g(u) = -ln(1 - exp(-u)) / u strictly decreasing, so the floor is the
+        root of g(u) = max_jump_s / tau at u = gamma * tau, found by
+        bisection on u. Rate unmeasured -> the outer floor: the sort gives
+        boost 0 (pure arrival order) while the rate is None, so no jump
+        exists to bound."""
+        if rate_tokens_per_s is None or rate_tokens_per_s <= 0.0:
+            return self.GAMMA_MIN_S
+        tau_s = self._bin_size / rate_tokens_per_s
+        budget = self._max_jump_s / tau_s
+        lo, hi = 1e-9, 1e3  # g(1e-9) ~ 2e10 > any budget; g(1e3) ~ 0
+        for _ in range(64):
+            mid = math.sqrt(lo * hi)
+            if -math.log(-math.expm1(-mid)) / mid > budget:
+                lo = mid
+            else:
+                hi = mid
+        return hi / tau_s
 
     def _maybe_log(self, gamma: float, gamma_hat: float, delta: float, n: int) -> None:
         self._updates_since_log += 1
@@ -411,11 +491,10 @@ class AdaptiveBoostGamma:
         ):
             logger.info(
                 "boost adaptive gamma: gamma=%.3e (gamma_hat=%.3e, "
-                "tail w99-w95=%.3g %s, n=%d)",
+                "tail t99-t95=%.3g s, n=%d)",
                 gamma,
                 gamma_hat,
                 delta,
-                self._unit,
                 n,
             )
             self._updates_since_log = 0
@@ -459,6 +538,7 @@ class SchedulePolicy:
         boost_gamma: float = 1e-4,
         boost_bin_size: int = 256,
         boost_adaptive_gamma: bool = False,
+        boost_adaptive_max_jump_s: float = 60.0,
         boost_clock: str = "tokens",
         in_batch_prefix_caching_max_pin_s: float = 60.0,
     ):
@@ -480,10 +560,24 @@ class SchedulePolicy:
             and self.policy == CacheAwarePolicy.BOOST
             else None
         )
-        # gamma-Ada; None unless boost + --boost-adaptive-gamma (off by
+        # gamma-Ada (Eq. 9) fits wall-second E2E latencies, so it is
+        # wall-mode only; None unless boost + --boost-adaptive-gamma (off by
         # default, so the fixed-gamma path is bit-identical to before).
+        if (
+            boost_adaptive_gamma
+            and self.policy == CacheAwarePolicy.BOOST
+            and self.boost_clock is not BoostClock.WALL
+        ):
+            raise ValueError(
+                "--boost-adaptive-gamma requires --boost-clock wall "
+                "(the E2E-latency tail fit is wall seconds)"
+            )
         self.adaptive_gamma: Optional[AdaptiveBoostGamma] = (
-            AdaptiveBoostGamma(boost_gamma, clock=self.boost_clock)
+            AdaptiveBoostGamma(
+                boost_gamma,
+                boost_bin_size,
+                boost_adaptive_max_jump_s,
+            )
             if boost_adaptive_gamma and self.policy == CacheAwarePolicy.BOOST
             else None
         )
@@ -602,7 +696,6 @@ class SchedulePolicy:
             in (
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
-                CacheAwarePolicy.BOOST,
             )
             and len(waiting_queue) > 128
         ):
@@ -610,44 +703,43 @@ class SchedulePolicy:
             return CacheAgnosticPolicy.FCFS
         return self.policy
 
-    def record_admission_waits(self, waits: List[float]) -> Optional[float]:
-        """Feed first-admission waits (in the active clock's unit) to gamma-Ada;
-        returns the updated gamma when it moved (the caller mirrors it into the
+    def record_completed_latencies(self, reqs: Sequence[Req]) -> Optional[float]:
+        """Feed the E2E latencies (scheduler_recv -> completion, wall
+        seconds) of the requests finished among reqs to gamma-Ada; returns
+        the updated gamma when it moved (the caller mirrors it into the
         eval log), None on every other path. No-op unless boost + adaptive
         gamma."""
         if self.adaptive_gamma is None:
             return None
-        gamma = self.adaptive_gamma.record_admissions(waits)
+        latencies = []
+        works = []
+        for r in reqs:
+            ts = r.time_stats
+            # Unstamped (0.0) sides mean the req never reached the scheduler
+            # or the completion stamp -- the eval log's e2e_s guard, so the
+            # runtime fit and the offline gamma agree on the population.
+            if (
+                not r.finished()
+                or ts.completion_time <= 0.0
+                or ts.scheduler_recv_time <= 0.0
+            ):
+                continue
+            latencies.append(ts.completion_time - ts.scheduler_recv_time)
+            works.append(len(r.origin_input_ids) + len(r.output_ids))
+        if not latencies:
+            return None
+        gamma = self.adaptive_gamma.record_latencies(
+            latencies,
+            rate_tokens_per_s=(
+                self.prefill_token_rate.tokens_per_s
+                if self.prefill_token_rate is not None
+                else None
+            ),
+            works=works,
+        )
         if gamma is not None:
             self.boost_gamma = gamma
         return gamma
-
-    def record_first_admission_waits(
-        self,
-        reqs: Sequence[Req],
-        *,
-        processed_tokens: int,
-        now_s: float,
-    ) -> Optional[float]:
-        """Feed the first admissions among reqs to gamma-Ada, waits computed
-        in the active clock's unit (counted tokens, or wall seconds under
-        --boost-clock wall)."""
-        if self.adaptive_gamma is None:
-            return None
-        waits = []
-        for r in reqs:
-            if r.matched_prefix_tokens_first_admission is not None:
-                continue
-            if self.boost_clock is BoostClock.WALL:
-                if r.first_queue_entry_time is None:
-                    continue
-                wait = max(0.0, now_s - r.first_queue_entry_time)
-            else:
-                if r.boost_arrival_tokens is None:
-                    continue
-                wait = max(0, processed_tokens - r.boost_arrival_tokens)
-            waits.append(wait)
-        return self.record_admission_waits(waits)
 
     def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
         policy = self._determine_active_policy(waiting_queue)
@@ -785,7 +877,8 @@ class SchedulePolicy:
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            self.policy
+            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.BOOST)
             or budget < 2 * page_size
         ):
             return None

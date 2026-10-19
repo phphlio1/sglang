@@ -49,6 +49,7 @@ HOST="0.0.0.0"
 BOOST_GAMMA="${BOOST_GAMMA:-}"
 BOOST_BIN_SIZE="${BOOST_BIN_SIZE:-256}"
 BOOST_ADAPTIVE_GAMMA="${BOOST_ADAPTIVE_GAMMA:-0}"
+BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-60}"
 BOOST_CLOCK="${BOOST_CLOCK:-wall}"
 IN_BATCH_PREFIX_CACHING_MAX_PIN_S="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S:-60}"
 LOG_SCHEDULE_EVAL_PATH="${LOG_SCHEDULE_EVAL_PATH:-}"
@@ -68,7 +69,7 @@ fi
 
 POLICY="${1:?usage: start_dynamo_stack.sh <policy> | --stop}"
 case "$POLICY" in
-  fcfs|fcfs-match|lpm|hrrn|dfs-weight|lof|boost) ;;
+  fcfs|fcfs-match|lpm|hrrn|dfs-weight|lof|shortest-prefill-first|boost) ;;
   *) echo "ERROR: unknown policy '$POLICY'" >&2; exit 2 ;;
 esac
 
@@ -76,7 +77,7 @@ POLICY_FLAGS=()
 if [[ "${POLICY}" == "boost" ]]; then
   [[ -n "${BOOST_GAMMA}" ]] && POLICY_FLAGS+=(--boost-gamma="${BOOST_GAMMA}")
   POLICY_FLAGS+=(--boost-bin-size="${BOOST_BIN_SIZE}" --boost-clock="${BOOST_CLOCK}")
-  [[ "${BOOST_ADAPTIVE_GAMMA}" == "1" ]] && POLICY_FLAGS+=(--boost-adaptive-gamma)
+  [[ "${BOOST_ADAPTIVE_GAMMA}" == "1" ]] && POLICY_FLAGS+=(--boost-adaptive-gamma --boost-adaptive-max-jump-s "${BOOST_ADAPTIVE_MAX_JUMP_S}")
 fi
 POLICY_FLAGS+=(--in-batch-prefix-caching-max-pin-s="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S}")
 [[ -n "${LOG_SCHEDULE_EVAL_PATH}" ]] && POLICY_FLAGS+=(--log-schedule-eval-path="${LOG_SCHEDULE_EVAL_PATH}")
@@ -86,6 +87,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export SGLANG_DP_USE_GATHERV=1
 export SGLANG_ENABLE_METRICS_DP_ATTENTION=1
 export SGLANG_ENABLE_METRICS_DEVICE_TIMER=1
+# OOM recovery (scheduler.py prepare_for_extend guard) returns requests to the
+# queue instead of crashing; the strict idle mem-check invariant would still
+# kill the engine after a recovery eviction, so it must be off (same as
+# start_server.sh:119-123 in the boost tree).
+export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
 export NCCL_P2P_LEVEL=NVL
 export HF_HUB_OFFLINE=1
 # Compute nodes have no /home/loipp (login-local): torch's dynamo/inductor
