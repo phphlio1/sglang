@@ -22,16 +22,17 @@ Edge cases all handled: zero work (`max(1,...)`), negative (clamped), overflow (
 
 Sort only reorders `waiting_queue` in-place. Does not touch `running_batch`, `tree_cache`, `can_run_list`, or any `Req` fields. Pure function.
 
-### Adaptive boost — complete, paper-correct with known limitation
+### Adaptive boost — complete, paper-correct; inert under heavy overload
 
 | Component | Paper ref | Code location | Status |
 |-----------|-----------|---------------|--------|
-| gamma_hat = ln(5)/(t99-t95) | Eq. 9 | `_tail_gamma_hat()` schedule_policy.py:454 | Correct, linear-interpolation percentile |
+| gamma_hat = ln(5)/(t99-t95) | Eq. 9 | `_tail_gamma_hat()` schedule_policy.py | Correct, linear-interpolation percentile |
 | EMA update | — | `(1-beta)*gamma + beta*gamma_hat`, beta=0.2 | Correct (implementation choice, not from paper) |
-| Max-jump bound | — | `_gamma_floor()` bisection schedule_policy.py:464 | Correct, 64 iterations, bounds b_gamma(k/rate) <= J |
-| Size-aware fix | Extension | `_size_aware_gamma_hat()` schedule_policy.py:421 | Sound, partially breaks feedback loop |
+| Max-jump bound | — | `_gamma_floor()` bisection schedule_policy.py | Correct, 64 iterations, bounds b_gamma(k/rate) <= J |
+| Size-aware fix | Extension | `_size_aware_gamma_hat()` schedule_policy.py | Sound, fires 19/19 updates under overload |
+| Trajectory log | — | `_maybe_log()` | Fixed 2026-10-19: raw pre-floor fit + tail source + floor |
 
-Known limitation: under heavy overload, gamma does not converge to sweet spot (oscillates ~0.10 instead of 5.0). Root cause: tail fat is global under overload, not isolated to giant starvation. This is an algorithm limitation, not a code bug. Use static gamma=5.0 for production; adaptive for experimentation.
+Audited 2026-10-19 (see e2_policies.md "Adaptive boost investigation"): implementation verified end-to-end — TTFT p99/p95 recomputed offline from schedule_eval.jsonl match e2_metrics for all 7 policy rows (ratio 0.95-0.99), and the gamma trajectory replays offline. Under heavy overload the E2E tail (86-560 s) puts the raw fit (0.003-0.019) always below the jump floor, so gamma pins at gamma_floor(J): the controller is inert and **J is the effective tuning knob**. All fit variants (E2E, prefill-only, work-tokens x rate) give ~0.08-0.09 on this heavy-tailed workload (work p95/p99 = 204k/237k tokens) — none can reach the static g=5.0 regime, which is equivalent to J=0.14 s (FCFS + burst tie-break). Algorithm-workload mismatch, not a code bug. At matched seed, adaptive J=50 beats lpm and hrrn on TTFT p99 at every seed; it trails static g=5.0 by 12-15% at seed 42, inside the seed-noise band (60-89%).
 
 ### OOM recovery — general reliability fix (not boost-specific)
 
@@ -45,11 +46,11 @@ Code in `scheduler.py`, applies to all policies:
 
 Evidence: 559 OOM events -> server survived, sweep completed 11/11 cells. OOM reduced 96% with chunk downscaling.
 
-### Known bugs (logging only, no behavior impact)
+### Known bugs
 
-1. `schedule_policy.py:416`: Log field `tail t99-t95` is actually `LN5/gamma_hat` (post-floor/clip/substitution), not raw tail width. Misleading when floor or size-aware substitution binds.
-2. `schedule_policy.py:417`: Log field `gamma_hat` shows processed value, not raw Eq. 9 estimate. Misleading when diffing runtime vs offline estimator.
-3. `schedule_policy.py:404`: `zip(lat_list, work_list)` silently truncates on length mismatch. Safe in production (built in lockstep), but future callers could misalign.
+1. FIXED 2026-10-19: log field `tail t99-t95` was `LN5/gamma_hat` (post-floor/clip/substitution), not the raw tail width — a floor-pinned run logged a 4-20 s "tail" while the raw tail was 86-560 s. `_maybe_log` now prints the raw pre-floor fit, the tail it came from ("overall"/"short"), the raw width, and the floor.
+2. FIXED 2026-10-19: log field `gamma_hat` showed the post-floor value, not the raw Eq. 9 estimate — same fix; regression test `test_trajectory_log_reports_raw_fit_and_floor` guards both.
+3. `zip(lat_list, work_list)` silently truncates on length mismatch. Safe in production (built in lockstep), but future callers could misalign.
 
 ## 2. Multi-GPU readiness
 
@@ -110,7 +111,7 @@ If the verification passes, proceed to sweep.
 
 ```bash
 python3 test/registered/unit/managers/test_schedule_policy.py
-# Expected: 59 tests, all OK
+# Expected: 60 tests, all OK
 ```
 
 ## 4. Experiment plan for 8xH200
@@ -144,13 +145,13 @@ Compare boost gamma=5.0 against lpm, hrrn, fcfs on the 8xH200 config. The 1x RTX
 
 ### 4.3 Phase 3: Adaptive gamma (experimentation)
 
-Run adaptive gamma with size-aware fix on 8xH200. The higher prefill throughput may reduce the overload pressure, potentially allowing the adaptive gamma to converge better.
+Run adaptive gamma with size-aware fix on 8xH200. With ~8x prefill rate, tau = k/rate shrinks ~8x, so the same J gives a higher gamma floor (less SJF), and the lighter overload may let the raw fit exceed the floor — the controller may actually be active there.
 
 ```bash
 --boost-adaptive-gamma --boost-adaptive-max-jump-s 60 --boost-clock wall
 ```
 
-Check: does gamma converge closer to the sweet spot with 8x throughput? The feedback loop may be weaker when the system is less overloaded.
+The 1x RTX6000 audit (2026-10-19) showed that under heavy overload the fit is always below the floor, so **J is the effective knob** — gamma_floor(J) at rate ~1900 tok/s: J=0.14 s -> gamma 5.0, J=15 s -> 0.23, J=50 s -> 0.089, J=60 s -> 0.076, J=120 s -> 0.043. Include small-J cells in the H200 sweep to map the J axis directly (J in {0.5, 2, 15, 60} s), and check the new trajectory log (`fit=... floor=...`) to see whether the fit ever exceeds the floor — if it does, the adaptive arm is genuinely active and worth comparing; if not, treat adaptive as static-at-floor and tune J.
 
 ### 4.4 Phase 4: Production config (GLM-5.3)
 
@@ -202,11 +203,11 @@ A cache-based cold/warm split (cached==0 vs cached>0) was considered but dropped
 - **hrrn**: mixed workload, SLA by E2E, proportional fairness (best stretch p99 among reordering policies)
 - **boost g=15.0**: fairness priority, near-FCFS with better throughput
 - **lpm**: batch/throughput, highest n done (181). Not interactive (TTFT p99=184s, worst stretch p99=127.81).
-- **boost ada**: dynamic workload, experimentation (does not converge under overload)
+- **boost ada**: dynamic workload; beats lpm/hrrn at matched seed; under overload pins at gamma_floor(J) so tune J, not gamma (see 5.5)
 - **fcfs**: light load only, best stretch p99 (56.83) but worst TTFT p99 (227s). "Equally slow for everyone."
 - **dfs-weight**: batch/throughput only, highest tok/s (86.9). Worst Jain (0.151), worst TTFT p99 (422s). Never use for interactive.
 
-### 5.5 Adaptive gamma convergence
+### 5.5 Adaptive gamma: floor-bound under overload; seed variance dominates comparisons
 
 | Version | gamma final | gamma range | tok/s |
 |---------|-------------|-------------|-------|
@@ -214,7 +215,7 @@ A cache-based cold/warm split (cached==0 vs cached>0) was considered but dropped
 | Original J=120 | 0.053 | [0.05, 0.06] | 59.5 |
 | Size-aware J=60 | 0.102 | [0.09, 0.55] | 67.7 |
 
-Size-aware fix improves throughput 63.5 -> 67.7 tok/s and breaks feedback loop partially (gamma occasionally reaches 0.55 vs stuck at 0.083). But does not converge to sweet spot (5.0) under heavy overload.
+Under overload the raw E2E tail (86-560 s) puts the Eq. 9 fit (0.003-0.019) always below the jump floor, so gamma pins at gamma_floor(J) — the adaptation is inert and J is the real knob. Seed replicates (same commit/config, seeds 42/43/44) show the seed effect dwarfs the policy effect: TTFT p99 lpm 184k/106k/92k, hrrn 194k/104k/82k, adaptive J=50 160k/115k/87k (spread 60-89%). At matched seed adaptive J=50 beats lpm/hrrn at every seed; static g=5.0 (= J 0.14 s, FCFS + burst tie-break) leads by 12-15% at seed 42, inside the noise band. Single-seed rankings are indicative only; H200 comparisons should use 3+ seeds per policy.
 
 ## 6. OOM recovery details (for reference)
 
@@ -243,10 +244,10 @@ After 3+ consecutive OOMs, `chunked_prefill_size` is capped to `max(available_me
 
 | File | Changes |
 |------|---------|
-| `python/sglang/srt/managers/schedule_policy.py` | `AdaptiveBoostGamma` class (size-aware fix), `record_latencies` accepts `works`, `record_completed_latencies` collects work sizes |
+| `python/sglang/srt/managers/schedule_policy.py` | `AdaptiveBoostGamma` class (size-aware fix), `record_latencies` accepts `works`, `record_completed_latencies` collects work sizes, trajectory-log fix (raw fit + tail source + floor) |
 | `python/sglang/srt/managers/scheduler.py` | OOM recovery (try/except around `prepare_for_extend`), chunk downscaling, invariant checker grace period, OOM counters |
 | `python/sglang/srt/arg_groups/fields/schedule.py` | `boost_adaptive_gamma`, `boost_adaptive_max_jump_s`, `boost_clock` args |
-| `test/registered/unit/managers/test_schedule_policy.py` | Updated `_latencies` -> `_samples`, 59 tests pass |
+| `test/registered/unit/managers/test_schedule_policy.py` | Updated `_latencies` -> `_samples`, trajectory-log regression test, 60 tests |
 | `ph2lio/experiments/e2/scripts/start_server.sh` | `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0` |
 | `ph2lio/experiments/e2/docs/e2_policies.md` | Policy comparison results, cold/warm analysis, stretch vs cold wait |
 | `ph2lio/experiments/e2/docs/future_plan_e2_policies.md` | This file — 8xH200 deployment plan, findings, recommendations |

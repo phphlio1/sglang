@@ -408,37 +408,41 @@ class AdaptiveBoostGamma:
             return None
 
         gamma_floor = self._gamma_floor(rate_tokens_per_s)
-        gamma_hat = self._size_aware_gamma_hat(gamma_floor)
+        gamma_hat, raw_fit, fit_src = self._size_aware_gamma_hat(gamma_floor)
         gamma = min(
             max((1.0 - self.BETA) * self._gamma + self.BETA * gamma_hat, gamma_floor),
             self.GAMMA_MAX_S,
         )
-        delta = self.LN5 / max(gamma_hat, self.GAMMA_MIN_S)
-        self._maybe_log(gamma, gamma_hat, delta, len(self._samples))
+        self._maybe_log(gamma, raw_fit, fit_src, gamma_floor, len(self._samples))
         self._gamma = gamma
         return gamma
 
-    def _size_aware_gamma_hat(self, gamma_floor: float) -> float:
+    def _size_aware_gamma_hat(self, gamma_floor: float) -> tuple[float, float, str]:
         """Overall tail fit (paper Eq. 9), corrected for giant starvation.
 
         Under overload, giants starved by the policy inflate the overall tail,
         driving gamma_hat toward zero (positive feedback). Splitting at median
         work isolates the short-request tail, which reflects the exogenous
         service variance the paper's fit targets -- not the policy-induced
-        giant starvation."""
+        giant starvation.
+
+        Returns the floored estimate, the raw pre-floor fit, and which tail
+        produced it ("overall" or "short") for the trajectory log.
+        """
         lats = [s[0] for s in self._samples]
         works = [s[1] for s in self._samples]
         gamma_overall = self._tail_gamma_hat(lats)
+        fallback = min(max(gamma_overall, gamma_floor), self.GAMMA_MAX_S)
 
         if len(works) < 2 * self._min_samples or all(w == works[0] for w in works):
-            return min(max(gamma_overall, gamma_floor), self.GAMMA_MAX_S)
+            return fallback, gamma_overall, "overall"
 
         sorted_works = sorted(works)
         median_w = sorted_works[(len(sorted_works) - 1) // 2]
         short_lats = [l for l, w in self._samples if w <= median_w]
         long_lats = [l for l, w in self._samples if w > median_w]
         if len(short_lats) < self._min_samples // 2 or len(long_lats) < self._min_samples // 2:
-            return min(max(gamma_overall, gamma_floor), self.GAMMA_MAX_S)
+            return fallback, gamma_overall, "overall"
 
         gamma_short = self._tail_gamma_hat(short_lats)
         gamma_long = self._tail_gamma_hat(long_lats)
@@ -446,10 +450,10 @@ class AdaptiveBoostGamma:
         # Giant starvation: long tail fatter than short (gamma_long < gamma_short).
         # Use gamma_short to ignore the policy-induced giant tail.
         if gamma_long < gamma_short:
-            gamma_hat = gamma_short
+            raw_fit, fit_src = gamma_short, "short"
         else:
-            gamma_hat = gamma_overall
-        return min(max(gamma_hat, gamma_floor), self.GAMMA_MAX_S)
+            raw_fit, fit_src = gamma_overall, "overall"
+        return min(max(raw_fit, gamma_floor), self.GAMMA_MAX_S), raw_fit, fit_src
 
     @staticmethod
     def _tail_gamma_hat(lats: list[float]) -> float:
@@ -482,7 +486,14 @@ class AdaptiveBoostGamma:
                 hi = mid
         return hi / tau_s
 
-    def _maybe_log(self, gamma: float, gamma_hat: float, delta: float, n: int) -> None:
+    def _maybe_log(
+        self,
+        gamma: float,
+        raw_fit: float,
+        fit_src: str,
+        gamma_floor: float,
+        n: int,
+    ) -> None:
         self._updates_since_log += 1
         rel = abs(gamma - self._last_logged_gamma) / self._last_logged_gamma
         if (
@@ -490,11 +501,13 @@ class AdaptiveBoostGamma:
             or rel >= self.LOG_REL_CHANGE
         ):
             logger.info(
-                "boost adaptive gamma: gamma=%.3e (gamma_hat=%.3e, "
-                "tail t99-t95=%.3g s, n=%d)",
+                "boost adaptive gamma: gamma=%.3e (fit=%.3e from %s tail, "
+                "width=%.3g s, floor=%.3e, n=%d)",
                 gamma,
-                gamma_hat,
-                delta,
+                raw_fit,
+                fit_src,
+                self.LN5 / raw_fit,
+                gamma_floor,
                 n,
             )
             self._updates_since_log = 0

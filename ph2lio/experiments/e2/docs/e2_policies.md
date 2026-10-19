@@ -12,7 +12,7 @@
 | 1 | n done / n wait | Completed requests / total sent | — |
 | 2 | cache hit (%) | Prefix cache utilization | `sum(matched_token)/sum(input_len)` |
 | 3 | queue mean/p99 (s) | Queue wait mean and 99th percentile | Linear percentile `k=(n-1)*p/100` |
-| 4 | TTFT mean/p99 (ms) | Time to first token mean and 99th percentile | Linear percentile `k=(n-1)*p/100` |
+| 4 | TTFT mean/p95/p99 (ms) | Time to first token mean, 95th, 99th percentile | Linear percentile `k=(n-1)*p/100` |
 | 5 | ITL mean/p99 (ms) | Inter-token latency mean and 99th percentile | Linear percentile `k=(n-1)*p/100` |
 | 6 | tok/s | Output token throughput | `sum(output_len) / (end_max - start_min)` |
 | 7 | Jain | Fairness of queue wait (1 = equal) | `(sum(x))^2 / (n * sum(x^2))`, x: per-request wait |
@@ -21,17 +21,17 @@
 
 ## Result — Concurrency 16
 
-| Policy | n done | n wait | cache hit (%) | queue mean (s) | queue p99 (s) | TTFT mean (ms) | TTFT p99 (ms) | ITL mean (ms) | ITL p99 (ms) | tok/s | Jain | stretch p99 | worst-5% wait (%) |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| fcfs | 159 | 173 | 77.4 | 26.892 | 220.500 | 35286 | 226862 | 422.95 | 154.95 | 66.4 | 0.337 | 56.83 | 33.73 |
-| lpm | 181 | 195 | 85.8 | 18.728 | 186.500 | 25136 | 183587 | 381.07 | 265.73 | 75.0 | 0.318 | 127.81 | 36.92 |
-| hrrn | 187 | 201 | 84.2 | 19.174 | 182.600 | 26070 | 194054 | 366.24 | 255.92 | 75.2 | 0.304 | 58.14 | 36.65 |
-| boost g=5.0 | 168 | 182 | 82.9 | 21.761 | 183.000 | 29526 | 140270 | 404.71 | 265.70 | 68.2 | 0.400 | 117.90 | 29.20 |
-| boost g=15.0 | 161 | 175 | 80.7 | 22.148 | 167.800 | 30123 | 150806 | 50.77 | 209.90 | 67.3 | 0.419 | 60.65 | 28.26 |
-| boost ada szfix | 163 | 177 | 81.5 | 21.646 | 192.125 | 30084 | 182250 | 421.08 | 350.82 | 67.7 | 0.332 | 92.96 | 34.57 |
-| dfs-weight | 181 | 195 | 87.3 | 23.483 | 359.500 | 29698 | 421762 | 379.50 | 715.04 | 86.9 | 0.151 | 64.04 | 60.92 |
+| Policy | n done | n wait | cache hit (%) | queue mean (s) | queue p99 (s) | TTFT mean (ms) | TTFT p95 (ms) | TTFT p99 (ms) | ITL mean (ms) | ITL p99 (ms) | tok/s | Jain | stretch p99 | worst-5% wait (%) |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| fcfs | 159 | 173 | 77.4 | 26.892 | 220.500 | 35286 | 125372 | 226862 | 422.95 | 154.95 | 66.4 | 0.337 | 56.83 | 33.73 |
+| lpm | 181 | 195 | 85.8 | 18.728 | 186.500 | 25136 | 105048 | 183587 | 381.07 | 265.73 | 75.0 | 0.318 | 127.81 | 36.92 |
+| hrrn | 187 | 201 | 84.2 | 19.174 | 182.600 | 26070 | 100705 | 194054 | 366.24 | 255.92 | 75.2 | 0.304 | 58.14 | 36.65 |
+| boost g=5.0 | 168 | 182 | 82.9 | 21.761 | 183.000 | 29526 | 97647 | 140270 | 404.71 | 265.70 | 68.2 | 0.400 | 117.90 | 29.20 |
+| boost g=15.0 | 161 | 175 | 80.7 | 22.148 | 167.800 | 30123 | 118908 | 150806 | 50.77 | 209.90 | 67.3 | 0.419 | 60.65 | 28.26 |
+| boost ada szfix | 163 | 177 | 81.5 | 21.646 | 192.125 | 30084 | 125619 | 182250 | 421.08 | 350.82 | 67.7 | 0.332 | 92.96 | 34.57 |
+| dfs-weight | 181 | 195 | 87.3 | 23.483 | 359.500 | 29698 | 111642 | 421762 | 379.50 | 715.04 | 86.9 | 0.151 | 64.04 | 60.92 |
 
-Note: All runs are from Oct 15-16 (commit `60060211`, with OOM recovery) with `in_batch_prefix_caching_max_pin_s=0`. FCFS and dfs-weight were rerun on Oct 16 to match this config (previously Oct 8-9, commit `101ea1dc`, pin=60). Boost g=15.0 ITL mean (50.77 ms) is anomalously low.
+Note: All runs are from Oct 15-16 (commit `60060211`, with OOM recovery) with `in_batch_prefix_caching_max_pin_s=0`, single run per policy at seed 42. FCFS and dfs-weight were rerun on Oct 16 to match this config (previously Oct 8-9, commit `101ea1dc`, pin=60). Boost g=15.0 ITL mean (50.77 ms) is anomalously low. Seed-replicate runs (seeds 42/43/44 for lpm, hrrn, adaptive J=50) show seed variance of 60-89% on TTFT p99 — 3-5x the policy gaps below — so this ranking is indicative only; see "Adaptive boost investigation".
 
 ## Overall ranking
 
@@ -45,7 +45,7 @@ FCFS has the best stretch p99 (56.83) — no reordering means no request is disp
 | 2 | hrrn | 58.14 | 0.304 | 36.65 | 194054 | 75.2 | Best stretch p99 (non-FCFS), high throughput, proportional fair |
 | 3 | boost g=15.0 | 60.65 | 0.419 | 28.26 | 150806 | 67.3 | Good Jain + queue p99, near-FCFS, moderate throughput |
 | 4 | lpm | 127.81 | 0.318 | 36.92 | 183587 | 75.0 | Good mean + throughput, worst stretch p99 |
-| 5 | boost ada szfix | 92.96 | 0.332 | 34.57 | 182250 | 67.7 | Adaptive, moderate but does not excel anywhere |
+| 5 | boost ada szfix | 92.96 | 0.332 | 34.57 | 182250 | 67.7 | Adaptive; beats lpm/hrrn at matched seed (see investigation) |
 | 6 | fcfs | 56.83 | 0.337 | 33.73 | 226862 | 66.4 | Best stretch p99, but worst TTFT p99 and low throughput |
 | 7 | dfs-weight | 64.04 | 0.151 | 60.92 | 421762 | 86.9 | Highest throughput, but worst fairness and worst TTFT p99 by far |
 
@@ -73,8 +73,8 @@ FCFS has the best stretch p99 (56.83) — no reordering means no request is disp
 
 ### Adaptive Boost (g-Ada + size-aware fix) — for dynamic workloads
 - **Use when**: workload is dynamic (bursty traffic, changing request size mix); do not know the optimal g in advance; want self-tuning.
-- **Strength**: self-adapts to workload, no manual g tuning. ITL mean 421.08 ms, ITL p99 350.82 ms: consistent decode.
-- **Weakness**: does not converge to optimal g under heavy overload (oscillates around g=0.10 instead of reaching g=5.0). Throughput lower than LPM/HRRN. Moderate on all metrics but does not excel anywhere. The paper's tail fit assumes fat tail comes from short-request starvation; under heavy overload, tail fat is global (queue congestion affects all requests), so the fit cannot distinguish exogenous variance from policy-induced variance.
+- **Strength**: self-adapts to workload, no manual g tuning. At matched seed, beats lpm and hrrn on TTFT p99 (159948 vs 183587/194054 at seed 42; holds at seeds 43/44). ITL mean 421.08 ms, ITL p99 350.82 ms: consistent decode.
+- **Weakness**: under heavy overload the tail fit is always below the jump floor, so gamma pins at gamma_floor(J) — the controller is inert and J is the real knob (see "Adaptive boost investigation"). 12-15% behind static g=5.0 on TTFT p99 at seed 42, within the seed-noise band. No fit variant (E2E, prefill-only, work-tokens) can reach g=5.0 on this heavy-tailed workload: the paper's rule prescribes strong SJF bounded by the jump floor.
 
 ### FCFS — baseline, best stretch p99 but worst TTFT p99
 - **Use when**: workload is light (no overload, queue near-empty); or need strict arrival-order guarantee; or SLA is measured by stretch (relative latency) not TTFT (absolute latency).
@@ -123,7 +123,7 @@ The trade-off is **throughput vs latency+fairness**, not starvation. Boost g=5.0
 | 15.0 | 161 | 167.8 | 150806 | 67.3 | 0.419 | 60.65 | 28.26 |
 | 20.0 | 166 | 183.0 | 322825 | 57.6 | 0.325 | — | — |
 
-g=5.0 is the sweet spot: best TTFT p99, zero OOM, zero retractions. g=15.0 is the fairness alternative. g=8.0 is an anomaly (TTFT p99=398s, likely variability from OOM interaction).
+g=5.0 is the best cell (TTFT p99 140270, zero OOM, zero retractions), but the sweep is one run per cell at seed 42: excluding the OOM-contaminated cells (g=8.0, g=20.0, and partly g=7.0), the rest scatter 140-203k ms with no trend, so "sweet spot at exactly 5.0" is not established — what the sweep does show is that any gamma >= ~2 (max jump <= ~0.5 s) lands in the same band, and gamma <= 0.3 (jump >= ~10 s) trends worse. g=15.0 is the fairness alternative.
 
 ## Adaptive gamma convergence
 
@@ -133,4 +133,61 @@ g=5.0 is the sweet spot: best TTFT p99, zero OOM, zero retractions. g=15.0 is th
 | Original J=120 | 0.053 | [0.05, 0.06] | 205915 | 59.5 | 0.349 |
 | Size-aware J=60 | 0.102 | [0.09, 0.55] | 182250 | 67.7 | 0.332 |
 
-The size-aware fix breaks the feedback loop partially: g occasionally reaches 0.55 (vs original stuck at 0.083), throughput improves 63.5 to 67.7 tok/s. But g still does not converge to the sweet spot (5.0) because under heavy overload, the tail fat is global, not isolated to giant requests.
+## Adaptive boost investigation (2026-10-19)
+
+Full audit of the adaptive implementation, the run data, and the "adaptive is much worse" claim. Three findings.
+
+### 1. The reported numbers are correct
+
+Every TTFT p99/p95 in the table above was recomputed offline from per-request `schedule_eval.jsonl` (health checks dropped, warmup excluded):
+
+| Policy | TTFT p99 offline (ms) | TTFT p99 table (ms) | ratio |
+|--------|----------------------|--------------------|-------|
+| fcfs | 225586 | 226862 | 0.994 |
+| lpm | 181624 | 183587 | 0.989 |
+| hrrn | 184398 | 194054 | 0.950 |
+| dfs-weight | 410306 | 421762 | 0.973 |
+| boost g=5.0 | 138279 | 140270 | 0.986 |
+| boost g=15.0 | 148220 | 150806 | 0.983 |
+| boost ada szfix | 178432 | 182250 | 0.979 |
+
+Ratios 0.95-0.99 (residual = warmup-exclusion boundary differences). The gamma trajectory also replays offline: window 128 / EMA 0.2 / size-aware / floor reproduce the logged band. No metric or implementation bug in the estimator path.
+
+### 2. "Adaptive is much worse" is not supported: seed variance dominates
+
+Runs exist at seeds 42/43/44 for lpm, hrrn, and adaptive J=50 (same commit, pin=0, run back-to-back Oct 15):
+
+| Policy | seed 42 TTFT p99 (ms) | seed 43 | seed 44 | seed spread |
+|--------|----------------------|---------|---------|-------------|
+| lpm | 183587 | 105805 | 91535 | 72% |
+| hrrn | 194054 | 103825 | 81917 | 89% |
+| boost ada J=50 | 159948 | 114645 | 87361 | 60% |
+
+- Seeds 43/44 are a lighter request mix (n done 193-271 vs 175-187): the same policy halves its TTFT p99. The seed swing (60-89%) is 3-5x the policy gaps in the single-seed table.
+- At matched seed, adaptive J=50 **beats** lpm and hrrn on TTFT p99 at every seed (160k vs 184k/194k at seed 42). It is 12-15% behind static g=5.0 at seed 42 — inside the noise band where the static sweep itself scatters 140-400k ms at one seed.
+- The single-seed ranking above is therefore indicative only. Ranking policies at this effect size needs the seed-replicate design (3+ seeds per policy).
+
+### 3. Why gamma converges to ~0.1: the fit is floor-bound, and every fit variant agrees
+
+The E2E tail (t99-t95) of completed requests is 86-560 s in steady state, so the raw Eq. 9 fit gives gamma_hat = 0.003-0.019 — always far below the max-jump floor (0.084 at J=60). The gamma shown in the log is the floor, not a converged fit; the adaptation is inert under this overload and **J is the effective policy knob**:
+
+| J (max jump s) | gamma floor (rate 1893 tok/s) | TTFT p99 (ms) |
+|----------------|-------------------------------|---------------|
+| 0.14 (= static g=5.0) | 5.04 | 140270 |
+| 50 | 0.089 | 159948 |
+| 60 | 0.076 | 154052 / 182250 |
+| 120 | 0.043 | 205915 |
+
+Static g=5.0 is equivalent to a **0.14 s** max jump: FCFS plus tie-breaking inside simultaneous-arrival bursts (aiperf subagent fan-out). Larger allowed jumps (more SJF) trend worse under this overload; FCFS itself (J=0) is also worse (226862), so the optimum is small-but-nonzero J.
+
+No fitted variable reaches g=5.0 on this workload — all three variants land at ~0.08-0.09, because the size distribution is genuinely heavy-tailed (work p95=204k, p99=237k tokens):
+
+| Fitted variable | p95-p99 width | gamma_hat |
+|-----------------|---------------|-----------|
+| E2E latency (paper, current) | 147-201 s | 0.008-0.011 |
+| Prefill service time only (ttft - wait) | 19-25 s | 0.065-0.086 |
+| Work in tokens x rate | 33k tok | 0.082-0.093 |
+
+The paper's rule (any faithful variant) prescribes strong SJF bounded only by the jump floor on this workload; g=5.0's edge is the burst-tie-break regime, which a tail fit cannot produce under overload. This is an algorithm-workload mismatch, not a code bug. The size-aware fix fires 19/19 updates (giant starvation detected continuously) and lifts gamma to 0.2-0.55 occasionally, but cannot reach 5.0.
+
+Logging fix applied with this investigation (commit follows): the trajectory log now prints the raw pre-floor fit, the tail it came from, and the floor (`fit=... from short/overall tail, width=... s, floor=...`), so a floor-pinned run is visible as fit << floor instead of reading as a converged fit.
