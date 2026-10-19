@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # E2 boost campaign — Phase 0: load-band recalibration on the dynamo arm.
-# 3 short probe cells (DURATION=900 — the scenario's minimum; 600 was rejected
-# by aiperf's scenario invariant) with dfs-weight at c16/c32/c64 to find
-# the concurrency band where #queue-req is persistently > 0 but not drowned
-# (the 5 old c64 cells showed 73k-132k pending = saturated). The chosen band
-# feeds phase 1's gamma sweep. Gate (evaluated after the cells, from the
-# engine log + schedule_eval queue_wait mass): highest c with a persistent
-# but modest queue.
+# Short probe cells (DURATION=900 — the scenario's minimum; 600 was rejected
+# by aiperf's scenario invariant) with dfs-weight to find the concurrency
+# band where #queue-req is persistently > 0 but not drowned. Evidence so far
+# (2026-10-19): c16/c32 ran nearly idle (queue>0 only 1.2%/5.1% of steady
+# samples, max queue 1-2, throughput still scaling ~linearly 162->368 tok/s)
+# while c64 is known drowned on this exact stack (the 5 old dynamo c64 cells,
+# now in agentx_pilot_preprod, showed 73k-132k pending). So the band is
+# between 32 and 64: probe c48. The chosen band feeds phase 1's gamma sweep.
+# Gate (evaluated after the cells, from the engine log + schedule_eval
+# queue_wait mass): persistent but modest queue.
 #
 # Prereqs: mirror_from_login.sh hgx-h200-01 re-run after the boost merge
 # (tag boost-h200-merged); smoke_dynamo_stack.sbatch green.
@@ -75,7 +78,7 @@ gzip_cell_exports() {  # rolling disk policy (plan §H.3): completed probe cells
   done
 }
 
-for c in 16 32 64; do
+for c in 16 32 48; do
   if ls "${OUTPUT_DIR}/dfs-weight/c${c}_"*/e2_metrics.json >/dev/null 2>&1; then
     echo "=== E2 resume: skip completed dfs-weight c${c} ==="
     continue
