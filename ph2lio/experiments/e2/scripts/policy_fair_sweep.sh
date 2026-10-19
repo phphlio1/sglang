@@ -67,7 +67,11 @@ run_cell() {  # $1 = sweep key, $2 = seed
   log "=== CELL START ${key} policy=${pol} seed=${seed} c16 pin=0 ==="
   # GRACE_PERIOD=600 matches the established c16 protocol: the run_e2.sh
   # default (inf) hangs forever on credits that never return.
-  if SEED="${seed}" CONCURRENCY=16 DURATION=1800 FORCE_RESTART=1 \
+  # `env` carries the per-arm boost vars: an expanded ${benv} in a plain
+  # command prefix is not parsed as assignments (bash sees the words after
+  # expansion), so `BOOST_GAMMA=5.0 bash ...` runs BOOST_GAMMA=5.0 as a
+  # command and the cell insta-fails.
+  if env SEED="${seed}" CONCURRENCY=16 DURATION=1800 FORCE_RESTART=1 \
      GRACE_PERIOD=600 IN_BATCH_PREFIX_CACHING_MAX_PIN_S=0 \
      BOOST_BIN_SIZE=256 BOOST_CLOCK=wall ${benv} \
      bash "${E2_DIR}/scripts/run_e2.sh" policy "${pol}" 16 >> "${LOG}" 2>&1; then
