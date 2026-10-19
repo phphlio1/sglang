@@ -15,7 +15,11 @@
 #SBATCH --nodelist=hgx-h200-01
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=160
+# Must stay >96: the server binds GPUs 4-7 to NUMA node 1 (--numa-node 0 0 0 0
+# 1 1 1 1); <=96 CPUs lands the whole allocation on one NUMA node and the
+# binding is skipped at boot (smoke 2623 died at 64). Measured demand is
+# ~16-20 cores — the count is purely topological. 128 since 2026-10-19.
+#SBATCH --cpus-per-task=128
 #SBATCH --mem=1600G
 #SBATCH --time=04:00:00
 #SBATCH --output=/shared/loipp/logs/e2boost_p0_loadband_%j.log
@@ -76,7 +80,7 @@ for c in 16 32 64; do
     echo "=== E2 resume: skip completed dfs-weight c${c} ==="
     continue
   fi
-  echo "=== E2 phase0 probe: policy=dfs-weight concurrency=${c} duration=600 ==="
+  echo "=== E2 phase0 probe: policy=dfs-weight concurrency=${c} duration=900 ==="
   bash scripts/run_e2.sh policy dfs-weight "${c}" \
     || echo "=== E2 cell failed: dfs-weight c${c} (will retry on resubmit) ==="
   gzip_cell_exports

@@ -13,7 +13,11 @@
 #SBATCH --nodelist=hgx-h200-01
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:8
-#SBATCH --cpus-per-task=160
+# Must stay >96: the server binds GPUs 4-7 to NUMA node 1 (--numa-node 0 0 0 0
+# 1 1 1 1); <=96 CPUs lands the whole allocation on one NUMA node and the
+# binding is skipped at boot (smoke 2623 died at 64). Measured demand is
+# ~16-20 cores — the count is purely topological. 128 since 2026-10-19.
+#SBATCH --cpus-per-task=128
 #SBATCH --mem=1600G
 #SBATCH --time=04:00:00
 #SBATCH --output=/shared/loipp/logs/e2boost_p3_adaptive_%j.log
