@@ -233,3 +233,41 @@ Kill criteria: starvers persist -> mechanism incomplete, next suspect is
 the chunk-limit interaction (one g5.0 cell with the limit disabled);
 starvers gone but a body percentile regresses >10% -> trade-off rejected,
 redesign before adopting.
+
+### Validation result (arrival tie-break, 2026-10-21 04:17, commit 413514ef3d)
+
+Cell c16_g5.0_wall_k256_20261021_032242 (run_meta sglang_commit
+413514ef3d; warm-cache parity restored after the ENOSPC night: fresh
+FP8 + workload-dataset download, 0 dangling links; log
+logs/boost_arrival_tiebreak_g5.0_77188_retry.log). Scheduler-side
+warmup-excluded, n=104, vs the g5.0-fix pair 20261020_181256 (n=110),
+same recipe both cells.
+
+| prediction                           | verdict  | numbers |
+|--------------------------------------|----------|---------|
+| starvers (>1000 s) -> 0              | PASS     | 0 starvers, 0 >600 s, max wait 457 s (old: 3 at 1483-1870 s) |
+| TTFT p99 -> <= ~700 s                | PASS     | aiperf 1699 -> 474 s (scheduler p99 469, max 501); fcfs 461 / lpm 716 |
+| ex-trio waits -> 43-160 s            | PARTIAL  | same-class waits 160/284/298 s (old 1870/1680/1483); nothing >600 s anywhere, but 2 of 3 sit above the band -- they arrive later (1260/1287 s) into a deeper queue |
+| body (mean/p50/p90/p95) unchanged    | FAIL     | mean 214->244 (+14%), p50 144->297 (+106%), p90 379->407 (+7%), p95 590->422 (-28%); same-arrival-band medians 114->189 / 218->368 / 306->386 s -- real, not mix |
+| cache hit stays ~31%                 | FAIL     | 31.2 -> 22.3% scheduler-side (aiperf first-attempt 37.3 -> 26.9%); not a top-2 artifact (excl top-2: 26.6 -> 17.7%) |
+| residual ties admit in arrival order | PASS     | last 8 admits strictly arrival-monotone; the rid-order drain fingerprint is gone |
+
+Kill criterion fired (p50 +106%, mean +14%): per pre-registration the
+trade-off is rejected as-is -- redesign before adopting. What the cell
+does settle: the rid tie-break mechanism is dead (starvers, p99 and the
+drain fingerprint all cleared, Jain 0.437 -> 0.843), and part of the old
+cell's speed was the bug itself -- the stuck families' prefill work was
+deferred past the window edge, and their end-drain bursts (9 siblings x
+22,622 matched tokens admitted 2711-2779 s) inflated the old hit rate.
+
+Open, and what blocks adoption: the in-window hit gap (31.6% old vs
+22.1% new, drain admits excluded) is NOT explained by the drain bursts
+alone; old cells show same-match fan-out clusters of 8-9 members, new
+cells 3-5. Near the saturation knee a 9-pp hit drop (-6% total
+throughput, 3565 -> 3360 tok/s) roughly doubles the median wait. n=1
+per arm, so before redesigning: (a) one repeat cell of this exact
+config to bound run variance, and/or (b) trace one fan-out family
+through both cells' server_metrics_export.jsonl to pin the
+cluster-shrink mechanism. Campaign view on the clean base: boost g5.0
+p99 474 s ~ fcfs 461, < lpm 716 << dfs-weight 1123, 0 starvation, best
+Jain -- the e2 tail goal is met; the open question is the body cost.
