@@ -94,3 +94,20 @@ the direct evidence the mechanism fires in this workload.
   demotion by sorting followers just behind their leader (phi_leader -
   epsilon) instead of a global group-1 tail, preserving the dedup hit
   without starvation behind future arrivals.
+
+## Fix (branch boost-audit-fixes, 2026-10-20)
+
+Implemented the fix candidate: `_compute_prefix_matches` returns
+(followers, follower -> leader) -- simulated-tree insert values are now
+per-insert sequence numbers, so the deepest matched node identifies the
+leader -- and `_sort_by_boost` places a follower at phi(leader) + eps,
+group 0: behind its leader (dedup win preserved), ahead of every later
+arrival (starvation gone; worst case a follower waits for one leader).
+lpm/hrrn/shortest-prefill keep the frozen group-1 behavior so the
+campaign arms stay comparable.
+
+Validation: scripts/boost_jgrid.sh runs boost-g5.0 and ada J in
+{60, 15, 5} at seed 77188, c16, pin=0, all with the fix -- the g5.0 and
+ada-j60 cells pair 1:1 against the no-fix campaign cells at the same
+seed. Prediction: the 1500-1950 s starvers disappear (TTFT p99 drops
+toward the fcfs/lpm band) while the cache hit stays near 28.7%.

@@ -353,6 +353,11 @@ class AdaptiveBoostGamma:
     # Outer clip in 1/s; the jump floor usually binds first on the low side.
     GAMMA_MIN_S = 1e-3
     GAMMA_MAX_S = 15.0
+    # Paper (UniBoost, Li et al., ICML 2026) is internally inconsistent on
+    # Eq. 9: the main text derives ln(Fbar(t95)/Fbar(t99)) = ln 5 from the
+    # CCDF ratio, while Algorithm 1 line 17 computes ln(99/95) -- a CDF
+    # mixup, 39x smaller. We follow the main text: the CCDF form is the
+    # log-linear tail slope the derivation actually targets.
     LN5 = math.log(5.0)
     # epsilon floor on the band width: a compressed tail (t99 == t95) is the
     # degenerate thin tail (FCFS-ward, gamma_hat -> GAMMA_MAX_S), not an error.
@@ -377,6 +382,8 @@ class AdaptiveBoostGamma:
         self._gamma = min(max(gamma0, self.GAMMA_MIN_S), self.GAMMA_MAX_S)
         self._updates_since_log = 0
         self._last_logged_gamma = self._gamma
+        self._updates = 0
+        self._pinned_updates = 0
 
     @property
     def gamma(self) -> float:
@@ -413,6 +420,13 @@ class AdaptiveBoostGamma:
             max((1.0 - self.BETA) * self._gamma + self.BETA * gamma_hat, gamma_floor),
             self.GAMMA_MAX_S,
         )
+        # pinned = updates whose raw tail fit is at/below the floor: 100%
+        # over a run means the J bound, not the fit, set gamma throughout.
+        # The EMA target is the floored estimate, so gamma only approaches
+        # the floor asymptotically -- the raw fit is the pinned signal.
+        self._updates += 1
+        if raw_fit <= gamma_floor:
+            self._pinned_updates += 1
         self._maybe_log(gamma, raw_fit, fit_src, gamma_floor, len(self._samples))
         self._gamma = gamma
         return gamma
@@ -502,13 +516,14 @@ class AdaptiveBoostGamma:
         ):
             logger.info(
                 "boost adaptive gamma: gamma=%.3e (fit=%.3e from %s tail, "
-                "width=%.3g s, floor=%.3e, n=%d)",
+                "width=%.3g s, floor=%.3e, n=%d, pinned=%.0f%%)",
                 gamma,
                 raw_fit,
                 fit_src,
                 self.LN5 / raw_fit,
                 gamma_floor,
                 n,
+                100.0 * self._pinned_updates / self._updates,
             )
             self._updates_since_log = 0
             self._last_logged_gamma = gamma
@@ -598,6 +613,9 @@ class SchedulePolicy:
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
+        # Monotonic across passes: simulated-tree node values identifying
+        # which queued request inserted each prefix.
+        self._waiting_tree_insert_seq = 0
 
     def calc_priority(
         self,
@@ -638,7 +656,7 @@ class SchedulePolicy:
             return
 
         if isinstance(policy, CacheAwarePolicy):
-            temporary_deprioritized = self._compute_prefix_matches(
+            temporary_deprioritized, leader_of = self._compute_prefix_matches(
                 waiting_queue, policy
             )
             for r in waiting_queue:
@@ -654,6 +672,9 @@ class SchedulePolicy:
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
             elif policy == CacheAwarePolicy.BOOST:
+                # Boost places dedup followers just behind their leader;
+                # the frozen baseline sorts below keep the global group-1
+                # tail (comparability with the campaign arms).
                 SchedulePolicy._sort_by_boost(
                     waiting_queue,
                     temporary_deprioritized,
@@ -667,6 +688,7 @@ class SchedulePolicy:
                         if self.prefill_token_rate is not None
                         else None
                     ),
+                    leader_of=leader_of,
                 )
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                 SchedulePolicy._sort_by_shortest_prefill(
@@ -798,12 +820,21 @@ class SchedulePolicy:
 
     def _compute_prefix_matches(
         self, waiting_queue: List[Req], policy: CacheAwarePolicy
-    ) -> Set[int]:
+    ) -> tuple[Set[str], Dict[str, str]]:
         """
         Computes and caches the matching prefixes for requests in the waiting queue,
             and handles in-batch prefix caching logic.
+
+        Returns (demoted follower rids, follower rid -> leader rid). The
+        leader is the queued request that first inserted the shared prefix;
+        boost sorts a follower just behind its leader, not behind every
+        group-0 request.
         """
-        temporary_deprioritized: Set[int] = set()
+        temporary_deprioritized: Set[str] = set()
+        leader_of: Dict[str, str] = {}
+        # Simulated-tree node values are per-insert sequence numbers, so the
+        # deepest matched node's value identifies the inserting request.
+        inserted_by: Dict[int, str] = {}
         self.waiting_queue_radix_tree.reset()
         now_s = time.perf_counter()
 
@@ -841,7 +872,14 @@ class SchedulePolicy:
                     IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ) and not self._pin_hold_expired(r, now_s):
                     temporary_deprioritized.add(r.rid)
+                    # device_indices concatenates the matched nodes' values
+                    # root -> deepest; the deepest node's inserter is the
+                    # leader whose admission will populate the shared KV.
+                    leader_of[r.rid] = inserted_by[int(in_batch_matching_prefixes[-1])]
                 else:
+                    insert_seq = self._waiting_tree_insert_seq
+                    self._waiting_tree_insert_seq += 1
+                    inserted_by[insert_seq] = r.rid
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
@@ -850,10 +888,12 @@ class SchedulePolicy:
                                 extra_key=extra_key,
                                 cache_salt=cache_salt,
                             ),
-                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
+                            value=torch.full(
+                                (len(prefix_ids),), insert_seq, dtype=torch.int64
+                            ),
                         )
                     )
-        return temporary_deprioritized
+        return temporary_deprioritized, leader_of
 
     def _pin_hold_expired(self, r: Req, now_s: float) -> bool:
         """Whether the follower pin's wall-second hold bound has released r
@@ -968,7 +1008,7 @@ class SchedulePolicy:
     @staticmethod
     def _sort_by_boost(
         waiting_queue: List[Req],
-        temporary_deprioritized: Set[int],
+        temporary_deprioritized: Set[str],
         gamma: float,
         bin_size: int,
         enable_priority_scheduling: bool = False,
@@ -976,6 +1016,7 @@ class SchedulePolicy:
         *,
         clock: BoostClock = BoostClock.TOKENS,
         rate_tokens_per_s: Optional[float] = None,
+        leader_of: Optional[Dict[str, str]] = None,
     ) -> None:
         """Gamma-boosted arrival ordering (UniBoost, Li et al., ICML 2026, Sec. 2).
 
@@ -992,11 +1033,20 @@ class SchedulePolicy:
         bounded by b_gamma(bin_size) clock-tokens (or b_gamma(bin_size / rate)
         wall seconds); requests older than that are unreachable — bounded
         displacement, converging to FCFS.
+
+        In-batch dedup followers (leader_of, from _compute_prefix_matches)
+        sort just behind their leader — group 0 at phi(leader) + eps — not
+        behind every group-0 request: a global group-1 tail also sits behind
+        every future arrival, which starves followers without bound once the
+        queue is giant-logged (e2 fair sweep seed 77188: 1500-1950 s follower
+        waits under overload vs <= 453 s under fcfs). A follower whose leader
+        left the queue keeps the group-1 tail.
         """
 
-        def key(r: Req):
-            u = SchedulePolicy._shortest_prefill_work(r)
-            w = geometric_bin(u, bin_size)
+        req_by_rid = {r.rid: r for r in waiting_queue} if leader_of else {}
+
+        def base_rank(r: Req) -> float:
+            w = geometric_bin(SchedulePolicy._shortest_prefill_work(r), bin_size)
             if clock is BoostClock.WALL:
                 # None = never stamped (synthetic reqs); treat as oldest.
                 arrival_s = (
@@ -1009,16 +1059,25 @@ class SchedulePolicy:
                     if rate_tokens_per_s is not None
                     else 0.0
                 )
-                rank = arrival_s - boost_s
-            else:
-                # None = never stamped (synthetic reqs); treat as oldest.
-                arrival = (
-                    r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
-                )
-                rank = arrival - gamma_boost(w, gamma)
+                return arrival_s - boost_s
+            # None = never stamped (synthetic reqs); treat as oldest.
+            arrival = (
+                r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
+            )
+            return arrival - gamma_boost(w, gamma)
+
+        def key(r: Req):
+            rank = base_rank(r)
             if r.rid in temporary_deprioritized:
-                # In-batch dedup followers still go last, same as lpm.
-                group, phi = 1, 0.0
+                leader = req_by_rid.get(leader_of.get(r.rid)) if leader_of else None
+                if leader is not None:
+                    # Eps: small enough that no unrelated request lands
+                    # between leader and follower, in either clock's units.
+                    eps = 1e-3 if clock is BoostClock.WALL else 1.0
+                    group, phi = 0, base_rank(leader) + eps
+                else:
+                    # Leader left the queue (admitted/retracted): tail.
+                    group, phi = 1, 0.0
             else:
                 group, phi = 0, rank
             if enable_priority_scheduling:

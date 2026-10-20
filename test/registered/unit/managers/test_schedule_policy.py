@@ -183,7 +183,9 @@ class TestShortestPrefillFirst(CustomTestCase):
         short = self.make_req("short", 32)
         long = self.make_req("long", 1024)
         queue = [long, short, cached]
-        with patch.object(self.policy, "_compute_prefix_matches", return_value=set()):
+        with patch.object(
+            self.policy, "_compute_prefix_matches", return_value=(set(), {})
+        ):
             self.policy.calc_priority(queue)
         self.assertEqual([req.rid for req in queue], ["cached", "short", "long"])
 
@@ -199,7 +201,9 @@ class TestShortestPrefillFirst(CustomTestCase):
         other = self.make_req("other", 1024)
         queue = [duplicate, other]
         with patch.object(
-            self.policy, "_compute_prefix_matches", return_value={duplicate.rid}
+            self.policy,
+            "_compute_prefix_matches",
+            return_value=({duplicate.rid}, {}),
         ):
             self.policy.calc_priority(queue)
         self.assertEqual(queue, [other, duplicate])
@@ -377,9 +381,13 @@ class TestBoostSort(CustomTestCase):
 
     GAMMA_K = (1e-4, 256)
 
-    def sort_rids(self, reqs, deprioritized=frozenset(), gamma=1e-4, bin_size=256):
+    def sort_rids(
+        self, reqs, deprioritized=frozenset(), gamma=1e-4, bin_size=256, leader_of=None
+    ):
         queue = list(reqs)
-        SchedulePolicy._sort_by_boost(queue, set(deprioritized), gamma, bin_size)
+        SchedulePolicy._sort_by_boost(
+            queue, set(deprioritized), gamma, bin_size, leader_of=leader_of
+        )
         return [r.rid for r in queue]
 
     def test_locality_hot_jumps_ahead_of_older_cold(self):
@@ -455,13 +463,44 @@ class TestBoostSort(CustomTestCase):
         fresh = _make_boost_req("fresh", 500, arrival=0)
         self.assertEqual(self.sort_rids([replay, fresh]), ["fresh", "replay"])
 
-    def test_in_batch_dedup_followers_sort_last(self):
+    def test_in_batch_dedup_follower_sorts_behind_its_leader(self):
+        # Regression (e2 fair sweep seed 77188, 2026-10-20): boost demoted
+        # in-batch dedup followers to a global group-1 tail, which sits
+        # behind every group-0 request -- under a giant-logged overloaded
+        # queue that is behind every future arrival, so later session turns
+        # starved 1500-1950 s while fcfs served the same reqs in <= 453 s.
+        # A follower must sort just behind its leader (group 0), ahead of
+        # every later arrival that the boost itself would not put ahead of
+        # the leader (late arrives 30k tokens after leader but only saves
+        # ~25.9k via its boost, so it still trails the leader).
+        leader = _make_boost_req("leader", 4_096, arrival=0)
+        follower = _make_boost_req("follower", 256, arrival=500)
+        late = _make_boost_req("late", 256, arrival=30_000)
+        self.assertEqual(
+            self.sort_rids(
+                [leader, follower, late],
+                deprioritized={"follower"},
+                leader_of={"follower": "leader"},
+            ),
+            ["leader", "follower", "late"],
+        )
+
+    def test_in_batch_dedup_follower_without_leader_sorts_last(self):
+        # Leader left the queue between classification and sort (admitted
+        # or retracted): the follower keeps the group-1 tail. Also the
+        # contract for callers that omit leader_of entirely.
         follower = _make_boost_req("follower", 256, arrival=0)
         other = _make_boost_req("other", 250_000, arrival=1_000_000)
-        self.assertEqual(
-            self.sort_rids([follower, other], deprioritized={"follower"}),
-            ["other", "follower"],
-        )
+        for leader_of in ({"follower": "gone"}, None):
+            with self.subTest(leader_of=leader_of):
+                self.assertEqual(
+                    self.sort_rids(
+                        [follower, other],
+                        deprioritized={"follower"},
+                        leader_of=leader_of,
+                    ),
+                    ["other", "follower"],
+                )
 
     def test_priority_scheduling_is_the_primary_key(self):
         # Same composition contract as _sort_by_priority_and_fcfs: priority
@@ -498,7 +537,7 @@ class TestBoostSort(CustomTestCase):
         cold = _make_boost_req("cold", 100_000, arrival=0)
         hot = _make_boost_req("hot", 256, arrival=500)
         queue = [cold, hot]
-        with patch.object(policy, "_compute_prefix_matches", return_value=set()):
+        with patch.object(policy, "_compute_prefix_matches", return_value=(set(), {})):
             policy.calc_priority(queue)
         self.assertEqual([r.rid for r in queue], ["hot", "cold"])
 
@@ -665,6 +704,26 @@ class TestBoostWallSort(CustomTestCase):
         # The shared order is genuinely boost-driven, not arrival-ordered.
         self.assertEqual(wall_order, ["hot1", "hot2", "mid", "cold"])
 
+    def test_in_batch_dedup_follower_sorts_behind_its_leader(self):
+        # Wall-clock contract of the starvation fix (tokens-clock twin in
+        # TestBoostSort): a demoted follower ranks at phi(leader) + 1e-3 s,
+        # ahead of every later arrival the boost would not put ahead of the
+        # leader (late's 43.6 s boost does not cover its 50 s arrival lag).
+        leader = _make_wall_req("leader", 4_096, entry_s=0.0)
+        follower = _make_wall_req("follower", 256, entry_s=5.0)
+        late = _make_wall_req("late", 256, entry_s=50.0)
+        queue = [leader, follower, late]
+        SchedulePolicy._sort_by_boost(
+            queue,
+            {"follower"},
+            0.1,
+            256,
+            clock=BoostClock.WALL,
+            rate_tokens_per_s=2000.0,
+            leader_of={"follower": "leader"},
+        )
+        self.assertEqual([r.rid for r in queue], ["leader", "follower", "late"])
+
     def test_calc_priority_measures_rate_from_processed_tokens(self):
         policy = SchedulePolicy(
             policy="boost",
@@ -679,7 +738,7 @@ class TestBoostWallSort(CustomTestCase):
         hot = _make_wall_req("hot", 256, entry_s=100.0)
         queue = [cold, hot]
         with (
-            patch.object(policy, "_compute_prefix_matches", return_value=set()),
+            patch.object(policy, "_compute_prefix_matches", return_value=(set(), {})),
             patch(
                 "sglang.srt.managers.schedule_policy.time.perf_counter",
                 side_effect=[0.0, 1.0, 2.0],
@@ -794,14 +853,18 @@ class TestInBatchPrefixCaching(CustomTestCase):
     def test_classification_leader_follower_unrelated(self):
         # Cold queue, empty radix: the first scanned req is inserted into the
         # simulated tree (leader); a later req sharing >= 32 leading tokens
-        # with it is deprioritized (follower); an unrelated req is neither.
+        # with it is deprioritized (follower) and mapped to that leader; an
+        # unrelated req is neither.
         leader = self._cold_req("leader", list(range(64)))
         follower = self._cold_req("follower", list(range(64)))
         unrelated = self._cold_req("unrelated", list(range(1000, 1064)))
         queue = [leader, follower, unrelated]
 
-        pinned = self._policy()._compute_prefix_matches(queue, CacheAwarePolicy.LPM)
+        pinned, leader_of = self._policy()._compute_prefix_matches(
+            queue, CacheAwarePolicy.LPM
+        )
         self.assertEqual(pinned, {"follower"})
+        self.assertEqual(leader_of, {"follower": "leader"})
 
     def test_pin_bound_promotes_after_60s(self):
         # The observed 112-298 s unbounded holds, unit form: a follower whose
@@ -811,7 +874,7 @@ class TestInBatchPrefixCaching(CustomTestCase):
         follower_late = self._cold_req(
             "follower_late", list(range(64)) + [7, 8, 9], entry_offset_s=61.0
         )
-        pinned = self._policy()._compute_prefix_matches(
+        pinned, _ = self._policy()._compute_prefix_matches(
             [leader, follower_late], CacheAwarePolicy.LPM
         )
         self.assertNotIn("follower_late", pinned)
@@ -820,20 +883,24 @@ class TestInBatchPrefixCaching(CustomTestCase):
         follower_recent = self._cold_req(
             "follower_recent", list(range(64)) + [7, 8, 9], entry_offset_s=30.0
         )
-        pinned = self._policy()._compute_prefix_matches(
+        pinned, leader_of = self._policy()._compute_prefix_matches(
             [leader, follower_recent], CacheAwarePolicy.LPM
         )
         self.assertEqual(pinned, {"follower_recent"})
+        self.assertEqual(leader_of, {"follower_recent": "leader"})
 
     def test_pin_bound_zero_disables(self):
         # 0 restores the unbounded pin: a follower waiting an hour stays
-        # pinned (the negative-branch contract of the flag).
+        # pinned (the negative-branch contract of the flag). The leader map
+        # is still built -- leader-relative placement under boost must not
+        # depend on the pin bound.
         leader = self._cold_req("leader", list(range(64)))
         follower = self._cold_req("follower", list(range(64)), entry_offset_s=3600.0)
-        pinned = self._policy(max_pin_s=0.0)._compute_prefix_matches(
+        pinned, leader_of = self._policy(max_pin_s=0.0)._compute_prefix_matches(
             [leader, follower], CacheAwarePolicy.LPM
         )
         self.assertEqual(pinned, {"follower"})
+        self.assertEqual(leader_of, {"follower": "leader"})
 
     def test_unstamped_req_never_promotes(self):
         # first_queue_entry_time is None on disagg/synthetic reqs: the wait is
@@ -842,7 +909,7 @@ class TestInBatchPrefixCaching(CustomTestCase):
         leader = self._cold_req("leader", list(range(64)))
         follower = self._cold_req("follower", list(range(64)))
         self.assertIsNone(follower.first_queue_entry_time)
-        pinned = self._policy()._compute_prefix_matches(
+        pinned, _ = self._policy()._compute_prefix_matches(
             [leader, follower], CacheAwarePolicy.LPM
         )
         self.assertEqual(pinned, {"follower"})
@@ -866,7 +933,11 @@ class TestInBatchDedupStamping(CustomTestCase):
         follower = _make_boost_req("follower", 256, arrival=0)
         other = _make_boost_req("other", 4_096, arrival=10)
         queue = [follower, other]
-        with patch.object(policy, "_compute_prefix_matches", return_value={"follower"}):
+        with patch.object(
+            policy,
+            "_compute_prefix_matches",
+            return_value=({"follower"}, {"follower": "other"}),
+        ):
             policy.calc_priority(queue)
         self.assertIs(follower.in_batch_dedup_pending, True)
         self.assertIs(other.in_batch_dedup_pending, False)
@@ -984,8 +1055,9 @@ class TestAdaptiveBoostGamma(CustomTestCase):
         # floor-pinned overload run logged a 4-20 s "tail" while the raw tail
         # was 86-560 s -- the floor-bound state was invisible and the
         # trajectory read as a converged fit. The line must carry the raw
-        # pre-floor fit, which tail it came from, and the floor, so a pinned
-        # run shows fit << floor.
+        # pre-floor fit, which tail it came from, the floor, and the share
+        # of updates clamped to that floor (100% = the J bound, not the fit,
+        # set gamma the whole run -- the ada@77188 state).
         adaptive = AdaptiveBoostGamma(
             gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
         )
@@ -999,12 +1071,17 @@ class TestAdaptiveBoostGamma(CustomTestCase):
                 )
         fit_m = re.search(r"fit=([\d.eE+-]+)", cm.output[-1])
         floor_m = re.search(r"floor=([\d.eE+-]+)", cm.output[-1])
+        pinned_m = re.search(r"pinned=(\d+)%", cm.output[-1])
         self.assertIsNotNone(fit_m, "log must report the raw fit")
         self.assertIsNotNone(floor_m, "log must report the floor")
+        self.assertIsNotNone(pinned_m, "log must report the floor-pinned share")
         fit = float(fit_m.group(1))
         floor = float(floor_m.group(1))
         self.assertLess(fit, 1e-6, "fit must be the pre-floor raw estimate")
         self.assertGreater(floor, 0.07, "floor is the J=60 jump bound at 2k tok/s")
+        self.assertGreaterEqual(
+            int(pinned_m.group(1)), 99, "every update must clamp to the floor"
+        )
         self.assertIn("tail", cm.output[-1])
 
     def test_warmup_returns_none_below_min_samples(self):
