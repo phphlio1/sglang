@@ -134,13 +134,13 @@ toward the fcfs/lpm band) while the cache hit stays near 28.7%.
   leader (bounded displacement: a follower waits for its leader, no
   longer for the whole group-0 prefix). rids are not stable across
   runs, so the pairing is by class, not by rid.
-- The tail that remains is capacity- and ordering-bound, not demotion:
-  fresh match=0 giants queue 900-1900 s under every boost arm while
-  fcfs holds 461 s under the same load. Boost's phi ordering plus the
-  BOOST-only shortest_prefill_chunk_limit put fresh giants last under a
-  36-min saturated queue. Open and testable: j5 (jumps <= 5 s, a
-  near-FCFS sort) still tails at 1500 s with 7 starvers -- a j5 cell
-  with the chunk limit disabled would isolate its share.
+- The tail that remains is still demotion, through a different door: the
+  fix bounds a follower behind one leader per pass, but the next leader is
+  the min-rid family member, not the earliest arrival (see the rid tie-break
+  section below). Class-level, boost-fix beats fcfs at p50/p90 in every size
+  class (giants >= 100k: p50 115-136 s vs 190 s, p90 278-310 s vs 370 s);
+  the tail is 1-3 rid-unlucky outliers per cell, not a fresh-giant class
+  effect.
 - J under overload: j15 is the best boost arm (p99 964 s, 1 starver,
   best Jain 0.537). Live floors matched the computed ones (j60
   0.116-0.122, j15 0.27-0.40, j5 0.62-1.05) and pinned=55-100% in the
@@ -167,3 +167,69 @@ scheduler-side recomputation (1807->1671 s) -- at n~100 the p99 is a
 worst-2 statistic. Costs of the fix: ada-j60 p10 19->35 s (fastest
 small requests wait behind freed followers) and TTFT Jain -0.03
 (0.434->0.407 g5.0, 0.427->0.390 ada-j60); mechanism not pinned down.
+
+### Root cause of the remaining tail: rid tie-break head rotation (2026-10-20 night)
+
+The fix's "worst case a follower waits for one leader" holds per pass but
+not across head rotations. Elimination ladder on the g5.0-fix cell (seed
+77188), every step measured on existing data:
+
+- Retraction: the three worst outliers (waits 1870/1680/1483 s,
+  in=101426/41062/52049, all match=0, follower=False) record
+  num_retractions=0; queue_wait stamps survive retraction by definition
+  (first admission minus first entry, stamped once).
+- Chunk-limit: engaged in only 13% of prefill steps while the queue was
+  non-empty (781 steps, new-token p50 = 8192, 103 capped) -- minor at most.
+- Budget misfit / scan break: 77 requests arrived after the worst outlier
+  and were admitted before it, 55 of them with uncached > 8192 (a fresh
+  122366-token request waited 131 s) -- large fresh requests fit
+  throughout.
+- Sort displacement at gamma=5: b <= 0.64 s per jump -> ~50 s cumulative
+  over ~75 later arrivals vs ~1400 s measured excess.
+- Stuck earlier leader: every pre-873 s arrival drained by 963 s while the
+  outlier waited to 2743 s -- no earlier leader to inherit the wait from.
+
+Mechanism (code path: scheduler.py calc_priority at the top of every
+get_new_batch_prefill pass -> schedule_policy.py):
+
+1. calc_priority sorts waiting_queue in place each pass; followers of a
+   shared-prefix family all tie at phi(leader)+eps, broken by rid
+   (_sort_by_boost key = (group, phi, rid)).
+2. Next pass, _compute_prefix_matches iterates that order: the first free
+   family member -- once the head drains, the min-rid follower -- inserts
+   and becomes the new leader; the family now sorts at phi(new leader) =
+   the ARRIVAL of whichever member holds the smallest rid.
+3. Under continuous same-prefix arrivals an early member with an unlucky
+   rid never wins headship: every later arrival with a smaller rid passes
+   it, for as long as arrivals continue. pin=0 (campaign) disables the
+   only other escape (_pin_hold_expired).
+
+Record-level fingerprint (no other mechanism produces it): the final drain
+of the g5.0-fix cell admits the last five requests in exact rid-lexicographic
+order while ignoring arrival -- 97fd(arr 2406) 2711 s, bdd1(arr 2417)
+2730 s, ea93(arr 873) 2743 s, f8ee(arr 1287) 2770 s, fd3b(arr 1099)
+2779 s. The stuck trio are all e/f-prefixed rids (bottom of the rid space)
+and drain only after arrivals stop (window end 2475 s + backlog).
+
+This supersedes the j5-open-question reading in boost_paper_fidelity
+finding 2: the mechanism is gamma-independent (it lives in the dedup
+tie-break layer, not the ranking), so j5's 7 starvers and ada-j15's single
+starver (a tiny in=513 that waited 1510 s) are the same signature, not
+chunk-limit effects.
+
+Pre-registered validation, written before any code change: tie-break
+followers by arrival stamp (first_queue_entry_time wall /
+boost_arrival_tokens tokens) instead of rid in _sort_by_boost.
+Predictions for one g5.0 seed-77188 cell:
+
+- starvers (>1000 s) -> 0; TTFT p99 -> the fcfs/lpm band (<= ~700 s); the
+  ex-trio waits -> the 43-160 s cohort band (the pre-873 s family drained
+  by 963 s).
+- body percentiles (mean/p50/p90/p95) unchanged within noise; cache hit
+  stays ~31% (one head at a time is preserved).
+- any residual late tie admits in ARRIVAL order, not rid order.
+
+Kill criteria: starvers persist -> mechanism incomplete, next suspect is
+the chunk-limit interaction (one g5.0 cell with the limit disabled);
+starvers gone but a body percentile regresses >10% -> trade-off rejected,
+redesign before adopting.

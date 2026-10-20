@@ -55,8 +55,10 @@ Resolution:
   0.537, 1 starver); live floors matched the computed ones (0.116-0.122 /
   0.27-0.40 / 0.62-1.05) with pinned=55-100%. Full table in
   boost_tail_collapse_root_cause.md. The ranking is non-monotonic in J;
-  the j5 tail (7 starvers despite a near-FCFS sort) is open -- the
-  BOOST-only shortest_prefill_chunk_limit is the testable candidate.
+  the j5 tail (7 starvers despite a near-FCFS sort) is the rid tie-break
+  head rotation, not a J or chunk-limit effect -- gamma-independent,
+  root-caused and pre-registered for validation in
+  boost_tail_collapse_root_cause.md (rid tie-break section).
 - Unit tests already lock the floor round trip and the Eq. 9 ln5/Delta
   form (`test_estimator_math_and_ema`).
 
