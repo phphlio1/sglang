@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fair 7-policy sweep: 5 random seeds x {fcfs, lpm, hrrn, dfs-weight,
+# Fair 7-policy sweep: 3 random seeds x {fcfs, lpm, hrrn, dfs-weight,
 # boost g=5.0, boost g=15.0, boost gamma-Ada J=60}, c16, pin=0, commit
 # 0229372590 (post adaptive-gamma audit). Seed-major order: each seed
 # block completes all 7 policies, so a partial campaign still yields
@@ -7,7 +7,8 @@
 #
 # Motivation (2026-10-19 audit): single-seed policy gaps (~15%) sit inside
 # a 60-89% seed band (seeds 42/43/44 replicates), so the ranking needs
-# per-seed pairing and 5 seeds/arm. ~54 min/cell -> ~31.5 h total.
+# per-seed pairing and 3+ seeds/arm (trimmed from 5 on 2026-10-20 to
+# finish the campaign sooner). ~54 min/cell -> ~19 h total.
 #
 # Resumable: cells recorded in logs/policy_fair_sweep.progress are skipped;
 # delete the file (or lines) to re-run cells. Failed cells are NOT recorded
@@ -27,7 +28,7 @@ mkdir -p "${E2_DIR}/logs"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 LOG="${E2_DIR}/logs/policy_fair_sweep_${STAMP}.log"
 PROGRESS="${E2_DIR}/logs/policy_fair_sweep.progress"
-SEEDS=(77188 42302 94815 15767 27781)
+SEEDS=(77188 42302 94815)
 POLICIES=(fcfs lpm hrrn dfs-weight boost-g5.0 boost-g15.0 boost-ada-j60)
 OK=0
 FAIL=0
