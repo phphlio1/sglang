@@ -146,3 +146,24 @@ toward the fcfs/lpm band) while the cache hit stays near 28.7%.
   0.116-0.122, j15 0.27-0.40, j5 0.62-1.05) and pinned=55-100% in the
   trajectory logs confirms J, not the tail fit, governed throughout --
   finding 2 of the paper audit, now measured.
+
+### Reading the numbers (closed-loop load, distribution view)
+
+aiperf holds 16 requests in flight and issues a new one per freed slot,
+so per-arm request counts are goodput, not a fixed arrival set
+(client-side request_count: fcfs 84, g5.0-fix 96, ada-j60-fix 110,
+ada-j15-fix 113, lpm 180). Every arm completed all the requests it took
+(0 null-ttft records at this seed); fcfs's 461 s p99 is over the ~99 it
+served while lpm served ~194 with p99 716 s -- under saturation the
+arms differ in what they sacrifice (fcfs: goodput, hit 16%; lpm: tail
+spread, Jain 0.25), not only in tail latency.
+
+The fix improved or held every body percentile of both paired arms
+(scheduler-side, warmup-excluded): g5.0 mean 290->236 s, p50 202->166,
+p90 515->406, p95 897->616, >600 s count 9->6; ada-j60 mean 229->209,
+p90 582->310, >300 s count 26->13, >600 s 12->7. The apparent g5.0 p99
+regression in the aiperf export (1530->1699 s) does not survive the
+scheduler-side recomputation (1807->1671 s) -- at n~100 the p99 is a
+worst-2 statistic. Costs of the fix: ada-j60 p10 19->35 s (fastest
+small requests wait behind freed followers) and TTFT Jain -0.03
+(0.434->0.407 g5.0, 0.427->0.390 ada-j60); mechanism not pinned down.
