@@ -1041,30 +1041,39 @@ class SchedulePolicy:
         queue is giant-logged (e2 fair sweep seed 77188: 1500-1950 s follower
         waits under overload vs <= 453 s under fcfs). A follower whose leader
         left the queue keeps the group-1 tail.
+
+        The follower tie at phi(leader)+eps breaks by arrival stamp, not rid:
+        the next pass classifies the queue in this order and makes its first
+        free family member the next leader once the current one drains, so a
+        rid tie-break hands headship to whichever follower holds the smallest
+        rid — an early arrival with an unlucky rid is then passed by every
+        later same-prefix arrival without bound (e2 g5.0 seed 77188: 1870 s
+        vs the 43-160 s cohort band; the cell's final drain admitted the
+        family in exact rid order, arrival ignored).
         """
 
         req_by_rid = {r.rid: r for r in waiting_queue} if leader_of else {}
 
-        def base_rank(r: Req) -> float:
-            w = geometric_bin(SchedulePolicy._shortest_prefill_work(r), bin_size)
+        def arrival_stamp(r: Req) -> float:
+            # None = never stamped (synthetic reqs); treat as oldest.
             if clock is BoostClock.WALL:
-                # None = never stamped (synthetic reqs); treat as oldest.
-                arrival_s = (
+                return (
                     r.first_queue_entry_time
                     if r.first_queue_entry_time is not None
                     else 0.0
                 )
+            return r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
+
+        def base_rank(r: Req) -> float:
+            w = geometric_bin(SchedulePolicy._shortest_prefill_work(r), bin_size)
+            if clock is BoostClock.WALL:
                 boost_s = (
                     gamma_boost(w / rate_tokens_per_s, gamma)
                     if rate_tokens_per_s is not None
                     else 0.0
                 )
-                return arrival_s - boost_s
-            # None = never stamped (synthetic reqs); treat as oldest.
-            arrival = (
-                r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
-            )
-            return arrival - gamma_boost(w, gamma)
+                return arrival_stamp(r) - boost_s
+            return arrival_stamp(r) - gamma_boost(w, gamma)
 
         def key(r: Req):
             rank = base_rank(r)
@@ -1081,8 +1090,8 @@ class SchedulePolicy:
             else:
                 group, phi = 0, rank
             if enable_priority_scheduling:
-                return (r.priority * priority_sign, group, phi, r.rid)
-            return (group, phi, r.rid)
+                return (r.priority * priority_sign, group, phi, arrival_stamp(r), r.rid)
+            return (group, phi, arrival_stamp(r), r.rid)
 
         waiting_queue.sort(key=key)
 

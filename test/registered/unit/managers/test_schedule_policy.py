@@ -485,6 +485,27 @@ class TestBoostSort(CustomTestCase):
             ["leader", "follower", "late"],
         )
 
+    def test_in_batch_dedup_follower_tie_breaks_by_arrival_not_rid(self):
+        # Regression (e2 g5.0 seed 77188, 2026-10-20 night): followers of
+        # one leader tie at phi(leader)+eps; a rid tie-break ordered the tie
+        # by rid, and the next pass makes the first family member in this
+        # order the next leader once the current one drains -- so a later
+        # arrival with a smaller rid kept winning headship and an early
+        # rid-unlucky request starved 1870 s under continuous same-prefix
+        # arrivals (the cell's final drain admitted the family in exact rid
+        # order, arrival ignored). The tie must break by arrival stamp.
+        leader = _make_boost_req("leader", 4_096, arrival=0)
+        early = _make_boost_req("zz_early", 256, arrival=500)
+        late = _make_boost_req("aa_late", 256, arrival=30_000)
+        self.assertEqual(
+            self.sort_rids(
+                [leader, early, late],
+                deprioritized={"zz_early", "aa_late"},
+                leader_of={"zz_early": "leader", "aa_late": "leader"},
+            ),
+            ["leader", "zz_early", "aa_late"],
+        )
+
     def test_in_batch_dedup_follower_without_leader_sorts_last(self):
         # Leader left the queue between classification and sort (admitted
         # or retracted): the follower keeps the group-1 tail. Also the
