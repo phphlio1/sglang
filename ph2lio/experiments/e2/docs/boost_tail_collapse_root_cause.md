@@ -111,3 +111,38 @@ Validation: scripts/boost_jgrid.sh runs boost-g5.0 and ada J in
 ada-j60 cells pair 1:1 against the no-fix campaign cells at the same
 seed. Prediction: the 1500-1950 s starvers disappear (TTFT p99 drops
 toward the fcfs/lpm band) while the cache hit stays near 28.7%.
+
+### Validation result (J-grid, 2026-10-20 evening, commit 8d3823e95f)
+
+| arm            | TTFT p99 | TTFT mean | starvers >1k s | hit % | tok/s | Jain  |
+|----------------|----------|-----------|----------------|-------|-------|-------|
+| fcfs (ref)     | 461 s    | 310 s     | 0              | 16.1  | 64.6  | -     |
+| lpm (ref)      | 716 s    | 107 s     | 0              | 74.5  | 75.7  | -     |
+| g5.0 no-fix    | 1530 s   | 306 s     | 5              | 28.7  | 34.8  | 0.500 |
+| g5.0 fix       | 1699 s   | 261 s     | 3              | 31.2  | 36.3  | 0.437 |
+| ada-j60 no-fix | 1511 s   | 249 s     | 2              | 41.4  | 41.2  | 0.452 |
+| ada-j60 fix    | 1186 s   | 227 s     | 4              | 35.9  | 40.9  | 0.412 |
+| ada-j15 fix    | 964 s    | 259 s     | 1              | 38.8  | 38.5  | 0.537 |
+| ada-j5 fix     | 1500 s   | 317 s     | 7              | 31.6  | 37.3  | 0.436 |
+
+- The follower class left the tail. The no-fix starvers were the
+  follower class: the tiny continuation (in=514, match=0 after its
+  demoter drained) and match-rich later-turn giants (in=134881
+  match=123518, in=111697 match=43478). With the fix, the g5.0 tail is
+  match=0 fresh giants only (in=101426/41062/52049); ada-j60 keeps two
+  match=23076 siblings that queue behind their own session's giant
+  leader (bounded displacement: a follower waits for its leader, no
+  longer for the whole group-0 prefix). rids are not stable across
+  runs, so the pairing is by class, not by rid.
+- The tail that remains is capacity- and ordering-bound, not demotion:
+  fresh match=0 giants queue 900-1900 s under every boost arm while
+  fcfs holds 461 s under the same load. Boost's phi ordering plus the
+  BOOST-only shortest_prefill_chunk_limit put fresh giants last under a
+  36-min saturated queue. Open and testable: j5 (jumps <= 5 s, a
+  near-FCFS sort) still tails at 1500 s with 7 starvers -- a j5 cell
+  with the chunk limit disabled would isolate its share.
+- J under overload: j15 is the best boost arm (p99 964 s, 1 starver,
+  best Jain 0.537). Live floors matched the computed ones (j60
+  0.116-0.122, j15 0.27-0.40, j5 0.62-1.05) and pinned=55-100% in the
+  trajectory logs confirms J, not the tail fit, governed throughout --
+  finding 2 of the paper audit, now measured.
