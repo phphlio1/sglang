@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# Auto-relaunch the fair sweep after the 2026-10-19 pass exits.
+# Watch a fair-sweep driver; when it exits, clear stray servers and
+# relaunch the sweep. The driver skips cells recorded in the progress
+# file, so the relaunch retries only unfinished cells.
 #
-# The 2026-10-19 22:35 pass launched with the env-expansion bug: the boost
-# cells (3 per seed block) insta-fail on `BOOST_GAMMA=...: command not
-# found` and are not recorded in the progress file. The fixed driver skips
-# done cells, so relaunching after this pass exits retries exactly the 15
-# failed boost cells. The pass's outer for-loop was parsed before the fix
-# was written to the script file (bash keeps the old parse), so it runs to
-# completion; only its final log line is unreliable -- hence this watcher
-# triggers on driver PROCESS EXIT, not on the SWEEP DONE log line.
+# The relaunch guard must match only a live driver process: an
+# unanchored "bash.*policy_fair_sweep.sh" also matched a concurrent
+# monitoring shell (its cmdline merely mentioned the script) and
+# aborted the relaunch. Anchor to the driver's exact cmdline shape.
 #
-# Cap: 36 h. Aborts (no relaunch) if the driver is still alive at the cap,
-# or if another sweep driver is already running at relaunch time.
+# Cap: 36 h. Aborts (no relaunch) if the driver is still alive at the
+# cap, or if another sweep driver is already running at relaunch time.
 
 set -u
 
@@ -45,7 +43,7 @@ if pgrep -f "launch_server|sglang::" >/dev/null 2>&1; then
   sleep 10
 fi
 
-if pgrep -f "bash.*policy_fair_sweep.sh" >/dev/null 2>&1; then
+if pgrep -f "bash [^ ]*policy_fair_sweep\.sh$" >/dev/null 2>&1; then
   say "another sweep driver is running - abort relaunch"
   exit 1
 fi

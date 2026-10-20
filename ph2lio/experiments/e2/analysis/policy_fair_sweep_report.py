@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fair-sweep aggregator: 7 arms x 5 seeds (policy_fair_sweep.sh).
+"""Fair-sweep aggregator: 7 arms x 3 seeds (policy_fair_sweep.sh).
 
 Scans the RTX results root for campaign cells (commit 0229372590, c16,
 pin=0, seed in the campaign set), maps each to an arm, pulls the shared
@@ -22,8 +22,9 @@ import os
 import sys
 from collections import defaultdict
 
-# Campaign identity (policy_fair_sweep.sh, 2026-10-19).
-SEEDS = [77188, 42302, 94815, 15767, 27781]
+# Campaign identity (policy_fair_sweep.sh, 2026-10-19; trimmed 5 -> 3
+# seeds on 2026-10-20 before seeds 15767/27781 ran).
+SEEDS = [77188, 42302, 94815]
 COMMIT_PREFIX = "0229372590"
 ARM_ORDER = ["fcfs", "lpm", "hrrn", "dfs-weight", "boost-g5.0", "boost-g15.0", "boost-ada-j60"]
 STRETCH_UNCACHED_FLOOR_TOKENS = 256
