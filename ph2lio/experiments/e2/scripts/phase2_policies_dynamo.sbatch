@@ -113,7 +113,10 @@ run_cell() {  # $1 = policy, $2 = conc, $3 = boost gamma (empty for non-boost), 
   # (extract_metrics_timeseries.py), gunzip it first (srun, then re-gzip).
   find "${OUTPUT_DIR}" -name e2_metrics.json | while read -r m; do
     d="$(dirname "${m}")"
-    [[ -f "${d}/server_metrics_export.jsonl" ]] && gzip -f "${d}/server_metrics_export.jsonl"
+    # `if` (not `[[ ]] && gzip`): a false guard as the loop's last status
+    # returns 1 and, under set -euo pipefail (find | while), kills the whole
+    # driver after the last cell — job 4391 died exactly this way.
+    if [[ -f "${d}/server_metrics_export.jsonl" ]]; then gzip -f "${d}/server_metrics_export.jsonl"; fi
   done
 }
 

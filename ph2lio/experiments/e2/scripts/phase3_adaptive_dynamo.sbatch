@@ -97,7 +97,10 @@ for seed in "${SEEDS[@]}"; do
       || echo "=== E2 cell failed: boost ${label} seed=${seed} (will retry on resubmit) ==="
     find "${OUTPUT_DIR}" -name e2_metrics.json | while read -r m; do
       d="$(dirname "${m}")"
-      [[ -f "${d}/server_metrics_export.jsonl" ]] && gzip -f "${d}/server_metrics_export.jsonl"
+      # `if` (not `[[ ]] && gzip`): a false guard as the loop's last status
+      # returns 1 and, under set -euo pipefail (find | while), kills the whole
+      # driver after the last cell — job 4391 died exactly this way.
+      if [[ -f "${d}/server_metrics_export.jsonl" ]]; then gzip -f "${d}/server_metrics_export.jsonl"; fi
     done
   done
 done
