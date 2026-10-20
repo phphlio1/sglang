@@ -26,10 +26,16 @@ from collections import defaultdict
 # seeds on 2026-10-20 before seeds 15767/27781 ran).
 SEEDS = [77188, 42302, 94815]
 # run_meta records the repo HEAD at server start, and the campaign spans
-# three commits (sweep launch, env fix, seed trim). They differ only in
-# scripts/docs -- the policy code is identical since 0229372590. Extend
-# this list if a retry runs from a newer commit.
-COMMIT_PREFIXES = ["736733d495", "0623366f0e", "dfe209bcbe"]
+# five commits (sweep launch, env fix, seed trim, root-cause docs, aggregator
+# fix). All are scripts/docs only -- the policy code is identical since
+# 0229372590. Later commits (b21cde8cce+) carry the leader-relative dedup
+# fix and must NOT join this no-fix campaign; those cells are the J-grid.
+COMMIT_PREFIXES = [
+    "736733d495",
+    "0623366f0e",
+    "dfe209bcbe",
+    "bec18cc62",
+]
 ARM_ORDER = ["fcfs", "lpm", "hrrn", "dfs-weight", "boost-g5.0", "boost-g15.0", "boost-ada-j60"]
 STRETCH_UNCACHED_FLOOR_TOKENS = 256
 
@@ -84,6 +90,13 @@ def eval_records(path: str) -> list[dict]:
 
 
 def tail_metrics(records: list[dict]) -> dict:
+    # Grace-period teardown leaves ttft_s null on requests that never
+    # decoded a token; the tail metrics cover served requests only.
+    records = [
+        r
+        for r in records
+        if r["ttft_s"] is not None and r["queue_wait_s"] is not None
+    ]
     waits = [r["queue_wait_s"] for r in records]
     ttfts = [r["ttft_s"] for r in records]
     uncached = [
