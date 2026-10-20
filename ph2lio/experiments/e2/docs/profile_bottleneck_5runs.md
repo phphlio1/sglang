@@ -2,7 +2,10 @@
 
 So sánh thông số Engine SGLang để profile bottleneck giữa 5 run có cùng cấu hình Production GLM5.3, workload AgentX
 
-`BASE_DIR = /shared/loipp/sglang/ph2lio/experiments/e2/results/glm53/agentx_dynamo/profiling/dfs-weight/`
+*(Cập nhật 20/10: §2/§3/§4 đính chính sau khi kiểm chứng lại — kết luận "size-blind placement"
+trước đây sai, vấn đề đúng là chuỗi dung lượng KV/hicache host tier, xem §4.)*
+
+`BASE_DIR = /shared/loipp/sglang/ph2lio/experiments/e2/results/glm53/agentx_pilot_preprod/agentx_dynamo/profiling/dfs-weight/`
 
 | Run | Stamp | Run dir |
 |---|---|---|
@@ -51,7 +54,7 @@ Thống kê per rank trong benchmark window (hàng workload = min–max mean qua
 | #retract | 3 | 0 | 2 | 0 | 0 |
 
 - **Router overhead - không đáng kể**: 1172 dec/4.8 ms, 1216 dec/12.1 ms, 1221 dec/9.6 ms, 1206 dec/7.4 ms, 1188 dec/13.3 ms - quá nhỏ so TTFT giây.
-- **Công thức cost - có tín hiệu nhưng chưa đủ**: corr(logit, TTFT) = +0.40, +0.26, +0.52, +0.37, +0.42; corr(logit, queue_wait) = +0.32, +0.08, +0.18, +0.15, +0.19. Cost cao đoán đúng hướng chờ lâu hơn ở mọi run, nhưng corr(logit, input_len) chỉ +0.18–0.32 (tín hiệu gần như không mang thông tin kích thước request — kiểm chứng chi tiết ở §4) nên hot-rank vẫn bị dồn.
+- **Công thức cost - đầy đủ, đã kiểm chứng lại (20/10)**: corr(logit, TTFT) = +0.40, +0.26, +0.52, +0.37, +0.42. Logit **có** chứa chi phí request đang đặt: corr(logit, state + 16×uncached/64) = +0.88–0.90 mọi run (state-only chỉ +0.50–0.60). corr(logit, input_len) thấp (+0.26–0.32) không phải do thiếu term mà vì input_len gần như hằng số trong workload lặp history (matched ≈ 0.9×input_len) — đính chính chi tiết ở §4.
 
 ## 3. Focus 1 - scheduling policy dfs-weight dẫn tới batch mỏng và đói prefill
 
@@ -65,55 +68,50 @@ Thống kê per rank trong benchmark window (hàng workload = min–max mean qua
   request đang decode (prefill chen ngang làm ITL giật) → scheduler hoãn
   prefill mới → backlog `#pending-token` duy trì suốt benchmark  dù admission queue gần rỗng (queue-req
   0.09–0.92/rank). TTFT tail 75–99 s đến từ backlog này, không phải cạn tài nguyên - GPU
-  vẫn 77–97%.
+  vẫn 77–97%. (Đính chính 20/10: thành phần lớn nhất của backlog/TTFT tail là request chờ
+  load-back host-tier — ~62% tổng thời gian chờ, phân tích ở §4; phần delayer giữ là phần còn lại.)
 - Batch decode mỏng 2.31–4.68 req/rank
   (dù trần `--max-running-requests=256`): prefill bị hoãn nên không có việc dồn vào batch.
 - **Tóm lại:** scheduling policy đánh đổi TTFT lấy ITL ổn định. Ở CCU 64 nó giữ batch mỏng kéo dài suốt window nên là bottleneck là hành vi cố ý của policy.
 
 **Verdict:** Consistent giữa 5 run
 
-## 4. Focus 2 - routing config gây mất cân bằng về workload / KV per rank
+## 4. Focus 2 - mất cân bằng per-rank: chuỗi dung lượng KV (hicache host tier), router không nhìn thấy
 
-**Mô tả:** Router của Dynamo có công thức:
-`logit = active_decode_blocks + 16 × adjusted_prefill_blocks − cache_credits`
+> **Đính chính (20/10):** kết luận cũ của mục này ("size-blind placement" — logit thiếu chi phí
+> request đang đặt) là **sai**. Test cũ dùng corr(logit, input_len): trong workload lặp history,
+> matched ≈ 0.9×input_len nên input_len gần như hằng số, không thể mang tín hiệu. Test đúng với
+> unc = input_len − cached cho corr +0.88–0.90 (state-only +0.50–0.60) → binary dynamo 1.4.2
+> **đã có đủ** term chi phí request trong logit, khớp source tag v1.4.2
+> (`lib/kv-router/src/scheduling/selector.rs`). Công thức tính cost không thiếu gì.
 
-Logit **chỉ phản ánh trạng thái hiện tại của rank** và **không chứa chi phí của request đang được đặt**. Router chọn rank "đang nhẹ" mà không biết request sắp đặt vào nặng bao nhiêu (**size-blind placement**) → với workload không đồng nhất (input dài, ~96k cached token/request), token lệch 3.9–5.6× giữa rank mọi run. Lệch KV là hệ quả tích lũy, trễ thời gian của lệch token đó, chỉ escalate thành KV-full + retract khi quỹ đạo KV của run chạm ngưỡng (2/5 run). Cache affinity là lệch **có chủ đích cộng thêm** (chỉ 9.4–11.8% decision), không phải nguyên nhân chính.
+**Vấn đề đúng (nhất quán 5/5 run):**
 
-- Active prefill token spread ≥ 3.9× mọi run.
-- KV usage spread p50 ≥ 0.51 mọi run.
-- corr(logit, TTFT) cùng dấu dương mọi run: +0.40, +0.26, +0.52, +0.37, +0.42.
+- **~90% request là lượt mới của hội thoại cũ**, bị ghim về rank đang giữ prefix: credit
+  ≈ 16×96k/64 ≈ 22k block, lớn hơn hẳn chênh lệch trạng thái giữa các rank → argmin luôn trả về
+  holder. Cache-aware routing hoạt động đúng, nhưng router gần như không còn đòn bẩy cân bằng
+  cho 90% traffic.
+- **Rank sở hữu nhiều hội thoại đầy KV device** → hicache write_back
+  (`--enable-hierarchical-cache --hicache-size=128 --hicache-write-policy=write_back`) đẩy prefix
+  cũ xuống host tier; cuối window rank nóng dùng 83–100% host tier (3/5 run chạm ~100%).
+- **Hội thoại quay lại mà prefix đã nằm trên host** → engine phải reclaim + load-back toàn bộ
+  span lên device **trước khi admit** (`python/sglang/srt/managers/schedule_policy.py`
+  `prepare_load_back`, `python/sglang/srt/mem_cache/prefill_budget.py` `reclaim_for_prealloc`) →
+  chờ queue ~15–28s, gấp ~8–14× request cùng cỡ nhưng prefix còn trên device (~2s). Confounder
+  đã loại bằng: so sánh trong cùng rank/cùng window vẫn chênh lệch đó; request lớn (input_len
+  ≥120k) không host-hit vẫn chỉ chờ ~2–4s.
+- **Nhóm host-hit chỉ ~14% request nhưng chiếm ~62% tổng thời gian chờ queue**; đa số request
+  chờ >30s thuộc nhóm này → nguồn chính của TTFT p99 75–99s. Spread "active prefill" 3.9–5.6×
+  phần lớn là bóng của backlog này: gauge chỉ drain khi token đầu tiên quay về router
+  (`lib/llm/src/kv_router/push_router/request_guard.rs`), nên backlog load-back hiện thành
+  mất cân bằng trên metric router.
+- **Router mù trước toàn bộ chuỗi**: logit không có term KV-occupancy hay chi phí reload;
+  host-hit còn được credit 0.75 (`lib/kv-router/src/scheduling/config.rs` default) — coi reload
+  gần như miễn phí. KV-full + retract (2/5 run, tổng 5 request) chỉ là biên hiếm của cùng áp lực
+  dung lượng, không phải vấn đề chính.
 
-
-Ví dụ (run 4):
-
-| Chỉ số (mean) | r0 | r1 | r2 | r3 | r4 | r5 | r6 | r7 | spread |
-|---|---|---|---|---|---|---|---|---|---|
-| Active prefill tokens `worker_active_prefill_tokens` | 15.7k | 10.3k | 11.9k | 11.8k | 5.3k | 9.4k | 20.2k | 21.0k | **3.9×** |
-| Active decode blocks | 6.1k | 6.9k | 6.2k | 6.7k | 5.0k | 6.1k | 6.8k | 6.3k | 1.4× |
-| KV token usage `full_token_usage` | 0.60 | 0.74 | 0.68 | 0.67 | 0.55 | 0.73 | 0.66 | 0.66 | 1.4× |
-| Admission queue-req | 0.51 | 0.58 | 0.46 | 0.39 | 0.17 | 0.42 | 0.45 | 0.39 | — |
-| Cache hit rate | 0.63 | 0.75 | 0.66 | 0.61 | 0.58 | 0.56 | 0.73 | 0.59 | — |
-
-Weight `16 × prefill_blocks` áp cho active prefill blocks (state của rank) — vấn đề không phải weight sai mà là công thức **thiếu hẳn term chi phí của request đang đặt** (corr(logit, input_len) +0.18–0.32) → size-blind placement là cơ chế chính, r7 nhận 21.0k active prefill token mean (nhiều nhất run 4) mà logit vẫn thấy rank đó "nhẹ".
-
-**Nguyên nhân**:
-
-- Router (kv-mode) cố gắng giữ request cùng prefix về cùng rank (cache hit
-  per rank chênh 0.41–0.80; nhưng affinity chỉ kích hoạt 9.4–11.8% decision,
-  `host_pinned_blocks > 0`) và chọn rank theo **argmin logit** — tín hiệu chỉ là
-  trạng thái rank tại thời điểm đó, không chứa tải của request đang đặt. Kết quả
-  bề ngoài giống "cân bằng theo số request": mọi run, rank ít request nhất đều thuộc
-  nhóm nhận input mean lớn nhất. Request count per rank chênh 1.9–3.9× - tải bị lệch.
-- **Hệ quả**: Active prefill token lệch 3.9–5.6× →
-  KV usage lệch p50 0.51–0.57 →
-  hot-rank chờ lâu hơn hẳn (queue-wait/TTFT per rank), và khi áp lực
-  đủ lớn thì escalate thành KV-full + retract. Lớp offload hicache host (128 GB/rank) cũng lệch theo:
-  used 0.5M–1.6M / 0.6M–2.1M / 0.6M–1.7M / 0.6M–1.7M / 0.9M–1.7M token.
-- Công thức tính cost của Dynamo phản ánh đúng hướng (corr dương với TTFT; cấu trúc state-only đã kiểm chứng corr +0.50–0.74 với gauge) nhưng
-  thiếu term chi phí request đang đặt nên chưa đủ kéo request khỏi hot-rank. Do đó, giả thuyết "công thức cost chưa tối ưu" được ủng hộ một phần nhưng chưa thể khẳng định hoàn toàn, hướng sửa: thêm estimated prompt cost (nhân theo KV-room còn lại của từng rank) vào logit, hoặc cân bằng theo prefill token/KV thay
-  vì trạng thái tức thời.
-
-**Verdict:** Consistent giữa 5 run
+**Verdict:** Consistent giữa 5 run. Hướng sửa (E3, cập nhật e3_plan.md sau): đưa chi phí thật
+của host-tier hit và headroom KV vào quyết định định tuyến.
 
 ## 5. Bottleneck khác ngoài phạm vi Scheduling (maybe future work?)
 
@@ -135,14 +133,18 @@ Các hiện tượng dưới đây có đo được trong 5 run nhưng **không 
 | Nguồn | Nội dung | Dùng ở |
 |---|---|---|
 | `analysis/sglang_rank_ts.csv` + `analysis/dynamo_ts.csv` | trích từ `server_metrics_export.jsonl` (8081 `sglang:*` per dp_rank; 8888 `dynamo_*`), benchmark window | §1–§2 per-rank mean/spread, KV, cache hit, queue |
-| `engine_*.log` / `frontend_*.log` (symlink trong run dir) | batch scheduler per-minute, pending-token, boot lines, WARN retract; dòng `Selected worker router_mode="kv"` (logit, host_pinned_blocks, dp_rank) + `Expiring stale request`; join router↔engine theo timestamp ±2 s; join `schedule_eval.jsonl` (`input_len`, `matched_prefix_tokens`, `output_len`) theo arrival ±2 s | §1 pending/running, §2 queue-wait/TTFT per rank, corr(logit,·), §4 kiểm chứng router (size-blind, affinity) |
+| `engine_*.log` / `frontend_*.log` (symlink trong run dir) | batch scheduler per-minute, pending-token, boot lines, WARN retract; dòng `Selected worker router_mode="kv"` (logit, host_pinned_blocks, dp_rank) + `Expiring stale request`; join router↔engine theo timestamp ±2 s; join `schedule_eval.jsonl` (`input_len`, `output_len`, `queue_wait_s`, `device_matched_prefix_tokens_first_admission`, `host_hit_prefix_tokens_first_admission`) theo arrival ±2 s | §1 pending/running, §2 queue-wait/TTFT per rank, corr(logit,·), §4 phân tích pinned/host-hit |
 | `e2_metrics.json` | throughput/TTFT/E2E/TPOT/fairness client | §1 |
 | `gpu_samples.csv` | nvidia-smi 1 s × 8 GPU | §1 GPU util |
 | `profiling/pyspy_*.svg` | flame 25 Hz × 120 s × 8 scheduler (4/5 run; run 2 probes bị skip) | §3 cơ chế |
 | `profile_export.jsonl` | `benchmark_phase` + `request_start_ns` → window; duration từ `e2_metrics.json` (`run.duration_s`) | mọi bảng |
 
-Benchmark window mỗi run = record đầu phase `profiling` → +1800 s. Chi tiết cách tính từng số + cite file/dòng: focus report từng run - run 1
+Benchmark window mỗi run = record đầu phase `profiling` → +1800 s. **Lưu ý (20/10):**
+`schedule_eval.jsonl` là file chung bị **append qua các run** trong cùng đợt — mọi phép
+join/phân tích phải lọc record theo khoảng thời gian log của từng run, không thì gom
+nhầm toàn bộ vào run đầu. Chi tiết cách tính từng số + cite file/dòng: focus report từng run - run 1
 `docs/focus3320_routing_scheduling.md`, run 2–5
 `docs/focus_c64_<stamp>_routing_scheduling.md`. Reproduce: `extract_metrics_timeseries.py <run_dir>`
 (srun trên node) → `gen_focus_report.py <run_dir>` → `compare_focus_runs.py
-<run_dir...>` 
+<run_dir...>`; chuỗi kiểm chứng lại §4 (20/10, đã gom thành 1 script, tự lọc window
+từng run): `focus2_retrace.py [--part formula|kvblind|pinned|drain|perreq|channels|hhsplit|verify|all] <run_dir>...`
