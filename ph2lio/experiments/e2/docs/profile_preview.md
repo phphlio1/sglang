@@ -102,7 +102,7 @@ python3 -m dynamo.sglang \
 
 ## 4. Kết quả bottleneck
 
-Cell `agentx_dynamo/profiling/dfs-weight/c64_20261014_112105`.
+Cell `agentx_pilot_preprod/agentx_dynamo/profiling/dfs-weight/c64_20261014_112105`.
 
 ### 4.1 Tổng quan client (aiperf, 1169 records)
 

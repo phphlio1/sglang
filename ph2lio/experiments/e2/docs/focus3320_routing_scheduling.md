@@ -9,7 +9,7 @@ hgx-h200-01). Theo 2 hướng định hướng:
 gây mất cân bằng giữa các GPU/DPA rank. Kèm health-check thông số: GPU,
 token usage, cache, KV cache.
 
-Run dir: `results/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261014_112105/`
+Run dir: `results/glm53/agentx_pilot_preprod/agentx_dynamo/profiling/dfs-weight/c64_20261014_112105/`
 
 ## 0. Nguồn dữ liệu & quy ước cite
 

@@ -10,7 +10,7 @@ cache, PROBE_DURATION 1800 s). Theo 2 hướng định hướng:
 (2) global dynamo routing gây mất cân bằng giữa các GPU/DPA rank. Kèm
 health-check thông số: GPU, token usage, cache, KV cache.
 
-Run dir: `results/glm53/agentx_dynamo/profiling/dfs-weight/c64_20261015_201358/`
+Run dir: `results/glm53/agentx_pilot_preprod/agentx_dynamo/profiling/dfs-weight/c64_20261015_201358/`
 
 ## 0. Nguồn dữ liệu & quy ước cite
 
