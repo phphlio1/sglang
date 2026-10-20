@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fair-sweep aggregator: 7 arms x 3 seeds (policy_fair_sweep.sh).
 
-Scans the RTX results root for campaign cells (commit 0229372590, c16,
+Scans the RTX results root for campaign cells (campaign commits, c16,
 pin=0, seed in the campaign set), maps each to an arm, pulls the shared
 metrics from e2_metrics.json, computes the threshold-free tail metrics
 (stretch p99, worst-5% wait share, cache hit) from schedule_eval.jsonl
@@ -25,7 +25,11 @@ from collections import defaultdict
 # Campaign identity (policy_fair_sweep.sh, 2026-10-19; trimmed 5 -> 3
 # seeds on 2026-10-20 before seeds 15767/27781 ran).
 SEEDS = [77188, 42302, 94815]
-COMMIT_PREFIX = "0229372590"
+# run_meta records the repo HEAD at server start, and the campaign spans
+# three commits (sweep launch, env fix, seed trim). They differ only in
+# scripts/docs -- the policy code is identical since 0229372590. Extend
+# this list if a retry runs from a newer commit.
+COMMIT_PREFIXES = ["736733d495", "0623366f0e", "dfe209bcbe"]
 ARM_ORDER = ["fcfs", "lpm", "hrrn", "dfs-weight", "boost-g5.0", "boost-g15.0", "boost-ada-j60"]
 STRETCH_UNCACHED_FLOOR_TOKENS = 256
 
@@ -46,10 +50,11 @@ def arm_of(meta: dict) -> str | None:
         return None
     if meta.get("seed") not in SEEDS:
         return None
-    if float(meta.get("in_batch_prefix_caching_max_pin_s") or -1) != 0.0:
+    pin = meta.get("in_batch_prefix_caching_max_pin_s")
+    if pin is None or float(pin) != 0.0:
         return None
     commit = meta.get("sglang_commit") or ""
-    if not commit.startswith(COMMIT_PREFIX):
+    if not any(commit.startswith(p) for p in COMMIT_PREFIXES):
         return None
     policy = meta.get("policy")
     if policy != "boost":
