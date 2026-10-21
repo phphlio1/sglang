@@ -1440,6 +1440,20 @@ class Req(ReqDllmMixin):
         self.device_matched_prefix_tokens_first_admission: Optional[int] = None
         self.host_hit_prefix_tokens_first_admission: Optional[int] = None
 
+        # Boost commit-gate: True while admission is held because the in-flight
+        # chunked prefill (or a waiting request that sorts before this one)
+        # will commit at least one more page of this request's matched prefix
+        # (a later full match instead of an immediate partial re-prefill).
+        # Last-write-wins per sort; the sort position is unchanged, so the hold
+        # is bounded by that one extender, not by later arrivals.
+        self.boost_commit_hold: bool = False
+        # Held sort passes (each pass ~ tens of ms); frozen at admission for
+        # the eval log.
+        self.boost_commit_hold_passes: int = 0
+        # perf_counter stamp of the first hold ever (survives pass toggles and
+        # stash windows); the commit-gate wall cap reads it.
+        self.boost_commit_hold_first_s: Optional[float] = None
+
     def advance_cache_request_handle(self) -> None:
         self.cache_request_handle = dataclasses.replace(
             self.cache_request_handle,

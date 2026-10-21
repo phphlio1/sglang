@@ -3933,6 +3933,7 @@ class Scheduler(
             self.waiting_queue,
             running_batch,
             processed_tokens=self.processed_tokens_counter,
+            chunked_req=self.chunked_req,
         )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
@@ -3948,9 +3949,7 @@ class Scheduler(
             # progress with smaller chunks instead of spinning on the same
             # oversized chunk that never fits.
             avail = self.tree_cache.token_to_kv_pool_allocator.available_size()
-            chunked_prefill_size = min(
-                chunked_prefill_size, max(avail, self.page_size)
-            )
+            chunked_prefill_size = min(chunked_prefill_size, max(avail, self.page_size))
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
             history_len = len(self.chunked_req.prefix_indices)
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
@@ -4014,6 +4013,13 @@ class Scheduler(
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                continue
+
+            # Boost commit-gate: skip admission while the in-flight chunked
+            # prefill is still committing this request's matched prefix. The
+            # sort order is untouched, so the hold ends with that one prefill
+            # (it does not stack behind later arrivals).
+            if req.boost_commit_hold:
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests

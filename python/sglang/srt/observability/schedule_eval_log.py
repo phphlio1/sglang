@@ -163,4 +163,5 @@ class ScheduleEvalLogger:
             ),
             "num_retractions": req.retraction_count,
             "boost_arrival_tokens": req.boost_arrival_tokens,
+            "boost_commit_hold_passes": req.boost_commit_hold_passes,
         }
