@@ -58,9 +58,9 @@ Hai nguồn không join được nhau: `rid` của eval log là id nội bộ se
 |---|---|---|---|---|---|
 | 1 | n done / n wait | đếm P_done / P_wait | — | `test_populations` | 160 (174 − 14 warmup) / 164 (180 − 2 offset − 14 warmup) |
 | 2 | cache hit (%) | eval: `matched_prefix_tokens_first_admission`, `input_len` | `sum(matched)/sum(input_len)` token-weighted | `TestCacheHit` | 13359405/16242867 = 0.82248 → 82.25% |
-| 3 | queue mean/p90/p99 (s) | eval: `queue_wait_s` | percentile nội suy tuyến tính `k=(n−1)·p/100` | `TestPercentile` | n=164: mean 21.916, p90 74.110, p99 112.050 s |
-| 4 | TTFT mean/p95/p99 (ms) | profile: `time_to_first_token` (unit ms) | ms→s→ms khứ hồi | fixture trong `test_metric_values` | mean 27742.32, p95 100988.28, p99 133672.72 ms |
-| 5 | ITL mean/p90/p99 (ms) | profile: `inter_chunk_latency` (mảng gap giữa 2 chunk liên tiếp) | pool toàn bộ chunk của P_done; fallback TPOT `(lat−ttft)/(osl−1)` ghi nhãn `tpot_based` | `TestITL` (cả hai nhánh) | 50265 chunk: mean 90.93, p90 52.56, p99 227.37 ms, source `per_chunk` |
+| 3 | queue mean/p50/p90/p95/p99 (s) | eval: `queue_wait_s` | percentile nội suy tuyến tính `k=(n−1)·p/100` | `TestPercentile` | n=164: mean 21.916, p90 74.110, p99 112.050 s |
+| 4 | TTFT mean/p50/p95/p99 (ms) | profile: `time_to_first_token` (unit ms) | ms→s→ms khứ hồi | fixture trong `test_metric_values` | mean 27742.32, p95 100988.28, p99 133672.72 ms |
+| 5 | ITL mean/p50/p90/p95/p99 (ms) | profile: `inter_chunk_latency` (mảng gap giữa 2 chunk liên tiếp) | pool toàn bộ chunk của P_done; fallback TPOT `(lat−ttft)/(osl−1)` ghi nhãn `tpot_based` | `TestITL` (cả hai nhánh) | 50265 chunk: mean 90.93, p90 52.56, p99 227.37 ms, source `per_chunk` |
 | 6 | tok/s | profile: `output_sequence_length`, `request_start_ns`/`request_end_ns` | `sum(osl) / (end_max − start_min)`, cửa sổ ghi trong output | `TestTokPerS` | 148348 token / 1818.18 s = 81.59 tok/s |
 | 7 | Jain | eval: `queue_wait_s` | `(Σx)²/(n·Σx²)` trên wait | `TestJainOnWait` | 0.339 |
 | 8 | stretch p95/p99 | eval: `queue_wait_s`, `ttft_s`, `input_len − matched_first` | `wait/(ttft−wait)`; population uncached ≥ 256 (floor = k của boost bin); mẫu số ≤ 0 loại + đếm; thiếu `ttft_s` (còn xếp hàng khi đóng cửa sổ) loại + đếm riêng | `TestStretch` (6 case) | n=159: p95 41.01, p99 105.87; dropped_denominator 0, dropped_no_ttft 1 |

@@ -77,6 +77,34 @@ def done_ttfts(run_dir: Path) -> list[float]:
     return ttfts
 
 
+def done_itl_gaps_ms(run_dir: Path) -> tuple[list[float], str]:
+    """Pooled inter-chunk gaps (ms) over P_done, mirroring the spec's ITL
+    row: per-chunk arrays when any record carries one, else TPOT."""
+    gaps: list[float] = []
+    tpot: list[float] = []
+    n_gap_rows = 0
+    for line in (run_dir / "profile_export.jsonl").open():
+        record = json.loads(line)
+        if record.get("error"):
+            continue
+        if (record.get("metadata") or {}).get("benchmark_phase") != "profiling":
+            continue
+        ttft = _time_s(record, "time_to_first_token")
+        lat = _time_s(record, "request_latency")
+        osl = _raw(record, "output_sequence_length")
+        if None in (ttft, lat, osl):
+            continue
+        arr = ((record.get("metrics") or {}).get("inter_chunk_latency") or {}).get(
+            "value"
+        )
+        if isinstance(arr, list):
+            n_gap_rows += 1
+            gaps.extend(arr)
+        if osl >= 2:
+            tpot.append((lat - ttft) * 1000.0 / (osl - 1))
+    return (gaps, "per_chunk") if n_gap_rows else (tpot, "tpot_based")
+
+
 def check(run_dir: Path) -> bool:
     v2 = json.loads((run_dir / "e2_metrics_v2.json").read_text())
     rows = wait_rows(run_dir)
@@ -91,17 +119,25 @@ def check(run_dir: Path) -> bool:
     ttfts = sorted(done_ttfts(run_dir))
 
     q, t = v2["queue_wait_s"], v2["ttft_ms"]
+    gaps_ms, itl_source = done_itl_gaps_ms(run_dir)
+    i = v2["itl_ms"]
     checks = [
         ("n_wait", len(rows), q["n"]),
         ("queue mean", sum(waits) / len(waits), q["mean"]),
+        ("queue p50", _pctile(waits, 0.50), q["p50"]),
         ("queue p90", _pctile(waits, 0.90), q["p90"]),
+        ("queue p95", _pctile(waits, 0.95), q["p95"]),
         ("queue p99", _pctile(waits, 0.99), q["p99"]),
         ("hit", hit, v2["cache_hit"]["rate"]),
         ("jain-qw", jain, v2["jain_queue_wait"]["value"]),
         ("worst5", worst5 / 100, v2["worst5_wait_share_pct"]["value"] / 100),
         ("n_done", len(ttfts), t["n"]),
         ("ttft mean", sum(ttfts) / len(ttfts), t["mean"] / 1000),
+        ("ttft p50", _pctile(ttfts, 0.50), t["p50"] / 1000),
         ("ttft p99", _pctile(ttfts, 0.99), t["p99"] / 1000),
+        ("itl p50", _pctile(gaps_ms, 0.50), i["p50"]),
+        ("itl p95", _pctile(gaps_ms, 0.95), i["p95"]),
+        ("itl p99", _pctile(gaps_ms, 0.99), i["p99"]),
     ]
     ok = True
     print(f"== {run_dir.name}")
@@ -112,7 +148,15 @@ def check(run_dir: Path) -> bool:
         print(f"  {name:<11} indep={mine:<12.4f} v2={theirs:<12.4f} delta={delta:+.6f} {'OK' if good else 'MISMATCH'}")
     starvers = sum(1 for w in waits if w > 1500)
     print(f"  starvers(>1500 s, indep): {starvers}")
-    assert _pctile(waits, 0.5) <= _pctile(waits, 0.9) <= _pctile(waits, 0.99)
+    assert itl_source == i["source"]
+    assert (
+        _pctile(waits, 0.5)
+        <= _pctile(waits, 0.9)
+        <= _pctile(waits, 0.95)
+        <= _pctile(waits, 0.99)
+    )
+    assert _pctile(ttfts, 0.5) <= _pctile(ttfts, 0.95) <= _pctile(ttfts, 0.99)
+    assert _pctile(gaps_ms, 0.5) <= _pctile(gaps_ms, 0.95) <= _pctile(gaps_ms, 0.99)
     assert 0.0 <= jain <= 1.0 and 0.0 <= hit <= 1.0
     return ok
 
