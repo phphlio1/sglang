@@ -508,3 +508,58 @@ Decision rules (pre-registered):
 - Any starver >1500 s OR qw p50 >320 s OR hit <20% -> KILL: the hold
   regresses under the campaign arrival pattern; revert to tie-break-only
   and investigate the hold dynamics.
+
+### Commit-gate validation cell result (2026-10-21, cell 124425, seed 77188)
+
+Same-rule recompute (schedule_eval, warm records input<500 dropped; Jain
+from e2_metrics for consistency with prior verdicts):
+
+| metric            | NEW 032242 | RPT 105838 | GATE 124425 | band            | verdict |
+|--------------------|-----------|-----------|-------------|-----------------|---------|
+| qw p50 s           | 296       | 276       | 252         | V2 [150, 280]   | PASS    |
+| qw p90 s           | 407       | 400       | 414         | --              |         |
+| qw max s           | 457       | 455       | 479         | V1 < 600        | PASS    |
+| starvers >1500 s   | 0         | 0         | 0           | V1 0            | PASS    |
+| hit all / in-win % | 21.9/23.3 | 22.7/23.2 | 23.2/24.8   | V3 [26, 34]     | MISS    |
+| uncached M tok     | 7.67      | 7.53      | 7.65        | V4 <= 7.35      | MISS    |
+| top m>=16k cluster | x5        | x4        | x6          | V4 >= 6         | PASS    |
+| hold records       | 0         | 0         | 27          | V4 >= 5         | PASS    |
+| core m>0 (of 5)    | 0         | 0         | 1 (69879:24544) | V4 >= 3     | MISS    |
+| max hold passes    | 0         | 0         | 47          | V5 < 3000       | PASS    |
+| Jain TTFT          | 0.843     | 0.854     | 0.832       | V1 >= 0.8       | PASS    |
+| TTFT p99 s         | 469       | 462       | 482         | V1 fcfs band    | PASS    |
+| retractions        | 1         | 2         | 2           | --              |         |
+
+Kill rule: no starver, p50 252 <= 320, hit 23.2 >= 20 -> NOT killed. V2
+PASS but V3 MISS -> pre-registered rule: one more seed (42302) before any
+verdict; cell launched after this section was committed.
+
+Mechanism (why V3 missed while the gate itself works):
+- The x6 cluster (m=24618) is six DIFFERENT sessions sharing one
+  24618-token base, batched at its commit boundary (5/6 held, 8-47
+  passes) -- the family-batching mechanism fires as designed.
+- Held records: median m/input 0.72, only 2/27 at >=90%. The matchable
+  portion is the shared base; each session's own multi-turn history past
+  it is unique or already evicted, so admission timing cannot recover it.
+- Top-10 uncached contributors are 2.13M of 7.65M: giant (175k-249k)
+  unique first-turn inputs at m=0-1728. Structural -- no policy can match
+  them; they are absent from RPT's finished set (did not finish there),
+  so record sets differ across cells on content, not just count.
+- Deterministic core: 1/5 recovered (69879 -> 24544). The other four were
+  0 again: their session prefixes were evicted before the continuation
+  arrived. The gate removes the churn SOURCE (partial-prefill waste) but
+  cannot resurrect already-evicted KV.
+- Reading: V3's [26, 34] was calibrated against OLD 30.6, which the rid
+  bug inflated (deferred work skews the finished set toward
+  cache-hitters). The same-rule post-fix R-band [17, 28] contains GATE
+  23.2. The gate's true cache effect on this workload looks like +1-2pp
+  plus family-boundary batching, not a return to 30.
+
+Pre-registered bands for the seed 42302 tiebreak cell (same config,
+commit c559363cf9): hit all [21, 27]; qw p50 [150, 290]; starvers 0;
+qw max < 600; hold records [10, 40]; top m>=16k cluster >= 5; max hold
+passes < 3000. Decision: hit >= 26 -> V3 was seed-noise, gate adopted.
+hit in [21, 25] on both seeds -> V3 bar was mis-calibrated against the
+bug-assisted OLD; adopt on V2 + mechanism evidence (bounded holds,
+boundary batching, no tail regression) with the honest cache statement
+(+1-2pp, not +8pp). Any kill-rule trip -> revert to tie-break-only.
