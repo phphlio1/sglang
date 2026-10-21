@@ -632,3 +632,44 @@ the lower (starvers, p90, TTFT p99) at p50 within 30 s of the other;
 ties -> keep the prior verdict's j15. Kill trip on j15 only -> adopt
 j60. Kill on both -> adaptive gamma needs the OOM guard work before any
 H200 use; static g5.0 + gate stands as the complete configuration.
+
+### J-grid rerun result (2026-10-21, cells 144214 j15 / 153643 j60)
+
+Same-rule recompute vs the pre-fix j-cells (Oct 20):
+
+| metric        | j15 pre | j15 GATE | j60 pre | j60 GATE | band           | verdict        |
+|---------------|---------|----------|---------|----------|----------------|----------------|
+| qw p50 s      | 159     | 274      | 137     | 248      | W2 [120, 260]  | j60 in, j15 miss (14 s) |
+| qw p90 s      | 549     | 384      | 279     | 375      | W3 j60 < j15   | PASS           |
+| qw max s      | 1510    | 470      | 1726    | 426      | W1 < 1800      | PASS           |
+| starvers      | 1       | 0        | 1       | 0        | W1 <= 1        | PASS           |
+| hit all %     | 38.2    | 24.1     | 35.3    | 25.4     | W4 [28, 42]    | MISS both      |
+| holds n / max | 0 / 0   | 30 / 53  | 0 / 0   | 25 / 52  | W5 [5,40]/<3k  | PASS           |
+| TTFT p99 s    | 953     | 480      | 1186    | 455      | W6 < 1300      | PASS           |
+| Jain (harness)| --      | 0.846    | --      | 0.844    | --             |                |
+
+Kill rule: no trip on either cell. Pre-registered decision rule -> j60
+WINS: p90 375 < 384, TTFT p99 455 < 480, p50 inside the 30 s window
+(248 vs 274, better on all three). ADOPT j60 as the adaptive J.
+
+W4 (and j15's W2) misses repeat the V3 lesson a third time: bands
+calibrated against pre-fix cells are calibrated against bug-flattered
+numbers (rid tie-break: OLD 30.6 hit / 143 p50; pre-fix adaptive 35-38
+hit / 137-159 p50). Post-fix adaptive+gate lands where static+gate lands
+(p50 248-274, hit 24-25), +1-2 pp over static. Standing rule from here:
+only post-fix cells calibrate bands.
+
+Reading: adaptive buys nothing over static g5.0 on this seed at c16
+(p50 248-274 vs 252; TTFT p99 455-480 vs 482). The gate holds under
+adaptive gamma too: 25-30 holds, max 52 passes, and j60's x11 boundary
+cluster (m=25024) is the largest family batch seen in any cell.
+
+Boost completeness on RTX6000 after this verdict: core policy, arrival
+tie-break, commit-gate (adopted), adaptive J=60 -- implemented,
+unit-tested (72/72), and validated on the overload seed across five
+post-fix cells (3 static + 2 adaptive). Remaining optional: the g15 OOM
+guard (A/B/C in the phase-1 doc) if a high-gamma arm is ever run; not
+needed for the validated configurations (g5.0 static, j60 adaptive).
+Baseline reruns and the metrics_v2 sweep stay deferred per scope. H200
+phase 2 is unlocked by the standing sequencing rule; the driver edit and
+submit stay with the user.
