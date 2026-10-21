@@ -409,3 +409,50 @@ run-to-run noise; family batching is a robustness fix. Same pattern
 reproduces (top <=5, several mid-session zeros) -> the tie-break
 systematically biases admission toward the cascade; the fix is required
 regardless.
+
+### Variance-bound repeat cell result (2026-10-21, cell 105838, same config as 032242)
+
+Cell c16_g5.0_wall_k256_20261021_105838 (seed 77188, gamma 5.0, bin 256,
+wall clock, pin=0, commit 413514ef3d -- identical to 032242). Same-rule
+recompute over all three cells (schedule_eval per-request; warm records
+input<500 dropped):
+
+| metric            | OLD 181256 | NEW 032242 | RPT 105838 | R-band        | verdict |
+|--------------------|-----------|-----------|-----------|---------------|---------|
+| qw p50 s           | 143       | 296       | 276       | [223, 371]    | inside  |
+| qw p90 s           | 377       | 407       | 400       | [305, 509]    | inside  |
+| qw mean s          | 212       | 242       | 238       | --            |         |
+| qw max s           | 1870      | 457       | 455       | < 600         | inside  |
+| starvers >1500 s   | 2         | 0         | 0         | 0             | inside  |
+| hit all / in-win % | 30.6/31.0 | 21.9/21.6 | 22.7/22.2 | [17, 28]      | inside  |
+| uncached M tok     | 7.15      | 7.67      | 7.53      | --            |         |
+| top m>=16k cluster | x10       | x5        | x4        | >=7 / <=5     | <=5     |
+| retractions        | 3         | 1         | 2         | --            |         |
+| drain arrival-mono | no (rid)  | yes       | tie only  | yes           | pass*   |
+| Jain TTFT          | 0.437     | 0.843     | 0.854     | --            |         |
+| TTFT p99 s         | 1699      | 474       | 466       | fcfs band     |         |
+
+* RPT drain non-decreasing except one simultaneous-arrival tie (two reqs
+  at arr=2270 s) -- not an inversion.
+
+Decision rule (pre-registered): inside R2/R3 AND outside the old bands
+(p50 276 vs 143; hit 22.7 vs 30.6) -> the body costs are REAL on n=2 ->
+the redesign gate OPENS. The tail verdict is stable: 0 starvers, Jain
+0.85, TTFT p99 in the fcfs band.
+
+R5 detail (cross-cell pairing, same input +-5, matched tokens per cell):
+a DETERMINISTIC core loses its matches in BOTH post-fix cells --
+in=27270 [23622/0/0], 25774 [24576/0/0], 111698 [32768/0/0], 69879
+[18729/0/0], 112236 [16384/0/0] -- ~110k matched tokens gone in every
+post-fix run; plus run-to-run sprinkling in BOTH directions (RPT-only
+zeros: 31169, 28924, 31692, 29962, 31766; RPT recoveries vs NEW: 93627
+0->21997, 103744 0->25709, 68991 ->62236). Reading: the post-fix
+admission pattern systematically starves a specific set of continuations
+(the cascade's deterministic core), and noise decides the rest. The
+commit-gate redesign targets both: full matches remove the +0.4M
+uncached delta, and the reduced KV churn keeps the core's session
+prefixes alive.
+
+Task note: the background waiter reported "failed exit 1" -- that was the
+waiter epilogue's own cwd bug (tail/ls from the wrong directory), not the
+cell; the cell itself exited 0 ("RUN DONE" 11:53:22).
