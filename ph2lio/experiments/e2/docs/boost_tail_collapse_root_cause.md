@@ -345,3 +345,67 @@ admits spread out in arrival order, and members admitted while the head is
 still chunk-prefilling match only the committed prefix (partial, differing
 values), while the old rid-order drain admitted the whole family at once
 after the head finished (uniform full match).
+
+### Fan-out family trace (2026-10-21, passes 1-4, before the repeat cell completed)
+
+schedule_eval per-request pairing (same seed, same inputs) plus the
+server_metrics series. Two results: a correction to the P5 reading, and
+the cluster-shrink mechanism.
+
+Correction: the "9 siblings x 22,622 admitted 2711-2779 s" drain-burst
+claim above is wrong for this cell. The >2500 s drain admits are all
+match=0 (the stuck trio plus two fresh); the 22,622 cluster is 8 members
+admitted IN-WINDOW at 1575-2514 s with full matches and 113-371 s waits.
+The old cell's hit advantage is real in-window dedup efficiency, not a
+drain artifact. (The other half of "old speed was the bug" still holds:
+the trio's ~195k of fresh prefill was deferred past the window edge.)
+
+Mechanism, evidence per link:
+
+1. Trunk timing seeds everything. Session trunk in=30569 admits 923 (OLD)
+   vs 1037 (NEW) -- 114 s apart with the pool at usage 0.97-0.99 (first
+   giant phase). The trunk is a head (match=0, no dedup): its sort position
+   is identical in both cells, so the gap is admission-budget jitter at
+   the knee, not the tie-break. Its early followers then straddle the
+   trunk's prefill: the in=30186 twins admit 964/964 (OLD -- trunk
+   committed, full match 27373 x2) vs 1041/1044 (NEW -- trunk mid-flight,
+   partial 23431 and 27685 three seconds apart: progressive page commits).
+2. Partial matches cost real prefill: each early follower pays its
+   unmatched 4-17k tokens fresh instead of hitting cache.
+3. The extra uncached work raises KV pressure and the radix tree evicts
+   idle session prefixes: mid-session continuations that matched 23-25k in
+   OLD match 0 in NEW (in=27268 [OLD 23622], 25773 [24576], 28611 [24673],
+   30476 [24576 -- its own session matched 24-28k at 2300-2400, zero by
+   2629: the prefix was evicted in the ~200 s between turns), and family-B
+   branches lose their 22k matches wholesale (in=93625, 103742, 69877).
+   Retraction is ruled out (OLD 3, NEW 1). Both cells run the same 545k
+   pool at the knee (usage 0.8-0.99, evictable often <50k; NEW touches
+   evictable=0 at t=901/1041/2222).
+4. Totals: NEW prefilled ~7.49M uncached tokens vs OLD ~6.98M (+7%) while
+   serving 0.5M LESS total input -- at the knee that is the -6% throughput,
+   the ~2x median wait (P4) and the -9pp hit (P5).
+
+Reading: the tie-break fix does not CAUSE the body cost -- it removes an
+accidental admission timing that happened to land on the lucky side of a
+noise-seeded cascade (n=1). The old cell's real edge was followers that
+(by that run's budget jitter) admitted just after their trunks committed,
+giving full matches. The systematic fix makes that timing deterministic:
+gate a follower's admission on its leader's KV commit (hold set released
+by the commit event) instead of placing it behind the leader's first
+chunk -- match completeness stops depending on budget jitter, the dedup
+win is recovered by construction, and the displacement bound is one
+leader prefill duration (seconds), with the pin valve bounding the
+hold against later arrivals. This supersedes the "smaller family batches
+per pass" sketch: batch the family at the leader's commit boundary.
+Caveat: eviction severity is rig-config-dependent -- the H200 production
+config has hicache 128G write-back, which would soften link 3 (evicted
+prefixes reload from host instead of missing).
+
+R5 (pre-registered before the repeat cell completes): count same-match
+clusters (m>=16k) and mid-session zero-matches (continuations whose
+session has earlier served turns). Repeat cell materially different from
+032242 (top cluster >=7 or mid-session zeros <=1) -> the cascade seed is
+run-to-run noise; family batching is a robustness fix. Same pattern
+reproduces (top <=5, several mid-session zeros) -> the tie-break
+systematically biases admission toward the cascade; the fix is required
+regardless.
