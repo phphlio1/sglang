@@ -719,3 +719,20 @@ load and all 5 post-fix local cells are OOM-free, with the local
 PrefillBudget guard (survived 12 pool-1.00 events) also in place. It
 stays a phase-2 item only if a near-FCFS-dynamics arm (incl. the fcfs
 baseline) runs at c64 on H200; watch for OOM in the fcfs cell here.
+
+Sweep verification protocol (set before the sweep landed, user request
+to double-check all numbers): (1) metrics_v2.py per cell (28/28 unit
+tests green); (2) analysis/cross_check_metrics_v2.py per cell -- an
+independent re-implementation of the populations from the spec, must
+exit 0 (all core deltas 0.000000 on both anchor cells 124425/153643);
+(3) sanity assertions: percentile monotonicity, Jain/hit in [0,1],
+independent starver count; (4) only then the S1-S5 evaluation.
+Population note: the crude same-rule numbers in the V/W verdict tables
+above (e.g. hit 23.2% on 124425) used the input>=500 filter over all
+lines; the v2 canonical P_wait (offset slice + health-check drop +
+scrape-based warmup cut + valid queue_wait) gives hit 28.5% on the same
+cell (n 106 -> 91). Within-boost verdict tables compared like with like
+and stand; the sweep table uses the v2 canonical population for every
+arm. Writing the independent check caught two bugs in the CHECK itself
+(unit "tokens" handled as None, percentile floor instead of
+interpolation) -- both fixed, the instrument had none.
