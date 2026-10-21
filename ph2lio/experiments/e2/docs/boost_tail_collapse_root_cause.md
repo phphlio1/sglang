@@ -563,3 +563,72 @@ hit in [21, 25] on both seeds -> V3 bar was mis-calibrated against the
 bug-assisted OLD; adopt on V2 + mechanism evidence (bounded holds,
 boundary batching, no tail regression) with the honest cache statement
 (+1-2pp, not +8pp). Any kill-rule trip -> revert to tie-break-only.
+
+### Commit-gate tiebreak cell: regime discovery, adopt decision (2026-10-21, cell 134335, seed 42302)
+
+The pre-registered tiebreak is INAPPLICABLE: the cell never reaches the
+overload regime the bands describe. Same-rule recompute:
+
+| metric              | GATE 77188 (124425) | GATE 42302 (134335) |
+|---------------------|---------------------|---------------------|
+| n                   | 106                 | 233                 |
+| qw p50/p90/max s    | 252/414/479         | 0/15/155            |
+| starvers            | 0                   | 0                   |
+| hit all/in-win %    | 23.2/24.8           | 82.6/80.9           |
+| uncached M tok      | 7.65                | 3.86                |
+| retractions         | 2                   | 7                   |
+| holds n / max pass  | 27 / 47             | 6 / 6               |
+| held median m/input | 0.72                | 0.97                |
+| TTFT p99 s          | 482                 | 137                 |
+
+The regime is seed-intrinsic, not gate-caused. Campaign seeds at c16
+(g15 cells Oct 20, same rule): 77188 p50 177 hit 29.0 (overload);
+42302 p50 0 hit 83.2; 94815 p50 0 hit 77.1. Only seed 77188 saturates
+the server at c16. The tiebreak pre-registration picked a seed that
+never reaches the saturation knee, so neither decision branch (noise vs
+mis-calibration) applies. Kill rule not tripped (0 starvers, p50 0,
+hit 82.6 >= 20).
+
+What the cell does establish: gate safety in the unsaturated regime.
+Six holds, max 6 passes, median held match 97% of input, TTFT p99 137 s,
+no starver -- the gate is quiet when the server is ahead and releases
+followers at full match.
+
+DECISION (criteria stated 2026-10-21: TTFT and starvation primary, a
+small cache/throughput trade acceptable): ADOPT the commit-gate. Basis:
+V1/V2 PASS on the overload seed (p50 252 vs 276/296 no-gate, 0 starvers,
+Jain 0.832, TTFT p99 482), mechanism verified (boundary batching, x6
+cluster, bounded holds), and light-regime safety shown here. Cache
+statement stays honest: +1.3 pp under overload against a no-gate
+same-seed band of 21.9-22.7, zero cost unsaturated; how much of the
++1.3 pp is systematic stays open and does not gate adoption. The J-grid
+rerun below adds two more overload-regime samples with holds.
+
+Boost completeness after adoption: J-grid rerun (bands below) and the
+g15 OOM guard decision remain; baseline reruns and the metrics_v2 sweep
+are deferred per scope.
+
+### J-grid rerun pre-registration (j15/j60, clean base + commit-gate, 2026-10-21 pre-launch)
+
+Cells: c16 seed 77188 pin=0, BOOST_GAMMA=0.09 adaptive, J=15 and J=60,
+HEAD 496efe4c45 (tie-break fix + commit-gate). Prior j-cells (Oct 20,
+pre-fix base): j15 p50 159 / p90 549 / max 1510 / starv 1 / hit 38.2 /
+TTFT p99 953; j60 p50 137 / p90 279 / max 1726 / starv 1 / hit 35.3 /
+TTFT p99 1186 (tail giant-bound: the 175k-249k inputs set the p99).
+
+Bands registered BEFORE launch:
+
+| band | metric        | prediction      | basis |
+|------|---------------|-----------------|-------|
+| W1   | starvers      | <= 1, max < 1800 | pre-fix had 1 each; fix+gate removed them on static |
+| W2   | qw p50 s      | [120, 260]      | adaptive pre-fix 137-159; static post-fix 252-296 |
+| W3   | qw p90 s      | j60 < j15       | pre-fix 279 vs 549, structural (bigger jump caps tail) |
+| W4   | hit all %     | [28, 42]        | adaptive pre-fix 35-38; gate shifts it either way by 1-2 pp |
+| W5   | holds         | n in [5, 40], max passes < 3000 | gate fires under adaptive, stays bounded |
+| W6   | TTFT p99 s    | < 1300          | pre-fix 953-1186, giant-bound |
+
+Decision: no kill trip on either cell -> the better J is the one with
+the lower (starvers, p90, TTFT p99) at p50 within 30 s of the other;
+ties -> keep the prior verdict's j15. Kill trip on j15 only -> adopt
+j60. Kill on both -> adaptive gamma needs the OOM guard work before any
+H200 use; static g5.0 + gate stands as the complete configuration.
