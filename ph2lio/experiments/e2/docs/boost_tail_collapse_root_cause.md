@@ -456,3 +456,55 @@ prefixes alive.
 Task note: the background waiter reported "failed exit 1" -- that was the
 waiter epilogue's own cwd bug (tail/ls from the wrong directory), not the
 cell; the cell itself exited 0 ("RUN DONE" 11:53:22).
+
+### Commit-gate v2: design, smoke evidence, validation-cell pre-registration (2026-10-21, pre-launch)
+
+Design (commit 48ff53383f): batch the family at the extender's commit
+boundary. After the boost sort, a request is marked boost_commit_hold
+while an earlier extender -- the in-flight chunked prefill (calc_priority
+now takes scheduler.chunked_req) or a waiting request that sorts before
+it -- will commit at least one more page (256 tokens) of its matched
+prefix (frontier fingerprint: the 256 tokens just past the current match
+point). The admission scan skips held requests without reordering, so
+displacement is bounded by one extender's prefill and never stacks behind
+later arrivals. Two bounds: the pin valve stays authoritative for pinned
+followers; a 120 s wall cap (BOOST_COMMIT_GATE_MAX_HOLD_S) covers pin=0
+and never binds on legit holds (largest trunks ~60 s).
+
+Smoke (1x RTX6000, 44,992-token shared base, trunk 45,046 + 2 siblings;
+pre-fix both siblings admitted at ~16k random partials): v2 sibling
+sorted first m=40,960 (91% of share, hold 4 passes), sibling sorted
+second m=44,992 FULL match (hold 5 passes, chained behind the first
+sibling's prefill too). Known leak, accepted: a trunk's final chunk
+reaches the radix tree one pass after chunk completion (chunked_req
+clears at the prefill->decode transition; the final insert lags), so the
+FIRST sibling admitted in that gap keeps <= 1 chunk (8,192 tokens) of
+partial match. Bounded per family; later siblings chain to full. Left
+open on purpose: closing it means touching the chunk-completion insert
+path in the scheduler, out of proportion to <= 8k tokens per family.
+
+Validation cell c16_g5.0_wall_k256 seed 77188 pin=0 commit 48ff53383f
+(same config and rule as OLD 181256 / NEW 032242 / RPT 105838). Bands
+registered BEFORE launch:
+
+| band | metric                  | prediction  | basis |
+|------|-------------------------|-------------|-------|
+| V1   | starvers >1500 s        | 0           | a hold ends with one extender's prefill (<=~60 s); tail already clean at 0 |
+| V1   | qw max s                | < 600       | same bound |
+| V1   | Jain TTFT / p99 s       | >=0.8 / fcfs band | holds add bounded wait, no reordering |
+| V2   | qw p50 s                | [150, 280]  | OLD 143 was rid-bug-assisted (195k deferred); post-fix floor 276-296; the gate buys back the median without the bug |
+| V3   | hit all %               | [26, 34]    | OLD 30.6, post-fix 21.9-22.7; deterministic core ~110k tokens + family batching |
+| V4   | hold_passes>0 records   | >= 5        | the gate must fire under campaign load |
+| V4   | top m>=16k cluster      | >= 6        | post-fix x4/x5; OLD x10 partly bug-assisted, >=6 is the honest recovery bar |
+| V4   | deterministic core m>0  | >= 3 of 5   | the 5 core continuations (in 27270, 25774, 111698, 69879, 112236, pairing input +-5) were 0 in BOTH post-fix cells; less churn -> less eviction -> partial recovery |
+| V4   | uncached M tok          | <= 7.35     | post-fix 7.53-7.67, OLD 7.15 |
+| V5   | max hold_passes         | < 3000      | the 120 s cap / ~40 ms pass ~= 3000; at the cap means an extender churned without committing |
+
+Decision rules (pre-registered):
+- V2 AND V3 inside -> commit-gate adopted; boost complete on RTX6000 ->
+  J-grid rerun (j15/j60) next, then H200 phase 2.
+- V2 or V3 missed -> one more seed (42302) to separate noise from
+  systematic before any verdict.
+- Any starver >1500 s OR qw p50 >320 s OR hit <20% -> KILL: the hold
+  regresses under the campaign arrival pattern; revert to tie-break-only
+  and investigate the hold dynamics.
