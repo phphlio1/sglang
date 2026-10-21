@@ -315,3 +315,33 @@ the tail lives in the dedup layer, not the ranking; gamma is not the tail
 knob on either rig. Known config delta for any cross-rig read: local
 campaign pin=0, H200 pin=60. The g15.0 crash is a separate defect (hard
 pool exhaustion -> OOM backout spin -> CUDA IMA; g15_oom_crash_root_cause.md).
+
+### Variance-bound repeat cell (pre-registered before launch, 2026-10-21)
+
+P4 (qw p50 144 -> 297 s) and P5 (hit 31.2 -> 22.3%) rest on n=1 per arm.
+This cell repeats the 032242 config exactly (seed 77188, gamma 5.0, bin 256,
+wall clock, pin=0, c16, commit 413514ef3d) to bound run-to-run noise before
+any redesign decision. Comparison recipe identical (drop HEALTH, drop the
+first 60 s of arrivals).
+
+Predictions, written before launch:
+- R1 starvers stay 0, max wait < 600 s.
+- R2 qw p50 in [223, 371] s (297 +/- 25%), p90 in [305, 509] s (407 +/- 25%).
+- R3 scheduler-side hit in [17, 28]% (22.3 +/- 5pp).
+- R4 final drain admits arrival-monotone.
+
+Decision rule, pre-registered:
+- Inside R2/R3 and outside the old bands (p50 ~144, hit ~31): the body/hit
+  costs are real on n=2 -> the redesign gate opens (split family admission
+  per pass).
+- Back in the old bands (p50 <= 190 s or hit >= 29%): the 032242 regressions
+  were run-to-run noise -> P4/P5 reopen, no redesign.
+- Otherwise mixed: one more seed before deciding.
+
+Parallel analysis while the cell runs (no new run needed): trace one
+fan-out family through both cells (181256 vs 032242) to pin the
+cluster-shrink mechanism -- hypothesis: with arrival tie-break the family
+admits spread out in arrival order, and members admitted while the head is
+still chunk-prefilling match only the committed prefix (partial, differing
+values), while the old rid-order drain admitted the whole family at once
+after the head finished (uniform full match).
