@@ -244,6 +244,56 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_not_called()
         self.mock_tree_cache.init_load_back.assert_not_called()
 
+    def test_boost_reservation_leftover_rejects_second_unfinished_chunk(self):
+        # Crash regression (sweep cell 20261021_204403, boost policy): the
+        # chunk reservation caps the in-flight chunk, and whatever keeps the
+        # reserved budget unspent (e.g. a commit-gate-held request skipped by
+        # the admission scan) leaves room for a waiting request that does
+        # not fit whole. Starting it as a second tracked chunked prefill
+        # kills the scheduler on `assert self.chunked_req is None`.
+        override = get_context().override_server_args(schedule_policy="boost")
+        override.install()
+        self.addCleanup(override.restore)
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 65536
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=256,
+            rem_input_tokens=50000,
+            rem_chunk_tokens=4096,
+        )
+        policy = SchedulePolicy(
+            policy="boost",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        continuation = self.create_shared_req("continuation")
+        continuation.full_untruncated_fill_ids = list(range(16384))
+        held = self.create_shared_req("held")
+        held.origin_input_ids = list(range(512))
+        held.num_matched_prefix_tokens = 0
+        big = self.create_shared_req("big")
+        big.origin_input_ids = list(range(16385))
+        big.full_untruncated_fill_ids = list(range(16385))
+        big.num_matched_prefix_tokens = 0
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+            continuation, [held, big], adder.rem_chunk_tokens, adder.page_size
+        )
+        self.assertIs(adder.add_chunked_req(continuation), continuation)
+        # The held request never reaches the adder, so its reserved tokens
+        # stay unspent when the oversized request is scanned.
+        self.assertEqual(adder.rem_chunk_tokens, 512)
+        self.assertEqual(
+            adder.add_one_req(big, has_chunked_req=True, truncation_align_size=None),
+            AddReqResult.OTHER,
+        )
+        self.assertEqual(adder.can_run_list, [continuation])
+        self.assertIsNone(adder.new_chunked_req)
+        big.set_extend_range.assert_not_called()
+
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
         req = self.create_shared_req("host-miss")
