@@ -515,6 +515,15 @@ meta = {
     # 1 = ensure_server was forced to stop a spec-matching server so this
     # cell starts from a cold radix cache.
     "server_force_restart": __import__("os").environ.get("FORCE_RESTART", "0") == "1",
+    # NSys daemon-mode window (profile_cell.sh NSYS_PROFILE=1 cells);
+    # false/null on unprofiled cells.
+    "nsys_profile": __import__("os").environ.get("NSYS_PROFILE", "0") == "1",
+    "nsys_session": __import__("os").environ.get("NSYS_SESSION_NAME"),
+    "nsys_delay_s": (
+        int(__import__("os").environ["NSYS_DELAY_S"])
+        if __import__("os").environ.get("NSYS_DELAY_S")
+        else None
+    ),
     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
 }
 Path(sys.argv[1]).write_text(json.dumps(meta, indent=2) + "\n")

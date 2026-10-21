@@ -33,6 +33,14 @@
 #                          land under <run_dir>/torch_traces; GBs on /shared)
 #   EXTRA_PYSPY_PATTERNS   extra pgrep -f patterns to flame, space-separated
 #                          (e.g. 'sglang::detokenizer'); default none
+#   NSYS_PROFILE           1 = wrap the engine in `nsys launch` (daemon mode,
+#                          collection OFF until the window below) and collect
+#                          one CUDA+NVTX window around the py-spy attach —
+#                          memcpy/kernel/graph-exec evidence per rank; default
+#                          0 = engine command byte-identical, no nsys at all
+#   NSYS_DELAY_S           delay from aiperf start to the probe window; steers
+#                          BOTH nsys and py-spy so the windows coincide;
+#                          default = STEADY_STATE_DELAY_S (120)
 #
 # Pre-flight, once on a booted server before spending a real cell:
 #   /shared/loipp/venv-server/bin/py-spy dump --pid <one scheduler pid>
@@ -164,6 +172,15 @@ PYSPY_RATE="${PYSPY_RATE:-25}"
 PYSPY_DURATION_S="${PYSPY_DURATION_S:-120}"
 PROFILE_STEPS="${PROFILE_STEPS:-30}"
 STEADY_STATE_DELAY_S="${STEADY_STATE_DELAY_S:-120}"
+# NSys window (NSYS_PROFILE=1 cells): delay from aiperf start to the probe
+# window, steering BOTH nsys and py-spy so the GPU window coincides with the
+# python window. Defaults to the steady-state delay (the original probe
+# placement). Exported for the engine wrap (session name) and run_meta.
+NSYS_DELAY_S="${NSYS_DELAY_S:-${STEADY_STATE_DELAY_S}}"
+if [[ "${NSYS_PROFILE:-0}" == "1" ]]; then
+  export NSYS_SESSION_NAME="e2nsys-${SLURM_JOB_ID:-$(date +%Y%m%d_%H%M%S)}"
+  export NSYS_DELAY_S
+fi
 # 900 covers a cold-mirror boot end to end: frontend :8888 answers /health
 # within seconds (before any worker registers), so with the readiness gate
 # below the clock starts at true readiness and aiperf's command.txt lands
@@ -174,6 +191,14 @@ PROBE_WAIT_TIMEOUT_S="${PROBE_WAIT_TIMEOUT_S:-900}"
 PROBE_PIDS=()
 
 cleanup_probes() {
+  # Finalize the nsys report FIRST (needs the session alive); plain `nsys
+  # stop` keeps the engine running. Never `nsys shutdown` here — its default
+  # --kill=sigterm would take the engine down with it.
+  if [[ "${NSYS_COLLECTING:-0}" == "1" ]]; then
+    timeout 900 nsys stop --session="${NSYS_SESSION_NAME:-}" \
+      >>"${probe_dir:-/tmp}/nsys/nsys_stop.log" 2>&1 || true
+    NSYS_COLLECTING=0
+  fi
   local pid
   for pid in "${PROBE_PIDS[@]:-}"; do
     kill "${pid}" 2>/dev/null || true
@@ -223,8 +248,8 @@ until [[ -f "${run_dir}/command.txt" ]]; do
   sleep 5
 done
 if [[ -f "${run_dir}/command.txt" ]]; then
-  echo "probing run dir: ${run_dir} (steady state in ${STEADY_STATE_DELAY_S}s)"
-  sleep "${STEADY_STATE_DELAY_S}"
+  echo "probing run dir: ${run_dir} (probe window in ${NSYS_DELAY_S}s)"
+  sleep "${NSYS_DELAY_S}"
 else
   echo "WARN: aiperf did not start within ${PROBE_WAIT_TIMEOUT_S}s; probes skipped" >&2
   wait "${RUN_PID}" || true
@@ -233,6 +258,37 @@ fi
 
 probe_dir="${run_dir}/profiling"
 mkdir -p "${probe_dir}"
+
+# NSys collection window: start BEFORE the py-spy attach so the GPU window
+# fully covers the python window. The report goes node-local first (/mnt is
+# /dev/md0; /shared is NFS and `nsys stop` BLOCKS on the finalize) and is
+# copied into the run dir at cell end, outside any measurement.
+# --sample/--cpuctxsw none: without them `nsys start` defaults CPU sampling
+# to process-tree — a duplicate of py-spy plus report bloat.
+if [[ "${NSYS_PROFILE:-0}" == "1" ]]; then
+  mkdir -p "${probe_dir}/nsys"
+  if [[ -d "${NODE_LOCAL}" ]]; then
+    NSYS_REPORT_DIR_LOCAL="${NODE_LOCAL}/nsys/${NSYS_SESSION_NAME}"
+  else
+    NSYS_REPORT_DIR_LOCAL="${probe_dir}/nsys"
+  fi
+  mkdir -p "${NSYS_REPORT_DIR_LOCAL}"
+  NSYS_STAMP="$(date +%Y%m%d_%H%M%S)"
+  NSYS_REPORT_LOCAL="${NSYS_REPORT_DIR_LOCAL}/engine_${NSYS_STAMP}.nsys-rep"
+  if timeout 120 nsys start --session="${NSYS_SESSION_NAME}" \
+      -o "${NSYS_REPORT_LOCAL}" --force-overwrite=true \
+      --sample=none --cpuctxsw=none \
+      >"${probe_dir}/nsys/nsys_start.log" 2>&1; then
+    NSYS_COLLECTING=1
+    # wall-clock anchors: phase-B joins nsys ns-since-collection-start
+    # (≈ the nsys_start anchor) with schedule_eval arrival times.
+    printf '%s nsys_start %s\n' "$(date +%s.%N)" "${NSYS_REPORT_LOCAL}" \
+      >>"${probe_dir}/nsys/nsys_window.log"
+    echo "nsys window started: session=${NSYS_SESSION_NAME} -> ${NSYS_REPORT_LOCAL}"
+  else
+    echo "WARN: nsys start failed; see ${probe_dir}/nsys/nsys_start.log" >&2
+  fi
+fi
 
 # py-spy: one flame per scheduler process (8 on either arm). Attach
 # failures (ptrace scope) are warned per pid, not fatal.
@@ -271,6 +327,19 @@ for pid in "${PROBE_PIDS[@]:-}"; do
   fi
 done
 
+# End the nsys window right after the py-spy reap: `nsys stop` keeps the
+# engine running and blocks only until the node-local report is finalized.
+if [[ "${NSYS_COLLECTING:-0}" == "1" ]]; then
+  printf '%s nsys_stop\n' "$(date +%s.%N)" >>"${probe_dir}/nsys/nsys_window.log"
+  if timeout 900 nsys stop --session="${NSYS_SESSION_NAME}" \
+      >"${probe_dir}/nsys/nsys_stop.log" 2>&1; then
+    NSYS_COLLECTING=0
+    echo "nsys report ready: ${NSYS_REPORT_LOCAL} ($(du -h "${NSYS_REPORT_LOCAL}" 2>/dev/null | cut -f1))"
+  else
+    echo "WARN: nsys stop failed or timed out; see ${probe_dir}/nsys/nsys_stop.log" >&2
+  fi
+fi
+
 # The boot log lives in the sweep tree (start_server writes there); link it
 # next to the run so bottleneck_report.py finds it without copying GBs.
 newest_server_log="$(ls -t "${RESULTS_ROOT}/${POLICY}"/server_*.log 2>/dev/null | head -1 || true)"
@@ -289,4 +358,15 @@ if [[ "${ARM}" == "dynamo" ]]; then
 fi
 
 wait "${RUN_PID}"
+
+# Copy the node-local nsys report into the run dir now that the benchmark is
+# over — the NFS copy runs outside any measurement window. If the cell failed
+# above, the report stays node-local at the path the nsys echo already logged.
+if [[ -n "${NSYS_REPORT_LOCAL:-}" && -f "${NSYS_REPORT_LOCAL}" ]]; then
+  if cp -v "${NSYS_REPORT_LOCAL}" "${probe_dir}/nsys/"; then
+    echo "nsys report archived: ${probe_dir}/nsys/$(basename "${NSYS_REPORT_LOCAL}")"
+  else
+    echo "WARN: nsys report copy failed; node-local copy kept at ${NSYS_REPORT_LOCAL}" >&2
+  fi
+fi
 echo "=== PROFILING CELL DONE: ${run_dir} ==="

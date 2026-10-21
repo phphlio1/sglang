@@ -166,7 +166,32 @@ FRONTEND_PID=$!
 #    UNRESOLVED input record (our resolution lives in an overlay, the input
 #    field stays None), so the auto default crashes KvEventPublisher
 #    (smoke 3190). Explicit input = dynamo reads 64.
-"${PY}" -m dynamo.sglang \
+# Optional NSys daemon-mode wrap (NSYS_PROFILE=1, set by profile_cell.sh):
+# `nsys launch` starts the app under injection in a named session; collection
+# stays OFF until `nsys start --session=<name>` from the cell script, so boot
+# (weight load, JIT, CUDA-graph capture) runs unprofiled and only the serving
+# window is collected. Default off = byte-identical engine command.
+#   --session-new : creates the session (plain --session= requires an
+#                   already-listed session; nsys launch --help)
+#   -t cuda,nvtx  : CUDA API+activity (memcpy/kernel/graph-exec) + NVTX only;
+#                   no osrt/CPU sampling (py-spy covers python CPU)
+#   --cuda-graph-trace=graph : whole-graph exec records. SGLang captures its
+#                   decode AND breakable-prefill graphs during BOOT, before
+#                   collection starts, so node granularity cannot instrument
+#                   them (and adds heavy per-node overhead per the help).
+#                   NOT --trace-fork-before-exec: its own help warns of
+#                   undefined behavior (boot-crash risk) and the mp-spawned
+#                   schedulers are covered by the default process-tree scope.
+if [[ "${NSYS_PROFILE:-0}" == "1" ]]; then
+  NSYS_SESSION_NAME="${NSYS_SESSION_NAME:-e2nsys-$(date +%Y%m%d_%H%M%S)}"
+  export NSYS_SESSION_NAME
+  NSYS_LAUNCH=(nsys launch --session-new="${NSYS_SESSION_NAME}" \
+    -t cuda,nvtx --cuda-graph-trace=graph)
+else
+  NSYS_LAUNCH=()
+fi
+
+"${NSYS_LAUNCH[@]}" "${PY}" -m dynamo.sglang \
   --model-path="${GLM_MODEL_PATH}" \
   --served-model-name="${SERVED_MODEL_NAME}" \
   --quantization=w4afp8 \
