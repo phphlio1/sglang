@@ -271,3 +271,47 @@ through both cells' server_metrics_export.jsonl to pin the
 cluster-shrink mechanism. Campaign view on the clean base: boost g5.0
 p99 474 s ~ fcfs 461, < lpm 716 << dfs-weight 1123, 0 starvation, best
 Jain -- the e2 tail goal is met; the open question is the body cost.
+
+### H200 phase-1 contamination scan (2026-10-21, server HEAD a9d2b9ecd8)
+
+Question: the H200 phase-1 gamma sweep ran on a base WITHOUT the arrival
+tie-break fix (a9d2b9ecd8 has the leader-relative fix but not 413514ef3d)
+-- does the rid bug contaminate those cells? Verdict: the bug is INERT in
+that regime; the gamma-flat conclusion is usable, not reference-only. Scan
+of all 6 cells' schedule_eval.jsonl (warmup-excluded, same recipe as above;
+server path results/glm53/agentx_dynamo/policies_v2/phase1_gamma/boost/):
+
+| cell            | n    | >1k s | >600 s | max qw | qw p99 | hit % |
+|-----------------|------|-------|--------|--------|--------|-------|
+| g1.0            | 1212 | 0     | 0      | 305 s  | 81 s   | 87.7  |
+| g3.0            | 1155 | 0     | 0      | 190 s  | 120 s  | 87.2  |
+| g5.0            | 1211 | 0     | 0      | 315 s  | 85 s   | 87.7  |
+| g7.0            | 1239 | 0     | 0      | 467 s  | 101 s  | 84.3  |
+| g10.0           | 1176 | 0     | 0      | 208 s  | 80 s   | 87.9  |
+| g15.0 (crashed) | 420  | 0     | 0      | 131 s  | 53 s   | 77.5  |
+
+Scheduler-side max waits (305/190/315/467/208) match the aiperf warm-max
+column exactly; p99 ordering matches (g3.0 worst, g1.0/g10.0 best). The
+g15.0 row is the survivor subset (420 of ~1210 served before the crash) --
+invalid as a policy cell, scanned only for completeness.
+
+Why inert, three independent reasons:
+
+1. pin=60 on the H200 cells (run_meta in_batch_prefix_caching_max_pin_s
+   =60.0), not the local campaign's pin=0: the 60 s valve bounds any
+   head-rotation wait even if the mechanism engaged.
+2. The regime never builds the giant-logged queue the mechanism needs: qw
+   p50=1 s, p90=8-13 s, hit 87-88% -- 8xH200 drains the queue in seconds
+   (the local RTX c16 cell held 1.0-1.8 M pending tokens for 36 min). The
+   workload's fan-out families exist (same-match clusters of 6-9 members,
+   matched 28k-108k) but arrive against a warm cache -- the leader drained
+   long before -- so the in-batch dedup classification never binds: 0
+   follower records in every cell (local cells record them routinely).
+3. Fingerprints absent: 0 starvers, 0 waits >600 s, and the final drain is
+   neither rid-lexicographic (the bug) nor otherwise anomalous.
+
+Cross-rig consistency: gamma-flat on H200 matches the local validation --
+the tail lives in the dedup layer, not the ranking; gamma is not the tail
+knob on either rig. Known config delta for any cross-rig read: local
+campaign pin=0, H200 pin=60. The g15.0 crash is a separate defect (hard
+pool exhaustion -> OOM backout spin -> CUDA IMA; g15_oom_crash_root_cause.md).
