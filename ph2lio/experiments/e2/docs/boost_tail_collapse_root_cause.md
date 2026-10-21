@@ -673,3 +673,49 @@ needed for the validated configurations (g5.0 static, j60 adaptive).
 Baseline reruns and the metrics_v2 sweep stay deferred per scope. H200
 phase 2 is unlocked by the standing sequencing rule; the driver edit and
 submit stay with the user.
+
+### Full-sweep pre-registration: boost vs baselines on metrics v2 (2026-10-21, pre-launch)
+
+User gate for H200: confirm boost beats the baselines on TTFT and
+starvation first (criteria: TTFT/starvation primary, small cache and
+throughput trade acceptable). Sweep: 6 arms -- fcfs, lpm, dfs-weight,
+hrrn, boost-g5.0 static, boost-ada-j60 -- seed 77188 (the only overload
+seed at c16), c16, pin=0, HEAD 819296b963, fresh boot per cell, eval
+log on for every arm (same instrument). Round 1 = one cell per arm; the
+two boost arms reach n=2 (paired with GATE cells 124425 / 153643).
+
+Boost anchors, metrics v2 canonical (computed this session):
+- g5.0 GATE 124425: hit 28.5%, Jain-qw 0.816, stretch p95/p99 114/147,
+  worst-5% 9.5%, tok/s 37.7, queue mean/p90/p99 273/415/474 s, TTFT
+  mean/p95/p99 296/473/483 s.
+- ada-j60 GATE 153643: hit 31.0%, Jain-qw 0.834, stretch 132/719,
+  worst-5% 8.6%, tok/s 40.1, queue 254/381/413 s, TTFT 275/429/458 s.
+
+Same-seed noise model (4 post-fix static-family cells): TTFT p99
+455-483 s (~ +/-5%), queue p50 248-296 s (~ +/-10%).
+
+Claims (bands registered BEFORE launch):
+
+| id | claim                     | band                                                          |
+|----|---------------------------|---------------------------------------------------------------|
+| S1 | boost starvation clean    | each boost arm: 0 starvers (qw > 1500 s), worst-5% <= 12%, Jain-qw >= 0.75 |
+| S2 | boost TTFT tail           | boost TTFT p99 < 0.9 x min(baseline TTFT p99)                 |
+| S3 | baseline starvation mechanism | lpm/hrrn/dfs-weight each >= 1 starver (frozen group-1 demotion at pin=0); fcfs 0 starvers but queue p99 > 500 s |
+| S4 | body trade                | boost queue mean <= 1.25 x min(baseline queue mean)           |
+| S5 | cache/throughput, report-only | hit >= 20%, tok/s >= 0.85 x max(baseline tok/s)           |
+
+Decision: CONFIRM (H200 gate opens) if S1 + S2 + S4 hold for at least
+one boost arm and S5 is report-clean. Any baseline within 10% of boost
+TTFT p99 -> repeat that pair n=2 before the verdict. Kill: a boost
+starver, or boost TTFT p99 >= min baseline, or boost queue mean
+> 1.5 x best baseline. S3 is a mechanism prediction, not a gate: if
+lpm/hrrn/dfs run clean of starvers at pin=0, the group-1 reading is
+wrong and the verdict rests on S1/S2/S4 alone.
+
+g15 OOM guard note: not needed for the validated arms -- the crash chain
+needs near-FCFS admission (gamma 15 saturates b_gamma to ~0) building a
+giant chain at hard exhaustion; g1.0-g10.0 ran clean at the same H200
+load and all 5 post-fix local cells are OOM-free, with the local
+PrefillBudget guard (survived 12 pool-1.00 events) also in place. It
+stays a phase-2 item only if a near-FCFS-dynamics arm (incl. the fcfs
+baseline) runs at c64 on H200; watch for OOM in the fcfs cell here.
