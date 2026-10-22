@@ -148,3 +148,32 @@ nhầm toàn bộ vào run đầu. Chi tiết cách tính từng số + cite fil
 (srun trên node) → `gen_focus_report.py <run_dir>` → `compare_focus_runs.py
 <run_dir...>`; chuỗi kiểm chứng lại §4 (20/10, đã gom thành 1 script, tự lọc window
 từng run): `focus2_retrace.py [--part formula|kvblind|pinned|drain|perreq|channels|hhsplit|verify|all] <run_dir>...`
+
+## 7. Xác nhận 10 run + NSys 5-run (22/10)
+
+Thêm 5 cell NSys (run 6–10: `c64_20261021_{141334,152339,171014,182013,193141}`,
+env-gate `NSYS_PROFILE=1` commit `cec7d6ace1`, collection window +120 s) — so sánh
+đầy đủ trong `docs/focus_consistency_10runs.md` (10 run) và
+`docs/focus_consistency_5runs.md` (riêng 5 cell NSys). Kết luận:
+
+- **10/10 run CONSISTENT cả 2 focus + health** (bảng §1 của doc 10-run): throughput
+  520–546 tok/s, running-req 2.30–4.68/rank, backlog đỉnh 73.559–132.265 token,
+  KV spread p50 0.50–0.57, corr(logit,TTFT) +0.26–+0.52, cache reuse 87.0–88.0%.
+- **Chuỗi §4 lặp lại 5/5 cell NSys** (retrace từng cell, log
+  `/shared/loipp/logs/retrace_<stamp>.txt`): pinned 89–91%; host-hit 14.1–17.8% req
+  gom 65.7–70.9% tổng qw-giây; qw host-hit 21.2–25.7 s vs prefix-on-device 1.8–2.4 s;
+  corr(logit, state+16·unc/64) +0.877–+0.897 vs state-only +0.519–+0.611 — binary
+  1.4.2 có term uncached ở cả 5 cell mới.
+- **NSys wrap không perturb hành vi**: nhóm NSys throughput 530–546 vs nhóm cũ
+  520–532 (chênh +2.6% nhóm, nằm trong dải run-to-run của từng nhóm); engine code
+  dfs-weight không đổi giữa 2 nhóm — 2 commit `python/sglang` trong khoảng 15–21/10
+  (`b21cde8cce`, `0229372590`) đều chỉ đụng nhánh boost (`_sort_by_boost`,
+  `AdaptiveBoostGamma`), path dfs-weight chỉ đổi value radix tree simulated
+  (bool→int64, không đọc bởi dfs-weight).
+- **Bằng chứng GPU window (+120 s, pha warmup — host tier 0.00M tại window, chuỗi
+  load-back chưa diễn ra)**: 5/5 cell `deep_ep::legacy::intranode`
+  dispatch+cached_notify_combine+notify_dispatch = **94.3–94.6% kernel-busy**
+  (n≈53–59k/window, avg 18.2–19.1 ms, max 60–171 ms — spin chờ rank khác; dữ liệu
+  thật `combine` chỉ ~0.7 ms) — chữ ký GPU của batch mỏng MoE EP=8 (focus 1);
+  memcpy DtoD 18.1–20.4 GB/window, HtoD/DtoH ≈ 0 GB. Truy vấn:
+  `scripts/nsys_window_summary.py` (sqlite từng cell, `profiling/nsys/*.sqlite`).
