@@ -736,3 +736,95 @@ and stand; the sweep table uses the v2 canonical population for every
 arm. Writing the independent check caught two bugs in the CHECK itself
 (unit "tokens" handled as None, percentile floor instead of
 interpolation) -- both fixed, the instrument had none.
+
+### Final campaign verdict: 10 arms x 2 seeds x n=2 (2026-10-23)
+
+User-directed final sweep (2026-10-22 evening directive): 4 baselines + 6
+boost arms (static g0.1/g0.25/g0.5/g1.0/g5.0 + adaptive j60), seeds 77188
+(the only overload seed at c16) and 42302 (light), c16, pin=0, DURATION
+1800, GRACE 600, n=2 per cell -- 40 runs, fresh boot each. The g0.1/g0.5
+arms were added to complete the static-gamma dose-response: show that a
+full static sweep has no universal winner. Every cell verified before
+entering any table: metrics_v2 + independent cross-check 16/16 delta-0,
+run_meta seed/policy/gamma checked. Means built by
+analysis/final_tables.py from analysis/final_tables_manifest.json (no
+hand-copied numbers); final tables: docs/fixed_e2_rtx6000.md. Population
+note: g1.0 n2 141639 P_wait 78 vs P_done 77 (one done-record outside the
+profiling-phase cut; within the warn tolerance).
+
+S1-S5 on the overload seed (bands registered above, n=2 means):
+
+- S1 PASS, all 6 boost arms, per-run not just on means: 0 starvers in
+  all 12 boost runs (indep count); worst-5% per-run max 10.3 (means
+  8.7-9.7, band <= 12); Jain-qw per-run min 0.766 (means 0.788-0.819,
+  band >= 0.75).
+- S2 PASS for g0.25 (455.9) and g1.0 (449.5) against 0.9 x fcfs 513.3 =
+  462.0; FAIL by the letter for g0.1 (465.5), g0.5 (482.6), ada j60
+  (484.3), g5.0 (487.4) -- all four still beat fcfs outright by 5.0-6.0%.
+  Best tail: g1.0 449.5, 12.5% below fcfs. (fcfs's own n1 484.9 vs n2
+  541.7 -- the n1-only view the repeat was mandated for would have
+  flipped S2 for every arm.)
+- S3 mechanism, not a gate: hrrn 3 starvers in BOTH runs (TTFT p99
+  1754.7, worst-5 39.3%) -- giant slow-aging + follower pins, confirmed.
+  lpm/dfs ran clean of >1500 s waits but express the same demotion as
+  tail concentration: lpm TTFT p99 654.7 / worst-5 30.9 / Jain 0.266;
+  dfs 800.0 / 32.3 / 0.240. fcfs 0 starvers, queue p99 453|532 (the
+  >500 s prediction held in 1 of 2 runs). The pre-registered fallback
+  applies: verdict rests on S1/S2/S4.
+- S4 FAIL by the letter, every boost arm (queue mean 254.4-274.4 vs
+  1.25 x lpm 98.8 = 123.5) -- lpm's mean is starvation-flattered: p50
+  19 s (matched requests admitted instantly) under a 622 s p99 and a
+  31% worst-5 tail; the low mean IS the starvation signature, not a
+  better body. Against the only 0-starver baseline (fcfs 294.7) every
+  boost arm wins at 0.86-0.93x. The kill clause "queue mean > 1.5 x
+  best baseline" fires only against that same flattered lpm mean; no
+  kill condition fires against fcfs (0 boost starvers, boost TTFT p99
+  all < fcfs, boost queue mean all < fcfs).
+- S5 report-only: hit 28.8-33.9 (>= 20 OK); tok/s 38.2-40.8 = 0.45-0.48x
+  lpm's 85.2 -- the registered acceptable trade (user criteria:
+  TTFT/starvation primary, small cache/throughput trade OK).
+
+Decision: CONFIRM on the registered primary criteria. Every boost arm
+matches fcfs's 0 starvers while beating it on TTFT p50/p95/p99 (p99
+449-487 vs 513) and worst-5 (8.7-9.7 vs 9.2), at a small Jain cost
+(0.788-0.819 vs 0.845; still 2.6-3.7x lpm/dfs/hrrn). hrrn starves
+outright; lpm/dfs trade a flattered mean for a 30-34% worst-5 tail and
+TTFT p99 655/800.
+
+Gamma dose-response (the no-universal-static-gamma result):
+
+- Overload (77188): the static band is flat -- TTFT p99 449.5-487.4
+  across g0.1 -> g5.0 (8.4% spread), all below fcfs 513.3. Body p50
+  orders with the lean: ada 291 < g0.1 320 < g1.0 325 < g0.25 335 <
+  g5.0 338 < fcfs 357 (bigger max-jump admits smalls sooner; the j60
+  adaptive lean dominates). An overload-only sweep crowns g1.0 (tail)
+  or g0.1/ada (body).
+- Light (42302): the same ladder reorders -- g0.25 90, g5.0 113,
+  g0.5 127 beat fcfs 135, but g1.0 142 and g0.1 151 fall BELOW fcfs.
+  The arm the overload-only sweep would crown (g1.0) is worse than the
+  baseline at light load; the biggest lean (g0.1, tau = ln2/gamma ~
+  6.9 s) is the worst boost arm there. No static gamma is at or near
+  the top in both regimes -> the production answer is the adaptive
+  controller (user decision 2026-10-22): at overload it pins at the
+  J-floor (best body 291, tail 484); at light load the fits track
+  gamma-hat 0.10-0.31 (server fit= lines).
+- Ada light-seed caveat: ada n2 42302 (cell 222225) drew a giant-heavy
+  trace realization -- n_wait 135 vs 221 n1 (the other 7 arms' n2 runs:
+  208-224), 151 vs 237 eval lines, tok/s 66.4 vs 101.3, TTFT p99 304.4
+  vs 114.2. The gamma trajectory is similar across the two runs
+  (settled gamma ~0.129, pinned 61%), so the controller was not stuck;
+  rid sequences differ run-to-run (the seed does not fix the trace
+  realization), and the top-5 waits (235-295 s) sat on 98-99%-matched
+  65k-233k-token requests -- a capacity clog from the realization,
+  compounded by the closed-loop client (fewer round trips -> fewer
+  requests -> every aggregate worse). Measurement itself verified
+  16/16. The ada 42302 mean (TTFT p99 209) is therefore policy-
+  confounded; n1 (114) is the cleaner read, but the final table reports
+  the mean of both runs.
+
+H200 gate: OPENS (user's move -- merge to /shared/loipp/sglang, phase-2
+driver g15->g10, CONCS "48 64", SEEDS "42 43 44"). The RTX j60 verdict
+is NOT universal: derive J from the measured H200 rig (2026-10-19
+audit), and H200 arm comparisons need >= 3 seeds per arm (seed variance
+60-89% >> policy gaps ~15%; here even same-seed realization spread
+reached 2.7x on one cell).
