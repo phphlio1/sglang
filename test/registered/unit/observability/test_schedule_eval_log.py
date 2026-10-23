@@ -116,6 +116,8 @@ class TestScheduleEvalLogger(CustomTestCase):
             boost_gamma=1e-4,
             boost_bin_size=256,
             boost_clock="tokens",
+            boost_cache_lambda=0.0,
+            boost_cache_cap_tokens=0,
         )
         finished = _finish(_make_req("done"))
         pending = _make_req("pending")  # still running: must not be logged
@@ -132,6 +134,8 @@ class TestScheduleEvalLogger(CustomTestCase):
                 "gamma",
                 "boost_clock",
                 "bin_size",
+                "cache_lambda",
+                "cache_cap_tokens",
                 "arrival_wall_s",
                 "queue_wait_s",
                 "ttft_s",
@@ -145,6 +149,7 @@ class TestScheduleEvalLogger(CustomTestCase):
                 "in_batch_dedup_follower_first_admission",
                 "num_retractions",
                 "boost_arrival_tokens",
+                "boost_commit_hold_passes",
             },
             set(rec.keys()),
         )
@@ -175,6 +180,8 @@ class TestScheduleEvalLogger(CustomTestCase):
             boost_gamma=1e-4,
             boost_bin_size=256,
             boost_clock="tokens",
+            boost_cache_lambda=0.0,
+            boost_cache_cap_tokens=0,
         )
         logger.log_finished_batch([_finish(_make_req("retracted"), retracted=True)])
         logger.close()
@@ -194,6 +201,8 @@ class TestScheduleEvalLogger(CustomTestCase):
             boost_gamma=1e-4,
             boost_bin_size=256,
             boost_clock="tokens",
+            boost_cache_lambda=0.0,
+            boost_cache_cap_tokens=0,
         )
         req = _finish(_make_req("done"))
         logger.log_finished_batch([req])
@@ -211,6 +220,8 @@ class TestScheduleEvalLogger(CustomTestCase):
                 boost_gamma=1e-4,
                 boost_bin_size=256,
                 boost_clock="tokens",
+                boost_cache_lambda=0.0,
+                boost_cache_cap_tokens=0,
             )
         # Disabled, not crashed: logging a finished batch is a no-op.
         logger.log_finished_batch([_finish(_make_req("done"))])

@@ -591,6 +591,168 @@ class TestBoostSort(CustomTestCase):
         self.assertIs(policy.policy, CacheAgnosticPolicy.FCFS)
 
 
+class TestBoostCacheSort(CustomTestCase):
+    """_sort_by_boost with cache_lambda > 0 (boost-cache):
+    phi(r) = A(r) - b_gamma(q(u(r))) - lambda*min(matched, M).
+
+    Properties derived from the formula, not mirrored from the code:
+      - cache locality: within one work bin, the matched-prefix bonus breaks
+        the FCFS tie toward the cache hit (the lpm signal, recovered);
+      - the starvation bound grows from b_gamma(k) to b_gamma(k) + lambda*M
+        and no further: still bounded displacement, so the anti-starvation
+        argument survives the fusion (this is the whole point of the policy).
+    """
+
+    def sort_rids(
+        self,
+        reqs,
+        gamma=1e-4,
+        bin_size=256,
+        cache_lambda=0.5,
+        cache_cap_tokens=8192,
+    ):
+        queue = list(reqs)
+        SchedulePolicy._sort_by_boost(
+            queue,
+            set(),
+            gamma,
+            bin_size,
+            cache_lambda=cache_lambda,
+            cache_cap_tokens=cache_cap_tokens,
+        )
+        return [r.rid for r in queue]
+
+    def test_lambda_zero_is_bit_identical_to_boost(self):
+        # Baseline comparability: cache_lambda=0 must leave the boost key
+        # untouched, so a mixed hot/cold queue sorts exactly as the frozen
+        # boost call (which passes no cache knobs at all).
+        reqs = [
+            _make_boost_req("cold_old", 100_000, arrival=0),
+            _make_boost_req("hot_new", 256, arrival=500, cached=4096),
+            _make_boost_req("cold_new", 300, arrival=600),
+        ]
+        fused = list(reqs)
+        SchedulePolicy._sort_by_boost(fused, set(), 1e-4, 256)
+        self.assertEqual(self.sort_rids(reqs, cache_lambda=0.0), [r.rid for r in fused])
+
+    def test_hot_prefix_breaks_the_equal_bin_tie(self):
+        # Same arrival, same work bin (matched tokens are excluded from u, so
+        # hot's u = 256 = cold's): without the bonus the tie falls to rid
+        # ("cold" < "hot"); the bonus lambda*matched = 2048 clock-tokens
+        # pulls the cache hit ahead.
+        cold = _make_boost_req("cold", 256, arrival=1_000)
+        hot = _make_boost_req("hot", 256, arrival=1_000, cached=4096)
+        self.assertEqual(self.sort_rids([cold, hot]), ["hot", "cold"])
+
+    def test_starvation_bound_grows_by_lambda_m_and_no_further(self):
+        # The fusion's core invariant: a fully-cached newcomer (u <= k,
+        # matched >= M) can beat an old cold request only while its arrival
+        # is within b_gamma(k) - b_gamma(q(u_cold)) + lambda*M. Just inside,
+        # it still jumps; just outside, the old request is unreachable again
+        # -- the bonus extends the bound by exactly lambda*M.
+        for gamma in (5e-5, 1e-4):
+            with self.subTest(gamma=gamma):
+                k, lam, cap = 256, 0.5, 8192
+                bound = (
+                    gamma_boost(k, gamma)
+                    - gamma_boost(geometric_bin(100_000, k), gamma)
+                    + lam * cap
+                )
+                cold = _make_boost_req("cold", 100_000, arrival=0)
+                inside = _make_boost_req(
+                    "inside", 256, arrival=int(bound * 0.9), cached=cap
+                )
+                # 10x the cap in matched tokens: the cap, not matched, sets
+                # the bonus, so this request sits outside the same bound.
+                outside = _make_boost_req(
+                    "outside", 256, arrival=int(bound * 1.1), cached=10 * cap
+                )
+                order = self.sort_rids(
+                    [cold, inside, outside],
+                    gamma=gamma,
+                    bin_size=k,
+                    cache_lambda=lam,
+                    cache_cap_tokens=cap,
+                )
+                self.assertLess(order.index("inside"), order.index("cold"))
+                self.assertLess(order.index("cold"), order.index("outside"))
+
+    def test_cap_saturates_matched_tokens(self):
+        # matched beyond M adds nothing: equal arrival, equal bin, matched M
+        # vs 5*M earn the same bonus and tie back to FCFS (rid order). A
+        # missing min() gives 5*M five times the pull and turns this red.
+        at_cap = _make_boost_req("at_cap", 256, arrival=1_000, cached=8192)
+        past_cap = _make_boost_req("past_cap", 256, arrival=1_000, cached=5 * 8192)
+        self.assertEqual(self.sort_rids([past_cap, at_cap]), ["at_cap", "past_cap"])
+
+    def test_wall_bonus_converts_at_rate_and_is_zero_unmeasured(self):
+        # Wall mode values the reuse at lambda*matched/rate seconds: the
+        # equal-bin tie below is broken only by that bonus (both sides sit at
+        # b_gamma(k/rate)). Without a measured rate the work boost is 0 and
+        # the cache bonus shares that fate -- pure arrival (rid) order.
+        cold = _make_wall_req("cold", 256, entry_s=5.0)
+        hot = _make_wall_req("hot", 256, entry_s=5.0, cached=8192)
+
+        def sort_wall(rate):
+            queue = [cold, hot]
+            SchedulePolicy._sort_by_boost(
+                queue,
+                set(),
+                0.1,
+                256,
+                clock=BoostClock.WALL,
+                rate_tokens_per_s=rate,
+                cache_lambda=0.5,
+                cache_cap_tokens=8192,
+            )
+            return [r.rid for r in queue]
+
+        # bonus = 0.5 * 8192 / 1000 = 4.096 s ahead of the tie.
+        self.assertEqual(sort_wall(1000.0), ["hot", "cold"])
+        self.assertEqual(sort_wall(None), ["cold", "hot"])
+
+    def test_boost_cache_policy_validates_knobs(self):
+        # The negative branch: out-of-range lambda/cap must fail fast at
+        # construction, not surface as a silent ordering distortion at the
+        # first sort.
+        for lam, cap in ((-0.1, 8192), (1.1, 8192), (0.5, 0)):
+            with self.subTest(lam=lam, cap=cap):
+                with self.assertRaises(ValueError):
+                    SchedulePolicy(
+                        policy="boost-cache",
+                        tree_cache=RadixCache.create_simulated(),
+                        enable_hierarchical_cache=True,
+                        enable_priority_scheduling=False,
+                        schedule_low_priority_values_first=False,
+                        boost_cache_lambda=lam,
+                        boost_cache_cap_tokens=cap,
+                    )
+
+    def test_calc_priority_dispatches_boost_cache(self):
+        # End-to-end through calc_priority: the boost-cache arm takes the
+        # shared boost path with its knobs attached. The equal-bin pair is
+        # chosen so ONLY the cache bonus can reorder (a dispatch regression
+        # that drops the cache kwargs, or BOOST_CACHE from the dispatch
+        # tuple, falls back to rid order and turns this red).
+        policy = SchedulePolicy(
+            policy="boost-cache",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            boost_gamma=1e-4,
+            boost_bin_size=256,
+            boost_cache_lambda=0.5,
+            boost_cache_cap_tokens=8192,
+        )
+        cold = _make_boost_req("cold", 256, arrival=1_000)
+        hot = _make_boost_req("hot", 256, arrival=1_000, cached=4096)
+        queue = [cold, hot]
+        with patch.object(policy, "_compute_prefix_matches", return_value=(set(), {})):
+            policy.calc_priority(queue)
+        self.assertEqual([r.rid for r in queue], ["hot", "cold"])
+
+
 class TestTokenClockRate(CustomTestCase):
     """TokenClockRate: the wall-mode work-to-seconds converter."""
 
@@ -1145,6 +1307,20 @@ class TestAdaptiveBoostGamma(CustomTestCase):
         jump_s = gamma_boost(256 / 2000.0, gamma)
         self.assertLessEqual(jump_s, 60.0)
         self.assertGreaterEqual(jump_s, 59.9, "floor must be tight, not slack")
+
+    def test_jump_floor_shares_budget_with_cache_bonus(self):
+        # boost-cache's lambda*M bonus cuts ahead like the work boost, so the
+        # J bound covers the sum: gamma's floor tightens to leave room for
+        # the bonus's wall value, and b_gamma(k/rate) + lambda*M/rate stays
+        # within max_jump_s. A floor that ignores the bonus leaves the total
+        # cut-ahead above J (second assert red).
+        rate, k, lam, cap, jump = 2_000.0, 256, 0.5, 8192, 50.0
+        fused = AdaptiveBoostGamma(1e-4, k, jump, cache_jump_tokens=lam * cap)
+        plain = AdaptiveBoostGamma(1e-4, k, jump)
+        floor_fused = fused._gamma_floor(rate)
+        self.assertGreater(floor_fused, plain._gamma_floor(rate))
+        total_jump_s = gamma_boost(k / rate, floor_fused) + lam * cap / rate
+        self.assertLessEqual(total_jump_s, jump + 1e-6)
 
     def test_jump_floor_tracks_rate_not_gamma(self):
         # Same jump budget at 10x the service rate: tau shrinks 10x, the
