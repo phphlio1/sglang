@@ -125,7 +125,7 @@ Các hiện tượng dưới đây có đo được trong 5 run nhưng **không 
   trong export; client không report `usage.prompt_tokens_details.cached_tokens`
   (cần `--enable-cache-report` phía server); `sglang:prefill_delayer_outcomes`
   đã được phân tích chi tiết ở §8 (23/10, sau khi extract giữ đủ label).
-- **MoE expert imbalance**: EP=8 → mỗi bước forward, token mọi rank all-to-all tới đúng expert, nếu 1 expert nóng, rank chứa expert đó chậm → gate cả bước của cả 8 rank. Với workload AgentX (agent/tool-use) phân bố expert theo chủ đề rất dễ lệch. Trong stack hiện tại không có metric per-expert nào được register - chỉ có sglang:eplb_balancedness (metrics_collector.py:923, Summary per forward_mode) nhưng chỉ register khi bật EPLB và ở moe_ep_rank=0. 
+- **MoE expert imbalance**: EP=8 → mỗi bước forward, token mọi rank all-to-all tới đúng expert, nếu 1 expert nóng, rank chứa expert đó chậm → gate cả bước của cả 8 rank. Với workload AgentX (agent/tool-use) phân bố expert theo chủ đề rất dễ lệch. Trong stack hiện tại không có metric per-expert nào được register - chỉ có sglang:eplb_balancedness (metrics_collector.py:923, Summary per forward_mode) nhưng chỉ register khi bật EPLB và ở moe_ep_rank=0. **Số đo GPU §9 (23/10): deep_ep chiếm 92,7% kernel-time — vấn đề lớn nhất theo thời gian GPU nhưng out of scope mentor.** 
 
 
 ## 6. Nguồn dữ liệu & quy ước cite (compact)
@@ -226,3 +226,33 @@ Kết luận (5/5 cell nhất quán):
 - Kiểm tra chéo: tổng pass có prefill chạy (timeout-exec + chunk-exec) =
   2.294-2.422 ≈ số dòng `Prefill batch` trong window đếm từ engine log (cell
   141334: 2.422 vs 2.424 — chênh 2 ở biên scrape).
+
+## 9. NSys readout đầy đủ theo quy trình mentor (23/10)
+
+Script `scripts/nsys_readout.py` (bước 1 `nsys stats` 4 report chuẩn; bước 2
+python đọc sqlite `?mode=ro`, không ghi file gốc). Output:
+`results/glm53/agentx_dynamo/profiling/dfs-weight/nsys_readout/` (20 PNG + CSV
+từng cell + `summary_cross.csv` + `index.html` kèm chú giải). 5/5 cell nhất
+quán, số ví dụ cell 141334:
+
+- **Kernel theo tên**: bộ ba deep_ep (`dispatch` 253,8 s +
+  `cached_notify_combine` 252,8 s + `notify_dispatch` 62,3 s) = **92,7%
+  kernel-time** (khớp §7 94,3-94,6%, chênh nhỏ do ranh giới window/tổng); 3
+  kernel đếm đúng 1:1:1 (13.384) = mỗi pass một vòng all-to-all; `combine`
+  (dữ liệu thật) 0,73 ms/lần vs `dispatch` 18,96 ms — phần còn lại là spin chờ
+  rank khác. Compute thật (GEMM/attention/elementwise/NCCL) gộm ~5%.
+- **CUDA API**: `cudaStreamSynchronize` 413,4 s ≈ 97% thời gian API, avg
+  **30,7 ms/lần**, số lần (13.475) ≈ số pass → mỗi pass kết thúc bằng một lần
+  sync chờ; launch rẻ (344.404 lần = 2,83 s) → không launch-bound.
+- **Timeline 8 GPU**: busy **55,0-63,9%**/GPU, khá đều giữa 8 GPU → idle 36-45%
+  nhưng **phân mảnh**: 2.211-2.353 gap ≥ 1 ms/GPU, gap max 0,82-0,97 s, avg
+  ~21 ms — khe nhỏ tại ranh giới forward pass. Nhịp pass ~76 ms (1.673
+  pass/GPU/window) khớp §8.
+- **Memcpy**: DtoD 18,1-20,4 GB/window (~147 MB/s — không memory-bound);
+  HtoD/DtoH ≈ 0 — window warmup, host tier 0,00M, **không suy ra được
+  load-back steady-state** (bằng chứng load-back vẫn là metrics §4/§7/§8).
+- **Chẩn đoán**: comm/sync-bound (EP=8) xác nhận mạnh; không
+  compute/launch/memory-bound tại window này. Idle phân mảnh + spin trong
+  kernel = bóng GPU của focus 1 (batch mỏng) — batch càng mỏng, chi phí
+  all-to-all trên mỗi token càng lớn. EP-MoE là vấn đề lớn nhất theo thời gian
+  GPU nhưng out of scope (§5). NVTX ~20-23k events/cell chưa khai thác.
