@@ -103,6 +103,31 @@ if [ ! -d "${TOKENIZER}" ]; then
   echo "=== FATAL: model path ${TOKENIZER} absent on $(hostname) ==="
   exit 1
 fi
+
+# HiCache native hash (unified-cache kv events) JIT-compiles hash_binding.cpp
+# on the first radix insert. Compute nodes lack libssl-dev, so point the
+# compiler at the shipped headers/lib -- without these every cell dies on its
+# first insert (jobs 5797/5798, 12/12 cells, openssl/sha.h + opensslconf.h
+# multiarch).
+export CPATH="${BENCH}/native-build-deps/include${CPATH:+:${CPATH}}"
+export LIBRARY_PATH="${BENCH}/native-build-deps/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+
+# Fail the job in seconds instead of burning 6 boots x ~8 min on a
+# native-hash load failure; also rebuilds the cache if a mirror refreshed
+# source mtimes (ninja then recompiles under CPATH above).
+if ! PYTHONPATH="${NODE_LOCAL}/sglang/python" \
+  "${NODE_LOCAL}/venv-dynamo/bin/python3" -c "
+from array import array
+from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
+get_native_hash(array('I', [1, 2, 3, 4]), None, page_size=1)
+print('native-hash-preflight-ok')
+" >"${BENCH}/logs/native_hash_preflight_${SLURM_JOB_ID}.log" 2>&1; then
+  echo "=== FATAL: HiCache native hash failed to load on $(hostname) ==="
+  tail -5 "${BENCH}/logs/native_hash_preflight_${SLURM_JOB_ID}.log"
+  exit 1
+fi
+echo "=== native-hash preflight OK (job ${SLURM_JOB_ID}) ==="
+
 export RESULTS_ROOT="${E2_DIR}/results/glm53/agentx_dynamo"
 export OUTPUT_DIR="${RESULTS_ROOT}/policies_v2/phase2_policies"
 export AIPERF_DATASET_MMAP_CACHE_DIR="${BENCH}/aiperf_mmap_cache"
