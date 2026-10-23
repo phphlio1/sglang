@@ -8,9 +8,9 @@ Prints one markdown table: dfs-weight is the baseline row (plain values);
 every other row shows "value (pct%)" per cell, pct being the difference vs the
 baseline COMPUTED FROM THE DISPLAYED VALUES (calculator-checkable), signed so
 + always means better: n/hit/tok-per-s/Jain are higher-is-better, queue/TTFT/
-ITL/worst-5 are lower-is-better. Means replace the p50 columns (manager
-format, 2026-10-23); n is the mean over runs displayed as a plain integer
-(half-up).
+ITL/worst-5 are lower-is-better. Means replace the p50 columns and n shows
+the plain value with no pct (manager format, 2026-10-23); n is the mean over
+runs displayed as a plain integer (half-up).
 
 Reads analysis/final_tables_manifest.json: {"<seed>": {"<arm>": [run_dir, ...]}}
 (run_dir relative to the experiment root). Every listed dir must already carry
@@ -133,11 +133,15 @@ def pct_cell(value_disp: str, base_disp: str, higher_is_better: bool) -> str:
     return f"{100 * diff / b:+.1f}%"
 
 
+# n shows the plain value only -- no pct vs the baseline (manager format).
+NO_PCT = {"n"}
+
+
 def table_row(label: str, runs: list[dict], base_runs: list[dict]) -> str:
     cells = []
     for header, scale, mode, higher in COLUMNS:
         disp = format_cell([r[header] for r in runs], scale, mode)
-        if base_runs is runs:
+        if base_runs is runs or header in NO_PCT:
             cells.append(disp)
         else:
             base = format_cell([r[header] for r in base_runs], scale, mode)
