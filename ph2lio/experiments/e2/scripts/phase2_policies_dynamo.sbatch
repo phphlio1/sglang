@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # E2 boost campaign — Phase 2: 6-arm policy comparison on the dynamo arm.
-# 6 policies x c{48,64} x seeds {77188, 42302}, DURATION=1800, fresh boot per
+# 6 policies x c{64} x seeds {77188, 42302}, DURATION=1800, fresh boot per
 # cell, pin=60 (prod parity):
-#   dfs-weight (prod policy, baseline, first), fcfs-match (fcfs +
-#   admission-match bookkeeping, the established fcfs reference arm), lpm,
+#   dfs-weight (prod policy, baseline, first), fcfs (plain, matches the RTX
+#   tables), lpm,
 #   hrrn, boost static gamma=0.25 (RTX 10-arm sweep representative: top-2 in
 #   both regimes, best light-regime arm), boost adaptive (gamma-Ada Eq. 9
 #   fit, jump floor J=BOOST_ADAPTIVE_MAX_JUMP_S).
@@ -28,9 +28,11 @@
 # Seed-MAJOR order: each seed block completes all 6 arms, so a partial
 # campaign still yields balanced paired comparisons (same seed = same
 # request mix); seed 77188 goes first.
-# 6 arms x 2 concs x 2 seeds = 24 cells x ~55-70 min -> ~24 h; expect ~6-7
-# submissions (4 h wall); resume loop skips completed (policy, conc, seed)
-# cells.
+# 6 arms x 1 conc x 2 seeds = 12 cells x ~55-70 min -> ~11-14 h; the 12 h
+# wall (temporary, was 4 h) usually covers the whole c64 pass in 1-2
+# submissions; resume loop skips completed (policy, conc, seed) cells.
+# c48 only if time permits: --export=CONCS="48 64" reruns resume-safely
+# (completed c64 cells skip).
 #
 # Prereqs: phase-1 DONE (J derivation above); CONCS may need retargeting
 # after the phase-0 gate.
@@ -45,7 +47,8 @@
 # ~16-20 cores — the count is purely topological. 128 since 2026-10-19.
 #SBATCH --cpus-per-task=128
 #SBATCH --mem=1600G
-#SBATCH --time=04:00:00
+# 12 h wall, temporary (user request 2026-10-23; was 4 h).
+#SBATCH --time=12:00:00
 #SBATCH --output=/shared/loipp/logs/e2boost_p2_policies_%j.log
 
 set -euo pipefail
@@ -55,7 +58,7 @@ E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
 BOOST_SWEEP_GAMMA="${BOOST_SWEEP_GAMMA:-0.25}"  # RTX representative static gamma
 BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-50}"  # 1.08x p95 giant prefill (header)
 SEEDS_LIST="${SEEDS_LIST:-77188 42302}"  # RTX campaign seed pair, seed-major
-CONCS="${CONCS:-48 64}"      # phase-0 load band
+CONCS="${CONCS:-64}"       # c48 only if time permits (--export=CONCS="48 64")
 
 NODE_LOCAL="${NODE_LOCAL:-/mnt/loipp}"
 if [ -x "${NODE_LOCAL}/venv-dynamo/bin/python3" ]; then
@@ -143,7 +146,7 @@ read -ra SEEDS <<< "${SEEDS_LIST}"
 read -ra CONC_LIST <<< "${CONCS}"
 for seed in "${SEEDS[@]}"; do
   for c in "${CONC_LIST[@]}"; do run_cell dfs-weight "${c}" "" "${seed}"; done
-  for p in fcfs-match lpm hrrn; do
+  for p in fcfs lpm hrrn; do
     for c in "${CONC_LIST[@]}"; do run_cell "${p}" "${c}" "" "${seed}"; done
   done
   for c in "${CONC_LIST[@]}"; do run_cell boost "${c}" "${BOOST_SWEEP_GAMMA}" "${seed}"; done
