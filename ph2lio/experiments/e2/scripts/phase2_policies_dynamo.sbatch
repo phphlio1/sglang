@@ -1,27 +1,39 @@
 #!/usr/bin/env bash
-# E2 boost campaign — Phase 2: policy comparison on the dynamo arm.
-# 7 policies x c{16,32,64}, DURATION=1800, fresh boot per cell:
-#   dfs-weight (prod policy, first), fcfs-match, lpm, hrrn,
-#   shortest-prefill-first, lof, boost at the phase-1 sweet-spot gamma
-#   (BOOST_SWEEP_GAMMA, default 5.0) + boost at gamma=15 (near-FCFS bound).
-# pin=60 default everywhere (prod parity).
+# E2 boost campaign — Phase 2: 6-arm policy comparison on the dynamo arm.
+# 6 policies x c{48,64} x seeds {77188, 42302}, DURATION=1800, fresh boot per
+# cell, pin=60 (prod parity):
+#   dfs-weight (prod policy, baseline, first), fcfs-match (fcfs +
+#   admission-match bookkeeping, the established fcfs reference arm), lpm,
+#   hrrn, boost static gamma=0.25 (RTX 10-arm sweep representative: top-2 in
+#   both regimes, best light-regime arm), boost adaptive (gamma-Ada Eq. 9
+#   fit, jump floor J=BOOST_ADAPTIVE_MAX_JUMP_S).
 #
-# Paired multi-seed (2026-10-19 RTX audit, doc e2_policies.md / plan §5.5):
-# seed variance (60-89%) dwarfs the ~15% policy gaps, so single-seed
-# rankings are indicative only — H200 comparisons should use 3+ seeds per
-# arm. Seed-MAJOR order: each seed block completes all arms, so a partial
+# J derivation (2026-10-23, 5 valid phase-1 cells, n=419 cold giants >=50k
+# tok with matched<=10%): prefill p50=19.8 p95=46.3 p99=65.7 s at ~4.9-5.3k
+# uncached tok/s, stable across gamma arms. Default J=50 = 1.08x the p95
+# giant prefill; the RTX J-grid verdict was J in [1,2]x one giant prefill
+# wins and <1x loses (j60 beat j15 at overload; RTX giants 30-60 s). At ~5k
+# tok/s the floor pins gamma~0.105 under overload (RTX-j60-like lean) while
+# static gamma=0.25 maps to J~17.5 s (RTX j15-zone) -- the two boost arms
+# span the lean range. Mini-sweep {half,one,double} stays available via
+# --export=BOOST_ADAPTIVE_MAX_JUMP_S=25|50|100.
+#
+# Seeds: the RTX campaign pair -- 77188 (overload regime there) + 42302
+# (light regime there) -- same trace seeds so the request mix matches the
+# RTX tables. The regime label is rig x conc dependent: on H200 at c48/c64
+# both seeds may sit inside the load band; the pairing still controls the
+# mix. RTX numbers are NOT directly comparable (pin=0 + c16 there vs
+# pin=60 + c48/c64 here).
+#
+# Seed-MAJOR order: each seed block completes all 6 arms, so a partial
 # campaign still yields balanced paired comparisons (same seed = same
-# request mix); seed 42 goes first and alone yields the full ranking.
-# Default SEEDS_LIST="42" keeps the original single-seed scope; submit
-# --export=SEEDS_LIST="42 43 44" (or 5 seeds) for the fair sweep
-# (cells scale linearly: 24 cells/seed).
+# request mix); seed 77188 goes first.
+# 6 arms x 2 concs x 2 seeds = 24 cells x ~55-70 min -> ~24 h; expect ~6-7
+# submissions (4 h wall); resume loop skips completed (policy, conc, seed)
+# cells.
 #
-# 24 cells/seed x ~55-70 min -> ~24 h/seed; expect ~6-7 submissions (4 h
-# wall); resume loop skips completed (policy, conc, seed) cells.
-#
-# Prereqs: phase1 DONE + sweet-spot gamma chosen (pass --export=BOOST_SWEEP_GAMMA=<g>
-# if it differs from 5.0). CONCS may need retargeting after the phase-0
-# gate if the load band lands at c40/c48 instead.
+# Prereqs: phase-1 DONE (J derivation above); CONCS may need retargeting
+# after the phase-0 gate.
 #SBATCH --job-name=e2boost-p2-policies
 #SBATCH --partition=hardware-hcm
 #SBATCH --nodelist=hgx-h200-01
@@ -40,9 +52,10 @@ set -euo pipefail
 
 BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
-BOOST_SWEEP_GAMMA="${BOOST_SWEEP_GAMMA:-5.0}"   # phase-1 winner
-SEEDS_LIST="${SEEDS_LIST:-42}"   # paired seeds, seed-major (see header)
-CONCS="${CONCS:-16 32 64}"       # revisit after the phase-0 gate (band may be 40/48)
+BOOST_SWEEP_GAMMA="${BOOST_SWEEP_GAMMA:-0.25}"  # RTX representative static gamma
+BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-50}"  # 1.08x p95 giant prefill (header)
+SEEDS_LIST="${SEEDS_LIST:-77188 42302}"  # RTX campaign seed pair, seed-major
+CONCS="${CONCS:-48 64}"      # phase-0 load band
 
 NODE_LOCAL="${NODE_LOCAL:-/mnt/loipp}"
 if [ -x "${NODE_LOCAL}/venv-dynamo/bin/python3" ]; then
@@ -88,20 +101,24 @@ seed_done() {  # $1 = policy, $2 = label, $3 = seed: completed cell with this se
   return 1
 }
 
-run_cell() {  # $1 = policy, $2 = conc, $3 = boost gamma (empty for non-boost), $4 = seed
-  local p="$1" c="$2" g="$3" seed="$4" label
-  if [[ "${p}" == "boost" ]]; then
-    label="c${c}_g${g}_wall_k256"
-  else
-    label="c${c}"
-  fi
+run_cell() {  # $1 = policy, $2 = conc, $3 = boost mode ("" | static gamma | "ada"), $4 = seed
+  local p="$1" c="$2" mode="$3" seed="$4" label
+  case "${mode}" in
+    ada) label="c${c}_gada_${BOOST_CLOCK}_k${BOOST_BIN_SIZE}_j${BOOST_ADAPTIVE_MAX_JUMP_S}" ;;
+    "")  label="c${c}" ;;
+    *)   label="c${c}_g${mode}_${BOOST_CLOCK}_k${BOOST_BIN_SIZE}" ;;
+  esac
   if seed_done "${p}" "${label}" "${seed}"; then
     echo "=== E2 resume: skip completed ${p} ${label} seed=${seed} ==="
     return 0
   fi
-  echo "=== E2 phase2 cell: policy=${p} c${c} ${g:+gamma=${g} }seed=${seed} ==="
-  if [[ "${p}" == "boost" ]]; then
-    BOOST_GAMMA="${g}" SEED="${seed}" bash scripts/run_e2.sh policy boost "${c}" \
+  echo "=== E2 phase2 cell: policy=${p} c=${c} ${mode:+mode=${mode} }seed=${seed} ==="
+  if [[ "${p}" == "boost" && "${mode}" == "ada" ]]; then
+    BOOST_ADAPTIVE_GAMMA=1 BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S}" \
+      SEED="${seed}" bash scripts/run_e2.sh policy boost "${c}" \
+      || echo "=== E2 cell failed: ${p} ${label} seed=${seed} (will retry on resubmit) ==="
+  elif [[ "${p}" == "boost" ]]; then
+    BOOST_GAMMA="${mode}" SEED="${seed}" bash scripts/run_e2.sh policy boost "${c}" \
       || echo "=== E2 cell failed: ${p} ${label} seed=${seed} (will retry on resubmit) ==="
   else
     SEED="${seed}" bash scripts/run_e2.sh policy "${p}" "${c}" \
@@ -120,19 +137,16 @@ run_cell() {  # $1 = policy, $2 = conc, $3 = boost gamma (empty for non-boost), 
   done
 }
 
-# Seed-major (paired): seed 42 block first — it alone completes the full
-# 24-cell ranking; later seeds only refine it. dfs-weight first within each
-# seed (prod reference), boost arms last.
+# Seed-major (paired): seed 77188 block first. dfs-weight first within each
+# seed (prod baseline), classic policies next, boost arms last.
 read -ra SEEDS <<< "${SEEDS_LIST}"
 read -ra CONC_LIST <<< "${CONCS}"
 for seed in "${SEEDS[@]}"; do
   for c in "${CONC_LIST[@]}"; do run_cell dfs-weight "${c}" "" "${seed}"; done
-  for p in fcfs-match lpm hrrn shortest-prefill-first lof; do
+  for p in fcfs-match lpm hrrn; do
     for c in "${CONC_LIST[@]}"; do run_cell "${p}" "${c}" "" "${seed}"; done
   done
   for c in "${CONC_LIST[@]}"; do run_cell boost "${c}" "${BOOST_SWEEP_GAMMA}" "${seed}"; done
-  if [[ "${BOOST_SWEEP_GAMMA}" != "15.0" ]]; then
-    for c in "${CONC_LIST[@]}"; do run_cell boost "${c}" "15.0" "${seed}"; done
-  fi
+  for c in "${CONC_LIST[@]}"; do run_cell boost "${c}" "ada" "${seed}"; done
 done
 echo "=== PHASE2 DONE ==="
