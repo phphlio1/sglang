@@ -90,6 +90,11 @@ fi
 export AIPERF="${NODE_LOCAL}/venv-aiperf/bin/aiperf"
 export HOME="${NODE_LOCAL}/home"
 mkdir -p "${HOME}"
+# torch cpp_extension checks ninja on PATH at every JIT-extension LOAD
+# (verify_ninja_availability), not only at build time; the engine
+# schedulers inherit this PATH when they load the native hash (jobs
+# 5845/5846 preflight-failed on exactly this).
+export PATH="${NODE_LOCAL}/venv-dynamo/bin:${PATH}"
 
 export SERVER_SCRIPT="${E2_DIR}/scripts/start_dynamo_stack.sh"
 export SGLANG_URL="http://127.0.0.1:8888"
