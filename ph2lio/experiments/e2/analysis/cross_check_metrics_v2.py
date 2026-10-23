@@ -135,6 +135,7 @@ def check(run_dir: Path) -> bool:
         ("ttft mean", sum(ttfts) / len(ttfts), t["mean"] / 1000),
         ("ttft p50", _pctile(ttfts, 0.50), t["p50"] / 1000),
         ("ttft p99", _pctile(ttfts, 0.99), t["p99"] / 1000),
+        ("itl mean", sum(gaps_ms) / len(gaps_ms), i["mean"]),
         ("itl p50", _pctile(gaps_ms, 0.50), i["p50"]),
         ("itl p95", _pctile(gaps_ms, 0.95), i["p95"]),
         ("itl p99", _pctile(gaps_ms, 0.99), i["p99"]),

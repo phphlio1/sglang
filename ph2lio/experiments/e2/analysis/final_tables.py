@@ -1,21 +1,29 @@
-"""Build the final sweep tables (one per seed) from e2_metrics_v2.json.
+"""Build the final sweep table for one seed from e2_metrics_v2.json.
 
 Usage:
 
     python3 analysis/final_tables.py <seed> [--allow-partial]
 
+Prints one markdown table: dfs-weight is the baseline row (plain values);
+every other row shows "value (pct%)" per cell, pct being the difference vs the
+baseline COMPUTED FROM THE DISPLAYED VALUES (calculator-checkable), signed so
++ always means better: n/hit/tok-per-s/Jain are higher-is-better, queue/TTFT/
+ITL/worst-5 are lower-is-better. Means replace the p50 columns (manager
+format, 2026-10-23); n is the mean over runs displayed as a plain integer
+(half-up).
+
 Reads analysis/final_tables_manifest.json: {"<seed>": {"<arm>": [run_dir, ...]}}
 (run_dir relative to the experiment root). Every listed dir must already carry
-a verified e2_metrics_v2.json (metrics_v2 + cross_check 16/16) and a run_meta
+a verified e2_metrics_v2.json (metrics_v2 + cross_check 17/17) and a run_meta
 seed matching the manifest key; anything else aborts before printing unless
 --allow-partial (interim views; the final file must run without it). Cells are
 the mean over the listed runs -- no hand-copied numbers.
 
-One wide table per seed: policy rows, metric columns. Sources
-(docs/metrics_v2.md): n/queue/hit/Jain/worst-5 come from P_wait, TTFT/ITL/
-tok-per-s from P_done; the populations are built independently and can drift
-by a request or two (done-record outside the profiling-phase cut), so the n
-column shows P_wait n and any drift is warned on stderr (large drift aborts).
+Sources (docs/metrics_v2.md): n/queue/hit/Jain/worst-5 come from P_wait, TTFT/
+ITL/tok-per-s from P_done; the populations are built independently and can
+drift by a request or two (done-record outside the profiling-phase cut), so
+the n column shows P_wait n and any drift is warned on stderr (large drift
+aborts).
 """
 
 from __future__ import annotations
@@ -38,7 +46,49 @@ ARM_ORDER = [
     "boost g5.0",
     "boost ada j60",
 ]
+BASELINE = "dfs-weight"
 SEED_LABEL = {"77188": "overload", "42302": "light"}
+
+# fmt mode: None -> plain integer (half-up); "scaled" -> 2 decimals under 1,
+# 1 under 100, else rounded; int -> that many decimals.
+FMT_SCALED = "scaled"
+COLUMNS: list[tuple[str, float, str | int | None, bool]] = [
+    ("n", 1.0, None, True),
+    ("q mean (s)", 1.0, FMT_SCALED, False),
+    ("q p95 (s)", 1.0, FMT_SCALED, False),
+    ("q p99 (s)", 1.0, FMT_SCALED, False),
+    ("TTFT mean (s)", 0.001, FMT_SCALED, False),
+    ("TTFT p95 (s)", 0.001, FMT_SCALED, False),
+    ("TTFT p99 (s)", 0.001, FMT_SCALED, False),
+    ("ITL mean (ms)", 1.0, FMT_SCALED, False),
+    ("ITL p95 (ms)", 1.0, FMT_SCALED, False),
+    ("ITL p99 (ms)", 1.0, FMT_SCALED, False),
+    ("hit %", 1.0, 1, True),
+    ("tok/s", 1.0, 1, True),
+    ("Jain", 1.0, 3, True),
+    ("worst-5 %", 1.0, 1, False),
+]
+
+
+def run_metrics(v2: dict) -> dict:
+    """Flat per-run dict keyed by the COLUMNS headers."""
+    q, t, i = v2["queue_wait_s"], v2["ttft_ms"], v2["itl_ms"]
+    return {
+        "n": q["n"],
+        "q mean (s)": q["mean"],
+        "q p95 (s)": q["p95"],
+        "q p99 (s)": q["p99"],
+        "TTFT mean (s)": t["mean"],
+        "TTFT p95 (s)": t["p95"],
+        "TTFT p99 (s)": t["p99"],
+        "ITL mean (ms)": i["mean"],
+        "ITL p95 (ms)": i["p95"],
+        "ITL p99 (ms)": i["p99"],
+        "hit %": v2["cache_hit"]["rate"] * 100,
+        "tok/s": v2["tok_per_s"]["value"],
+        "Jain": v2["jain_queue_wait"]["value"],
+        "worst-5 %": v2["worst5_wait_share_pct"]["value"],
+    }
 
 
 def load_arm(seed: str, arm: str, dirs: list[str]) -> dict:
@@ -59,17 +109,7 @@ def load_arm(seed: str, arm: str, dirs: list[str]) -> dict:
         if n_wait != n_done:
             print(f"WARN {d}: P_wait n {n_wait} != P_done n {n_done}; "
                   "n column shows P_wait", file=sys.stderr)
-        runs.append(
-            {
-                "q": v2["queue_wait_s"],
-                "t": v2["ttft_ms"],
-                "i": v2["itl_ms"],
-                "hit": v2["cache_hit"]["rate"] * 100,
-                "toks": v2["tok_per_s"]["value"],
-                "jain": v2["jain_queue_wait"]["value"],
-                "w5": v2["worst5_wait_share_pct"]["value"],
-            }
-        )
+        runs.append(run_metrics(v2))
     return {"arm": arm, "runs": runs}
 
 
@@ -77,34 +117,32 @@ def mean(values: list[float]) -> float:
     return sum(values) / len(values)
 
 
-def fmt_scaled(values: list[float], unit_scale: float = 1.0) -> str:
-    """Adaptive decimals on the mean: 2 under 1, 1 under 10, else rounded."""
-    m = mean([v * unit_scale for v in values])
-    decimals = 2 if m < 1 else (1 if m < 10 else 0)
+def format_cell(values: list[float], scale: float, mode: str | int | None) -> str:
+    m = mean([v * scale for v in values])
+    if mode is None:
+        return str(int(m + 0.5))
+    decimals = (
+        (2 if m < 1 else (1 if m < 100 else 0)) if mode == FMT_SCALED else mode
+    )
     return f"{m:.{decimals}f}"
 
 
-def fmt_n(values: list[float]) -> str:
-    m = mean(values)
-    return f"{m:.0f}" if m == int(m) else f"{m:.1f}"
+def pct_cell(value_disp: str, base_disp: str, higher_is_better: bool) -> str:
+    v, b = float(value_disp), float(base_disp)
+    diff = v - b if higher_is_better else b - v
+    return f"{100 * diff / b:+.1f}%"
 
 
-HEADER = [
-    "n",
-    "q p50 (s)",
-    "q p95 (s)",
-    "q p99 (s)",
-    "TTFT p50 (s)",
-    "TTFT p95 (s)",
-    "TTFT p99 (s)",
-    "ITL p50 (ms)",
-    "ITL p95 (ms)",
-    "ITL p99 (ms)",
-    "hit %",
-    "tok/s",
-    "Jain",
-    "worst-5 %",
-]
+def table_row(label: str, runs: list[dict], base_runs: list[dict]) -> str:
+    cells = []
+    for header, scale, mode, higher in COLUMNS:
+        disp = format_cell([r[header] for r in runs], scale, mode)
+        if base_runs is runs:
+            cells.append(disp)
+        else:
+            base = format_cell([r[header] for r in base_runs], scale, mode)
+            cells.append(f"{disp} ({pct_cell(disp, base, higher)})")
+    return "| " + " | ".join([label] + cells) + " |"
 
 
 def main() -> None:
@@ -123,38 +161,22 @@ def main() -> None:
     missing = [a for a in ARM_ORDER if a not in arms]
     if missing and not partial:
         sys.exit(f"ABORT: seed {seed} missing arms {missing}")
-    order = [a for a in ARM_ORDER if a in arms]
+    if BASELINE not in arms:
+        sys.exit(f"ABORT: seed {seed} missing baseline {BASELINE}")
+    order = [BASELINE] + [a for a in ARM_ORDER if a != BASELINE and a in arms]
     label = SEED_LABEL.get(seed, seed)
     print(f"## Seed {seed} ({label}, c16) -- runs/arm: "
           + ", ".join(f"{a}={len(arms[a]['runs'])}" for a in order)
           + (f"  PARTIAL missing {missing}" if missing else ""), file=sys.stderr)
 
-    def v(a: str, key: str, field: str) -> list[float]:
-        return [r[key][field] for r in arms[a]["runs"]]
-
-    def raw(a: str, key: str) -> list[float]:
-        return [r[key] for r in arms[a]["runs"]]
-
-    print("| policy | " + " | ".join(HEADER) + " |")
-    print("|---" * (len(HEADER) + 1) + "|")
+    print(f"## Seed {seed} ({label}, c16)")
+    print()
+    print("| policy | " + " | ".join(h for h, *_ in COLUMNS) + " |")
+    print("|---" * (len(COLUMNS) + 1) + "|")
+    base_runs = arms[BASELINE]["runs"]
     for a in order:
-        cells = [
-            fmt_n(v(a, "q", "n")),
-            fmt_scaled(v(a, "q", "p50")),
-            fmt_scaled(v(a, "q", "p95")),
-            fmt_scaled(v(a, "q", "p99")),
-            fmt_scaled(v(a, "t", "p50"), 0.001),
-            fmt_scaled(v(a, "t", "p95"), 0.001),
-            fmt_scaled(v(a, "t", "p99"), 0.001),
-            fmt_scaled(v(a, "i", "p50")),
-            fmt_scaled(v(a, "i", "p95")),
-            fmt_scaled(v(a, "i", "p99")),
-            f"{mean(raw(a, 'hit')):.1f}",
-            f"{mean(raw(a, 'toks')):.1f}",
-            f"{mean(raw(a, 'jain')):.3f}",
-            f"{mean(raw(a, 'w5')):.1f}",
-        ]
-        print("| " + " | ".join([a] + cells) + " |")
+        label_row = a if a != BASELINE else f"{a} (baseline)"
+        print(table_row(label_row, arms[a]["runs"], base_runs))
 
 
 if __name__ == "__main__":
