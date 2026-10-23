@@ -111,10 +111,13 @@ Phân tầng (mỗi tầng benchmark riêng):
   benefit `B = TTFT_i − TTFT_j > 0` (DualMap Eq. 6); dynamo đã có hạ tầng
   migration (tắt, limit 0 - `frontend/main.py:343`).
 
-Chỗ cắm: **dynamo 1.5.1 custom WorkerScorer** (Python policy, 1.5.0 GA có API
-này) - dựng từ wheel public, không cần registry creds team. Fallback nếu wrapper
-1.5.1 không tương thích sglang branch ta: giữ 1.4.2, đo T1/T2 bằng **offline
-replay** trước (dynamo pkg có sẵn module `replay/`).
+Chỗ cắm **(đã verify S0, 20/10, wheel thật — không còn suy đoán từ release notes)**:
+
+- Selection + logit chạy trong **Rust** (`_core.abi3.so` chứa chuỗi log `Selected worker`; `frontend/main.py` chỉ build config — 1.5.1 :411-468; `FrontendRoute` chỉ nhận GET tĩnh, `_core.pyi:2404-2412`) → không patch Python scorer built-in được.
+- **API custom-routing công khai có sẵn từ 1.4.2** (trùng khớp 1.5.1, `_core.pyi` cả hai bản): `KvRouter.best_worker(token_ids, request_id, policy_class, …)` → (worker_id, dp_rank, overlap_blocks); `get_potential_loads(token_ids)` → per (worker_id, dp_rank): **`potential_prefill_tokens`** (= token sẽ phải prefill nếu đặt request này vào rank đó ≈ T_c per-candidate), `potential_decode_blocks`, `active_requests` (1.5.1 `_core.pyi:3022-3051`; 1.4.2 `:3054`); `get_overlap_scores` → overlap theo tier (device/host/disk/shared); `generate(worker_id=…, dp_rank=…)` — bypass KV matching, route thẳng nhưng **vẫn cập nhật router state** (1.4.2 `:2944-2945`); protocol thủ công `mark_prefill_complete()`/`free()` (1.5.1 `:3090-3122`).
+- → **T1 = custom router service bằng Python trên chính 1.4.2 đang chạy**: mỗi request → `get_potential_loads` → `score'` → argmin → `generate(worker_id, dp_rank)`. Không cần upgrade dynamo, không cần build Rust, không cần registry team. Câu hỏi mở cho S1: semantics `potential_prefill_tokens` (đã gồm active prefill state của rank hay chỉ phần uncached của request — quyết định cách cộng term).
+- 1.5.1 (venv tham chiếu `/shared/loipp/venv-dynamo-15`) **không có WorkerScorer/WorkerPicker Python API** (grep 0 hit); customization = `--router-policy-config` YAML "custom worker-selection instances" (`common/configuration/groups/kv_router_args.py:555-568`) + `--router-prefill/decode-policy` named instances (`:598-623`), và `KvRouterConfig` 1.5.1 (`_core.pyi:1773-1884`) **không có field cost uncached per-request** → T1 không thể diễn đạt qua config ở 1.5.1 — plan không thừa với upstream. Thứ 1.5.1 thêm (queue fcfs/wspt + `router_queue_threshold`, `LoadThresholdConfig` :1736-1741, session affinity hard/soft, aic load model, hicache credit) đều không là T1.
+- **PR (S3) vẫn là thay đổi Rust** (scorer sống trong Rust) — bằng chứng A/B lấy từ Python service; story PR = "dynamo expose `potential_prefill_tokens` per-candidate từ 1.4.x nhưng scorer argmin không dùng nó".
 
 
 ## 4. Kết quả kì vọng (baseline = 10 run đã xác nhận 22/10)
@@ -137,15 +140,19 @@ TTFT same-prefix chỉ riêng affinity.
 
 ## 5. Định hướng các bước
 
-- **S0 - spike (0 GPU)**: dựng venv dynamo 1.5.1 public wheel trên login node
-  (CPU): `pip install ai-dynamo==1.5.1 ai-dynamo-runtime==1.5.1` → import + đọc
-  API WorkerScorer thực tế (release notes → code thật); smoke stack đầy đủ để
-  dành cửa sổ GPU. Đồng thời xin team path/creds image `1.5.0-kvoverlap1` (đã
-  verify: patch chỉ thêm metric log).
-- **S1 - offline replay (0 GPU)**: mô phỏng `score'` trên request stream +
-  gauges của 10 run cũ → xác nhận hướng & chọn `w_u`/`w_r`/`w_k` trước khi tốn
-  GPU. Khung đã có sẵn: `scripts/focus2_retrace.py --part formula` (A3/A4/B) —
-  mở rộng thành các biến thể score' rồi đo lại pinned/qw/spread như retrace.
+- **S0 - spike (0 GPU)** ✅ *xong 20/10 (login node, 0 GPU, CPU-only)*: venv
+  `/shared/loipp/venv-dynamo-15` (ai-dynamo 1.5.1 + ai-dynamo-runtime 1.5.1 từ
+  PyPI, 1,7 GB kèm deps). Kết quả: (a) không có WorkerScorer/WorkerPicker trong
+  wheel 1.5.1 — xem §3; (b) **API custom-routing có sẵn từ 1.4.2** → T1 làm trên
+  1.4.2 luôn, không upgrade; (c) risk wheel-compat (§7) bỏ. Venv 1.5.1 giữ làm
+  tham chiếu upstream.
+- **S1 - offline replay (0 GPU)**: (a) xác định semantics
+  `potential_prefill_tokens` (câu hỏi mở S0 để lại, §3 — đọc Rust source
+  `get_potential_loads` repo ai-dynamo/dynamo hoặc probe KvRouter offline);
+  (b) mô phỏng `score'` trên request stream + gauges của 10 run cũ → xác nhận
+  hướng & chọn `w_u`/`w_r`/`w_k` trước khi tốn GPU. Khung đã có sẵn:
+  `scripts/focus2_retrace.py --part formula` (A3/A4/B) — mở rộng thành các
+  biến thể score' rồi đo lại pinned/qw/spread như retrace.
 - **S2 - A/B serving**: baseline vs T1 vs T2 trên harness e2
   (start_dynamo_stack.sh + aiperf + `compare_focus_runs.py`), CCU64, seed 42,
   cold cache, ≥3 run/mode (retract intermittent nên 1 run không đủ). Thêm 2 thước
@@ -181,7 +188,10 @@ như không giao nhau, nhưng benchmark thì lẫn. Luật:
 - ~~"Công thức dynamo thiếu term uncached"~~ **Đã đính chính (§1)**: term có sẵn
   (weight 16), corr +0,877–0,897 — story PR phải nói đúng chỗ thiếu là reload
   cost + KV headroom, không nói "thiếu size term".
-- Wheel 1.5.1 ↔ wrapper `dynamo.sglang` ↔ branch sglang ta: compat chưa verify
-  (S0 giải).
+- ~~Wheel 1.5.1 ↔ wrapper `dynamo.sglang` ↔ branch sglang ta: compat chưa verify
+  (S0 giải).~~ **Đã giải (S0 20/10): A/B chạy trên 1.4.2 đang có — không
+  upgrade, không compat risk.** Risk mới thay thế: semantics
+  `potential_prefill_tokens` chưa xác định (S1 xác định bằng code/probe trước
+  khi chọn công thức cộng term).
 - Biến thiên benchmark: triệu chứng retract intermittent (9 lần/10 run) → cần
   ≥3 run/mode để không kết luận từ nhiễu.
