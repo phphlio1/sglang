@@ -116,10 +116,6 @@ này) - dựng từ wheel public, không cần registry creds team. Fallback n�
 1.5.1 không tương thích sglang branch ta: giữ 1.4.2, đo T1/T2 bằng **offline
 replay** trước (dynamo pkg có sẵn module `replay/`).
 
-Verify trước khi tin: dynamo 1.5.1 KHÔNG có sẵn feature này (đã check releases
-07/10 + 1.6.0-dev 14–20/10: chỉ có KV-aware/load/session/round-robin/prediction
-routing + charge active decode; 1.6.0-dev mới có uncached-token *accounting của
-tải state*, chưa phải cost per-request).
 
 ## 4. Kết quả kì vọng (baseline = 10 run đã xác nhận 22/10)
 
