@@ -33,6 +33,9 @@ archived under `../../archives/` and this tree is the reusable frame.
 
 - `../.venv-e2/` — the aiperf client venv (default `AIPERF` path in
   `run_e2.sh`; override with `AIPERF=...` if a clone needs its own).
+  Venvs are not relocatable: if this tree is ever moved, rewrite the
+  `bin/` script shebangs to the new absolute path (a stale one fails with
+  "bad interpreter").
 - conda env `sglang`, the repo-root CUDA shim, and the model weights — all
   wired in `scripts/start_server.sh`.
 - `results/` and `logs/` are generated at run time and git-ignored.

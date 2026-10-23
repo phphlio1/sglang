@@ -447,6 +447,10 @@ mode_smoke() {
   local smoke_flags=(--num-dataset-entries "${NUM_ENTRIES}" --unsafe-override)
   [[ -n "${TRAJECTORY_START_MIN_RATIO}" ]] && smoke_flags+=(--trajectory-start-min-ratio "${TRAJECTORY_START_MIN_RATIO}")
   [[ -n "${TRAJECTORY_START_MAX_RATIO}" ]] && smoke_flags+=(--trajectory-start-max-ratio "${TRAJECTORY_START_MAX_RATIO}")
+  # Finite drain: the global default (inf) hangs forever when a turn cancelled
+  # at the send deadline never returns its credits; grace bounds that wait.
+  [[ "${GRACE_PERIOD}" == "inf" ]] && GRACE_PERIOD=300
+  export GRACE_PERIOD
   run_aiperf "${run_dir}" "${CONCURRENCY}" "${SMOKE_DURATION}" "${smoke_flags[@]}"
   if [[ -f "${eval_path}" ]]; then
     cp "${eval_path}" "${run_dir}/schedule_eval.jsonl"
