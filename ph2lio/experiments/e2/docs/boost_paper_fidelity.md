@@ -50,7 +50,18 @@ Resolution:
   the pinned signal). A floored run now reads `fit << floor, pinned=100%`.
 - J-grid experiment (scripts/boost_jgrid.sh): J in {60, 15, 5} at seed
   77188 under the leader-relative fix, to measure the J gradient that the
-  floor-pinned regime actually exposes.
+  floor-pinned regime actually exposes. Result (evening run): TTFT p99
+  1186 / 964 / 1500 s for J = 60 / 15 / 5 -- J=15 best (also best Jain
+  0.537, 1 starver); live floors matched the computed ones (0.116-0.122 /
+  0.27-0.40 / 0.62-1.05) with pinned=55-100%. Full table in
+  boost_tail_collapse_root_cause.md. The ranking is non-monotonic in J;
+  the j5 tail (7 starvers despite a near-FCFS sort) is the rid tie-break
+  head rotation, not a J or chunk-limit effect -- gamma-independent.
+  Validated 2026-10-21 (commit 413514ef3d): mechanism eliminated (0
+  starvers, aiperf p99 474 s, drain in arrival order) at a body-median
+  cost (p50 144->297 s, hit 31->22%) -- J ranking needs a rerun on the
+  clean base after the variance bound; see boost_tail_collapse_root_cause.md
+  (validation result).
 - Unit tests already lock the floor round trip and the Eq. 9 ln5/Delta
   form (`test_estimator_math_and_ema`).
 

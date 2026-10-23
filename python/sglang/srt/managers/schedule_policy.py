@@ -115,6 +115,19 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
     os.environ.get("IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD", "32")
 )
 
+# Boost commit-gate frontier: one page of tokens compared just past a waiting
+# request's current match point. The in-flight chunked prefill extends that
+# request's match iff it shares this page, so a shared frontier means holding
+# admission until the commit buys at least this many matched tokens.
+BOOST_COMMIT_GATE_FRONTIER_TOKENS = 256
+
+# Boost commit-gate wall cap: cumulative seconds a request may spend held
+# across passes. A legit hold ends with one extender's prefill (<= ~60 s for
+# the largest trunks); past the cap the extender is assumed pathological
+# (retraction churn that never commits) and the request admits on whatever
+# partial match it has.
+BOOST_COMMIT_GATE_MAX_HOLD_S = 120.0
+
 
 IGNORE_EOS_RESERVE_TOKENS = 1
 # AMD/HIP-only: the prefill tile-budget admission control is part of the AMD
@@ -455,7 +468,10 @@ class AdaptiveBoostGamma:
         median_w = sorted_works[(len(sorted_works) - 1) // 2]
         short_lats = [l for l, w in self._samples if w <= median_w]
         long_lats = [l for l, w in self._samples if w > median_w]
-        if len(short_lats) < self._min_samples // 2 or len(long_lats) < self._min_samples // 2:
+        if (
+            len(short_lats) < self._min_samples // 2
+            or len(long_lats) < self._min_samples // 2
+        ):
             return fallback, gamma_overall, "overall"
 
         gamma_short = self._tail_gamma_hat(short_lats)
@@ -622,7 +638,14 @@ class SchedulePolicy:
         waiting_queue: List[Req],
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
+        chunked_req: Optional[Req] = None,
     ) -> None:
+        # Boost commit-gate flag is last-write-wins per pass; clear before any
+        # branch (early returns and policy fallbacks included) so no stale hold
+        # survives a policy switch or a chunked_req completion.
+        for r in waiting_queue:
+            r.boost_commit_hold = False
+
         # Before _determine_active_policy so the >128-queue FCFS fallback
         # still refreshes the rate between wall-mode sorts.
         if self.prefill_token_rate is not None:
@@ -690,6 +713,8 @@ class SchedulePolicy:
                     ),
                     leader_of=leader_of,
                 )
+                # After the sort: _mark_commit_holds reads the admission order.
+                self._mark_commit_holds(waiting_queue, chunked_req)
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                 SchedulePolicy._sort_by_shortest_prefill(
                     waiting_queue, temporary_deprioritized
@@ -905,6 +930,52 @@ class SchedulePolicy:
             return False
         return now_s - r.first_queue_entry_time > self.in_batch_prefix_caching_max_pin_s
 
+    def _mark_commit_holds(
+        self, waiting_queue: List[Req], chunked_req: Optional[Req]
+    ) -> None:
+        # waiting_queue is in admission order (the boost sort already ran).
+        # A request is held while an earlier extender -- the in-flight chunked
+        # prefill or a waiting request that sorts (and admits) before it --
+        # will commit at least one more page of its matched prefix. Holds end
+        # with that one extender; the wall cap below bounds a pathological
+        # extender (retraction churn) that never commits.
+        frontier = BOOST_COMMIT_GATE_FRONTIER_TOKENS
+        now_s: Optional[float] = None
+
+        def extends_match(extender: Optional[Req], k: int, r_ids) -> bool:
+            if extender is None:
+                return False
+            e_ids = extender.origin_input_ids
+            return (
+                len(e_ids) >= k + frontier
+                and e_ids[k : k + frontier] == r_ids[k : k + frontier]
+            )
+
+        for i, r in enumerate(waiting_queue):
+            k = r.num_matched_prefix_tokens
+            if k <= 0:
+                continue
+            r_ids = r.origin_input_ids
+            held = extends_match(chunked_req, k, r_ids) or any(
+                extends_match(w, k, r_ids) for w in waiting_queue[:i]
+            )
+            if not held:
+                continue
+            if now_s is None:
+                now_s = time.perf_counter()
+            if r.boost_commit_hold_first_s is None:
+                r.boost_commit_hold_first_s = now_s
+            # The pin valve stays authoritative for its own contract (a pinned
+            # follower must not wait past pin); the commit-gate cap covers the
+            # pin=0 case and any non-follower hold.
+            if now_s - r.boost_commit_hold_first_s > BOOST_COMMIT_GATE_MAX_HOLD_S or (
+                self.in_batch_prefix_caching_max_pin_s > 0
+                and self._pin_hold_expired(r, now_s)
+            ):
+                continue
+            r.boost_commit_hold = True
+            r.boost_commit_hold_passes += 1
+
     @staticmethod
     def _shortest_prefill_work(r: Req) -> int:
         return max(
@@ -1041,30 +1112,39 @@ class SchedulePolicy:
         queue is giant-logged (e2 fair sweep seed 77188: 1500-1950 s follower
         waits under overload vs <= 453 s under fcfs). A follower whose leader
         left the queue keeps the group-1 tail.
+
+        The follower tie at phi(leader)+eps breaks by arrival stamp, not rid:
+        the next pass classifies the queue in this order and makes its first
+        free family member the next leader once the current one drains, so a
+        rid tie-break hands headship to whichever follower holds the smallest
+        rid — an early arrival with an unlucky rid is then passed by every
+        later same-prefix arrival without bound (e2 g5.0 seed 77188: 1870 s
+        vs the 43-160 s cohort band; the cell's final drain admitted the
+        family in exact rid order, arrival ignored).
         """
 
         req_by_rid = {r.rid: r for r in waiting_queue} if leader_of else {}
 
-        def base_rank(r: Req) -> float:
-            w = geometric_bin(SchedulePolicy._shortest_prefill_work(r), bin_size)
+        def arrival_stamp(r: Req) -> float:
+            # None = never stamped (synthetic reqs); treat as oldest.
             if clock is BoostClock.WALL:
-                # None = never stamped (synthetic reqs); treat as oldest.
-                arrival_s = (
+                return (
                     r.first_queue_entry_time
                     if r.first_queue_entry_time is not None
                     else 0.0
                 )
+            return r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
+
+        def base_rank(r: Req) -> float:
+            w = geometric_bin(SchedulePolicy._shortest_prefill_work(r), bin_size)
+            if clock is BoostClock.WALL:
                 boost_s = (
                     gamma_boost(w / rate_tokens_per_s, gamma)
                     if rate_tokens_per_s is not None
                     else 0.0
                 )
-                return arrival_s - boost_s
-            # None = never stamped (synthetic reqs); treat as oldest.
-            arrival = (
-                r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
-            )
-            return arrival - gamma_boost(w, gamma)
+                return arrival_stamp(r) - boost_s
+            return arrival_stamp(r) - gamma_boost(w, gamma)
 
         def key(r: Req):
             rank = base_rank(r)
@@ -1081,8 +1161,8 @@ class SchedulePolicy:
             else:
                 group, phi = 0, rank
             if enable_priority_scheduling:
-                return (r.priority * priority_sign, group, phi, r.rid)
-            return (group, phi, r.rid)
+                return (r.priority * priority_sign, group, phi, arrival_stamp(r), r.rid)
+            return (group, phi, arrival_stamp(r), r.rid)
 
         waiting_queue.sort(key=key)
 
@@ -2117,11 +2197,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
-            ):
-                # Only one unfinished chunked request can be tracked.
+            if has_chunked_req:
+                # Only one unfinished chunked request can be tracked; a
+                # capped chunk (chunked_req_limit) leaves budget unspent.
                 return AddReqResult.OTHER
             if self.exact_chunk_fill:
                 # Take the remainder verbatim so the batch hits exactly

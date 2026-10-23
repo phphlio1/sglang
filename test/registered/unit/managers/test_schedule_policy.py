@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.schedule_policy import (
+    BOOST_COMMIT_GATE_MAX_HOLD_S,
     AdaptiveBoostGamma,
     BoostClock,
     CacheAgnosticPolicy,
@@ -485,6 +486,27 @@ class TestBoostSort(CustomTestCase):
             ["leader", "follower", "late"],
         )
 
+    def test_in_batch_dedup_follower_tie_breaks_by_arrival_not_rid(self):
+        # Regression (e2 g5.0 seed 77188, 2026-10-20 night): followers of
+        # one leader tie at phi(leader)+eps; a rid tie-break ordered the tie
+        # by rid, and the next pass makes the first family member in this
+        # order the next leader once the current one drains -- so a later
+        # arrival with a smaller rid kept winning headship and an early
+        # rid-unlucky request starved 1870 s under continuous same-prefix
+        # arrivals (the cell's final drain admitted the family in exact rid
+        # order, arrival ignored). The tie must break by arrival stamp.
+        leader = _make_boost_req("leader", 4_096, arrival=0)
+        early = _make_boost_req("zz_early", 256, arrival=500)
+        late = _make_boost_req("aa_late", 256, arrival=30_000)
+        self.assertEqual(
+            self.sort_rids(
+                [leader, early, late],
+                deprioritized={"zz_early", "aa_late"},
+                leader_of={"zz_early": "leader", "aa_late": "leader"},
+            ),
+            ["leader", "zz_early", "aa_late"],
+        )
+
     def test_in_batch_dedup_follower_without_leader_sorts_last(self):
         # Leader left the queue between classification and sort (admitted
         # or retracted): the follower keeps the group-1 tail. Also the
@@ -959,6 +981,129 @@ class TestInBatchDedupStamping(CustomTestCase):
         self.assertFalse(any(r.in_batch_dedup_pending for r in queue))
 
 
+class TestBoostCommitGate(CustomTestCase):
+    """The boost commit-gate holds a waiting request's admission while an
+    earlier extender -- the in-flight chunked prefill or a waiting request
+    that sorts before it -- is still committing its matched prefix. The
+    fan-out trace it guards (e2 c16 seed 77188) measured siblings admitted
+    during the trunk's chunked prefill re-prefilling the uncommitted tail
+    (+0.4M uncached tokens, -6% throughput at the saturation knee); a later
+    full match is worth one extender's wait. The frontier fingerprint must
+    hold exactly the requests whose match an extender will grow, and the
+    hold must stay bounded (pin valve, wall cap).
+    """
+
+    @staticmethod
+    def _req_with_match(rid, ids, matched):
+        req = _make_req(rid, "", ids)
+        req.num_matched_prefix_tokens = matched
+        return req
+
+    @staticmethod
+    def _boost_policy():
+        return SchedulePolicy(
+            policy="boost",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+
+    def test_holds_sibling_whose_match_the_chunked_prefill_extends(self):
+        # Sibling matched 1000 of a 3000-token shared prefix; the chunked
+        # trunk still has 2000 tokens to commit past that point.
+        trunk = _make_req("trunk", "", list(range(3_000)))
+        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
+        self._boost_policy()._mark_commit_holds([sibling], trunk)
+        self.assertIs(sibling.boost_commit_hold, True)
+        self.assertEqual(sibling.boost_commit_hold_passes, 1)
+
+    def test_holds_sibling_behind_a_waiting_extender_that_sorts_first(self):
+        # No chunked req (the trunk was stashed back to the waiting queue
+        # mid-chunk, the smoke-test release hole): the trunk sorts before the
+        # sibling, so the sibling still waits for its commit.
+        trunk = _make_req("trunk", "", list(range(3_000)))
+        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
+        self._boost_policy()._mark_commit_holds([trunk, sibling], None)
+        self.assertIs(trunk.boost_commit_hold, False)
+        self.assertIs(sibling.boost_commit_hold, True)
+
+    def test_no_hold_behind_a_waiting_extender_that_sorts_after(self):
+        # The sibling sorts first; holding it behind a later extender would
+        # invert the admission order the sort just established.
+        trunk = _make_req("trunk", "", list(range(3_000)))
+        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
+        self._boost_policy()._mark_commit_holds([sibling, trunk], None)
+        self.assertIs(sibling.boost_commit_hold, False)
+        self.assertIs(trunk.boost_commit_hold, False)
+
+    def test_wall_cap_releases_a_never_committing_extender(self):
+        # An extender stuck in retraction churn never commits; past the wall
+        # cap the sibling must admit on its partial match instead of starving.
+        policy = self._boost_policy()
+        trunk = _make_req("trunk", "", list(range(3_000)))
+        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
+        policy._mark_commit_holds([sibling], trunk)
+        self.assertIs(sibling.boost_commit_hold, True)
+        sibling.boost_commit_hold = False  # calc_priority's per-pass clear
+        sibling.boost_commit_hold_first_s -= BOOST_COMMIT_GATE_MAX_HOLD_S + 1.0
+        policy._mark_commit_holds([sibling], trunk)
+        self.assertIs(sibling.boost_commit_hold, False)
+
+    def test_no_hold_when_the_prefixes_diverge_at_the_match_point(self):
+        # The trunk shares exactly the matched 1000 tokens then diverges;
+        # committing its tail cannot extend the sibling's match. A length-only
+        # check (trunk longer than the match point) would hold it.
+        trunk = _make_req("trunk", "", list(range(1_000)) + list(range(9_000, 12_000)))
+        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
+        self._boost_policy()._mark_commit_holds([sibling], trunk)
+        self.assertIs(sibling.boost_commit_hold, False)
+
+    def test_no_hold_without_a_match_or_a_chunked_req(self):
+        trunk = _make_req("trunk", "", list(range(3_000)))
+        fresh = self._req_with_match("fresh", list(range(3_000)), 0)
+        self._boost_policy()._mark_commit_holds([fresh], trunk)
+        self.assertIs(fresh.boost_commit_hold, False)
+
+        matched = self._req_with_match("m", list(range(1_500)), 1_000)
+        self._boost_policy()._mark_commit_holds([matched], None)
+        self.assertIs(matched.boost_commit_hold, False)
+
+    def test_no_hold_when_less_than_a_frontier_page_remains(self):
+        # The trunk ends 255 tokens past the match point: below the
+        # 256-token frontier the commit buys too little to be worth a hold.
+        trunk = _make_req("trunk", "", list(range(1_255)))
+        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
+        self._boost_policy()._mark_commit_holds([sibling], trunk)
+        self.assertIs(sibling.boost_commit_hold, False)
+
+    def test_calc_priority_clears_stale_holds(self):
+        # The flag is last-write-wins per pass; a hold left by an earlier pass
+        # (its chunked req since finished) must not keep skipping admission.
+        policy = SchedulePolicy(
+            policy="lpm",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        req = _make_boost_req("r0", 256, arrival=0)
+        req.boost_commit_hold = True  # stale from an earlier sort
+        policy.calc_priority([req])
+        self.assertIs(req.boost_commit_hold, False)
+
+    def test_held_passes_accumulate_across_sorts(self):
+        # The pass counter is the eval log's hold-duration signal; it must
+        # accumulate across passes, not reset per pass.
+        policy = self._boost_policy()
+        trunk = _make_req("trunk", "", list(range(3_000)))
+        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
+        for _ in range(3):
+            policy._mark_commit_holds([sibling], trunk)
+            sibling.boost_commit_hold = False  # calc_priority's per-pass clear
+        self.assertEqual(sibling.boost_commit_hold_passes, 3)
+
+
 class TestAdaptiveBoostGamma(CustomTestCase):
     # window/min_samples shrunk per instance so the estimator math stays
     # testable without 128 completions; the formulas are window-agnostic.
@@ -1029,9 +1174,7 @@ class TestAdaptiveBoostGamma(CustomTestCase):
             gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
         )
         for _ in range(200):
-            gamma = adaptive.record_latencies(
-                [30.0] * 16, rate_tokens_per_s=2000.0
-            )
+            gamma = adaptive.record_latencies([30.0] * 16, rate_tokens_per_s=2000.0)
         # EMA approaches the clip asymptotically (0.8-weighted), so it
         # stalls an ulp or two below GAMMA_MAX_S.
         self.assertAlmostEqual(gamma, AdaptiveBoostGamma.GAMMA_MAX_S, places=10)
@@ -1061,14 +1204,10 @@ class TestAdaptiveBoostGamma(CustomTestCase):
         adaptive = AdaptiveBoostGamma(
             gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
         )
-        with self.assertLogs(
-            "sglang.srt.managers.schedule_policy", level="INFO"
-        ) as cm:
+        with self.assertLogs("sglang.srt.managers.schedule_policy", level="INFO") as cm:
             # Degenerate fat tail: raw fit ~ ln5/(6e8) far below the floor.
             for _ in range(200):
-                adaptive.record_latencies(
-                    [0.0] * 15 + [1e9], rate_tokens_per_s=2000.0
-                )
+                adaptive.record_latencies([0.0] * 15 + [1e9], rate_tokens_per_s=2000.0)
         fit_m = re.search(r"fit=([\d.eE+-]+)", cm.output[-1])
         floor_m = re.search(r"floor=([\d.eE+-]+)", cm.output[-1])
         pinned_m = re.search(r"pinned=(\d+)%", cm.output[-1])
@@ -1090,22 +1229,16 @@ class TestAdaptiveBoostGamma(CustomTestCase):
         adaptive = AdaptiveBoostGamma(
             gamma0=0.09, bin_size=256, max_jump_s=60.0, window=16, min_samples=8
         )
-        self.assertIsNone(
-            adaptive.record_latencies([5.0] * 7, rate_tokens_per_s=None)
-        )
+        self.assertIsNone(adaptive.record_latencies([5.0] * 7, rate_tokens_per_s=None))
         self.assertEqual(adaptive.gamma, 0.09)
-        self.assertIsNotNone(
-            adaptive.record_latencies([5.0], rate_tokens_per_s=None)
-        )
+        self.assertIsNotNone(adaptive.record_latencies([5.0], rate_tokens_per_s=None))
 
     def test_gamma0_outside_outer_bounds_clips_at_init(self):
         # A tokens-scale gamma0 (1e-4 per-token) is below the 1/s outer
         # floor; it must clip up at construction, not run unclipped until
         # the first completion arrives (mode-mismatch guard for the
         # default-resolution path).
-        adaptive = AdaptiveBoostGamma(
-            gamma0=1e-4, bin_size=256, max_jump_s=60.0
-        )
+        adaptive = AdaptiveBoostGamma(gamma0=1e-4, bin_size=256, max_jump_s=60.0)
         self.assertEqual(adaptive.gamma, AdaptiveBoostGamma.GAMMA_MIN_S)
 
 

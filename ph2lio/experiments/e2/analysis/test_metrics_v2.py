@@ -319,21 +319,26 @@ class TestComputeMetricsV2(unittest.TestCase):
 
     def test_metric_values(self):
         metrics = self._compute(False)
-        # waits [2, 1]: mean 1.5; sorted [1,2]: p90 1.9, p99 1.99
+        # waits [2, 1]: mean 1.5; sorted [1,2]: p50 1.5, p90 1.9, p95 1.95, p99 1.99
         q = metrics["queue_wait_s"]
         self.assertEqual(q["n"], 2)
         self.assertEqual(q["mean"], 1.5)
+        self.assertEqual(q["p50"], 1.5)
         self.assertEqual(q["p90"], 1.9)
+        self.assertEqual(q["p95"], 1.95)
         self.assertEqual(q["p99"], 1.99)
-        # ttft_ms [500, 200]: mean 350; p95 200+0.95*300=485; p99 497
+        # ttft_ms [500, 200]: mean 350; p50 350; p95 200+0.95*300=485; p99 497
         self.assertEqual(metrics["ttft_ms"]["mean"], 350.0)
+        self.assertEqual(metrics["ttft_ms"]["p50"], 350.0)
         self.assertEqual(metrics["ttft_ms"]["p95"], 485.0)
         self.assertEqual(metrics["ttft_ms"]["p99"], 497.0)
-        # ITL per-chunk pooled [100, 300]: mean 200, p90 280, p99 298
+        # ITL per-chunk pooled [100, 300]: mean 200, p50 200, p90 280, p95 290, p99 298
         self.assertEqual(metrics["itl_ms"]["source"], "per_chunk")
         self.assertEqual(metrics["itl_ms"]["n_chunks"], 2)
         self.assertEqual(metrics["itl_ms"]["mean"], 200.0)
+        self.assertEqual(metrics["itl_ms"]["p50"], 200.0)
         self.assertEqual(metrics["itl_ms"]["p90"], 280.0)
+        self.assertEqual(metrics["itl_ms"]["p95"], 290.0)
         self.assertEqual(metrics["itl_ms"]["p99"], 298.0)
         # tokens 12 over window (12-10)=2 s -> 6.0
         self.assertEqual(metrics["tok_per_s"]["value"], 6.0)
