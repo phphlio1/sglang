@@ -177,3 +177,52 @@ env-gate `NSYS_PROFILE=1` commit `cec7d6ace1`, collection window +120 s) — so 
   thật `combine` chỉ ~0.7 ms) — chữ ký GPU của batch mỏng MoE EP=8 (focus 1);
   memcpy DtoD 18.1–20.4 GB/window, HtoD/DtoH ≈ 0 GB. Truy vấn:
   `scripts/nsys_window_summary.py` (sqlite từng cell, `profiling/nsys/*.sqlite`).
+
+## 8. Xác nhận trực tiếp cơ chế prefill-delayer từ metric outcomes (23/10)
+
+Trích `sglang:prefill_delayer_outcomes` (counter) + 2 histogram
+`wait_forward_passes`/`wait_seconds` **kèm đủ label** từ
+`server_metrics_export.jsonl` của 5 cell NSys (delta trong benchmark window từng
+cell; trước đây `extract_metrics_timeseries.py` bỏ label nên metric này chưa
+phân tích được). Script `scripts/delayer_outcomes_scan.py`; log
+`/shared/loipp/logs/delayer_outcomes_retry.log`; chi tiết per-rank
+`/shared/loipp/logs/delayer_outcomes_<stamp>.tsv`.
+
+| Chỉ số (window, gom 8 rank) | 141334 | 152339 | 171014 | 182013 | 193141 |
+|---|---|---|---|---|---|
+| Pass bị hoãn — nhánh mixed (`delay`) | 118.704+1.328 | 120.067+1.269 | 119.712+1.338 | 116.709+1.377 | 124.319+1.209 |
+| — trong đó chunk tiếp diễn vẫn chạy (exec=true) | 1.328 | 1.269 | 1.338 | 1.377 | 1.209 |
+| Pass không rank nào có prefill (`none`) | 59.783 | 61.982 | 56.311 | 56.138 | 58.752 |
+| Hết 30 pass buộc cho phép, KHÔNG sinh batch | 3.002 | 3.044 | 3.033 | 2.985 | 3.185 |
+| Hết 30 pass buộc cho phép, CÓ sinh batch | 1.094 | 1.084 | 1.079 | 1.031 | 1.085 |
+| Nhánh "all" (mọi rank cùng có prefill) | **0** | **0** | **0** | **0** | **0** |
+| `wait_forward_passes` bucket ≤20 pass | 0 | 0 | 0 | 0 | 0 |
+| `wait_seconds` mean mỗi lần chờ (s) | 2,38 | 2,15 | 2,32 | 2,35 | 2,06 |
+| Tổng pass/rank (→ ms/pass) | 22.989 (78) | 23.431 (77) | 22.684 (79) | 22.280 (81) | 23.569 (76) |
+| Tỷ lệ pass rơi vào trạng thái mixed | 65,3% | 64,7% | 66,7% | 66,3% | 66,6% |
+
+Kết luận (5/5 cell nhất quán):
+
+- **Nhánh "all" = 0** → slot-trigger trong nhánh "all" (`prefill_delayer.py`
+  270-277) chưa bao giờ chạy — khớp suy luận code+config (256 slot ≫ running
+  2,3-4,5/rank; queue-trigger tắt `queue_trigger_enabled=False`; valve watermark
+  tắt `token_usage_low_watermark=None`, engine log dòng 673-694). **100% lần hoãn
+  đến từ nhánh mixed** ("một số rank có prefill, số kia không" —
+  `prefill_delayer.py:319-346`).
+- **100% lần chờ kết thúc ở bucket 21-29 pass** (bucket ≤20 = 0) → mỗi lần chờ
+  đều chạm mũ `max_delay_passes=30`, không bao giờ dừng sớm nhờ alignment (vì
+  "all" không đạt được bao giờ).
+- **wait_seconds mean 2,06-2,38 s ≈ queue-wait của request trúng device
+  (1,80-2,42 s, §7)** → phần delayer góp vào hàng chờ = đúng 1 chu kỳ 30 pass
+  (~76-81 ms/pass), đúng như thiết kế bounded.
+- **~65-67% tổng số pass scheduler bị giữ prefill** vì mất đồng bộ rank — nguyên
+  nhân gốc là router ghim ~90% request về rank giữ tiền tố (focus 2): bottleneck
+  (1) được nuôi bằng bottleneck (2), khớp chiều đã chốt ở §3-§4.
+- Hết 30 pass mà vẫn **không sinh batch: 2,7-2,9×** số lần sinh batch → phần lớn
+  lần thử vào batch thất bại ngay cả khi delayer đã buông — nhất quán với request
+  trúng host phải chờ thu hồi+nạp lại qua nhiều chu kỳ (qw trúng host 21,2-25,7 s
+  ≈ ~9-11 chu kỳ × ~2,3 s cộng thời gian nạp; metric không có label host/device
+  nên chưa tách trực tiếp từng lần).
+- Kiểm tra chéo: tổng pass có prefill chạy (timeout-exec + chunk-exec) =
+  2.294-2.422 ≈ số dòng `Prefill batch` trong window đếm từ engine log (cell
+  141334: 2.422 vs 2.424 — chênh 2 ở biên scrape).
