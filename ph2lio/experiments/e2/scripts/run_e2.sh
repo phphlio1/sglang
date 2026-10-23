@@ -54,7 +54,7 @@ SEED="${SEED:-42}"
 OUTPUT_DIR="${OUTPUT_DIR:-${E2_DIR}/results/1x-rtx6000pro/agentx}"
 SERVER_SCRIPT="${SERVER_SCRIPT:-${E2_DIR}/scripts/start_server.sh}"
 METRICS_SCRIPT="${METRICS_SCRIPT:-${E2_DIR}/analysis/agentx_metrics.py}"
-AIPERF="${AIPERF:-${E2_DIR}/.venv/bin/aiperf}"
+AIPERF="${AIPERF:-${E2_DIR}/../.venv-e2/bin/aiperf}"
 
 SMOKE_POLICY="${SMOKE_POLICY:-dfs-weight}"  # server policy for smoke mode
 SMOKE_DURATION="${SMOKE_DURATION:-300}"     # s; below scenario min -> --unsafe-override
