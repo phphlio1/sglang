@@ -124,7 +124,7 @@ Các hiện tượng dưới đây có đo được trong 5 run nhưng **không 
 - **Thước đo còn hở**: `sglang:fwd_occupancy` thỉnh thoảng bị drop mẫu NaN
   trong export; client không report `usage.prompt_tokens_details.cached_tokens`
   (cần `--enable-cache-report` phía server); `sglang:prefill_delayer_outcomes`
-  có đếm per outcome/rank nhưng chưa được phân tích chi tiết.
+  đã được phân tích chi tiết ở §8 (23/10, sau khi extract giữ đủ label).
 - **MoE expert imbalance**: EP=8 → mỗi bước forward, token mọi rank all-to-all tới đúng expert, nếu 1 expert nóng, rank chứa expert đó chậm → gate cả bước của cả 8 rank. Với workload AgentX (agent/tool-use) phân bố expert theo chủ đề rất dễ lệch. Trong stack hiện tại không có metric per-expert nào được register - chỉ có sglang:eplb_balancedness (metrics_collector.py:923, Summary per forward_mode) nhưng chỉ register khi bật EPLB và ở moe_ep_rank=0. 
 
 
