@@ -10,6 +10,7 @@ diverged -- investigate before trusting either. Usage:
 
 from __future__ import annotations
 
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -43,13 +44,23 @@ def wait_rows(run_dir: Path) -> list[dict]:
     post = lines[offset:]
     nohealth = [r for r in post if not str(r.get("rid", "")).startswith("HEALTH_CHECK_")]
     cut = None
-    export = run_dir / "server_metrics_export.jsonl"
-    if export.exists():
-        for line in export.open():
-            record = json.loads(line)
-            if record.get("benchmark_phase") == "profiling" and record.get("timestamp_ns"):
-                cut = record["timestamp_ns"] / 1e9
-                break
+    # The plain export is preferred when present (RTX dirs); the H200 phase-2
+    # driver archives it as .jsonl.gz after the metrics writer consumed it.
+    for export in (
+        run_dir / "server_metrics_export.jsonl",
+        run_dir / "server_metrics_export.jsonl.gz",
+    ):
+        if not export.exists():
+            continue
+        opener = gzip.open if export.suffix == ".gz" else open
+        with opener(export, "rt") as fh:
+            for line in fh:
+                record = json.loads(line)
+                if record.get("benchmark_phase") == "profiling" and record.get("timestamp_ns"):
+                    cut = record["timestamp_ns"] / 1e9
+                    break
+        if cut is not None:
+            break
     inwin = [
         r
         for r in nohealth
