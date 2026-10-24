@@ -1,0 +1,42 @@
+{
+  "77188": {
+    "boost g0.25": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/boost/c64_g0.25_wall_k256_20261023_191336"
+    ],
+    "boost ada j50": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/boost/c64_gada_wall_k256_j50_20261023_202140"
+    ],
+    "dfs-weight": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/dfs-weight/c64_20261023_144212"
+    ],
+    "fcfs": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/fcfs/c64_20261023_154921"
+    ],
+    "hrrn": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/hrrn/c64_20261023_180511"
+    ],
+    "lpm": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/lpm/c64_20261023_165726"
+    ]
+  },
+  "42302": {
+    "boost g0.25": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/boost/c64_g0.25_wall_k256_20261024_020906"
+    ],
+    "boost ada j50": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/boost/c64_gada_wall_k256_j50_20261024_031604"
+    ],
+    "dfs-weight": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/dfs-weight/c64_20261023_213715"
+    ],
+    "fcfs": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/fcfs/c64_20261023_224805"
+    ],
+    "hrrn": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/hrrn/c64_20261024_010208"
+    ],
+    "lpm": [
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/lpm/c64_20261023_235453"
+    ]
+  }
+}
