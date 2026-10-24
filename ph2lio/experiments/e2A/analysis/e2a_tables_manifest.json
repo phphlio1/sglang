@@ -1,0 +1,60 @@
+{
+  "77188": {
+    "bc l0.25 m8192": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l0.25_m8192_20261024_134045"
+    ],
+    "bc l0.5 m2048": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l0.5_m2048_20261024_162421"
+    ],
+    "bc l0.5 m32768": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l0.5_m32768_20261024_171852"
+    ],
+    "bc l0.5 m8192": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l0.5_m8192_20261024_143517"
+    ],
+    "bc l1.0 m8192": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l1.0_m8192_20261024_152953"
+    ],
+    "bc ada j50": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_gada_wall_k256_j50_l0.5_m8192_20261024_181320"
+    ],
+    "boost g0.25": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261024_124610"
+    ],
+    "dfs-weight": [
+      "results/1x-rtx6000pro/agentx/dfs-weight/c16_20261024_200208"
+    ],
+    "lpm": [
+      "results/1x-rtx6000pro/agentx/lpm/c16_20261024_190744"
+    ]
+  },
+  "42302": {
+    "bc l0.25 m8192": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l0.25_m8192_20261024_215026"
+    ],
+    "bc l0.5 m2048": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l0.5_m2048_20261025_003158"
+    ],
+    "bc l0.5 m32768": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l0.5_m32768_20261025_012542"
+    ],
+    "bc l0.5 m8192": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l0.5_m8192_20261024_224419"
+    ],
+    "bc l1.0 m8192": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_g0.25_wall_k256_l1.0_m8192_20261024_233807"
+    ],
+    "bc ada j50": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_gada_wall_k256_j50_l0.5_m8192_20261025_021930"
+    ],
+    "boost g0.25": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261024_205637"
+    ],
+    "dfs-weight": [
+      "results/1x-rtx6000pro/agentx/dfs-weight/c16_20261025_040703"
+    ],
+    "lpm": [
+      "results/1x-rtx6000pro/agentx/lpm/c16_20261025_031320"
+    ]
+  }
+}
