@@ -81,7 +81,10 @@ BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-50}"  # 1.08x p95 giant 
 # Boost-cache fusion arms ("lambda:cap" pairs): the e2A c16 sweep showed M
 # dominates lambda (m2048 best at light, m32768 best at overload), so the
 # H200 pass sweeps M at the mid lambda 0.5 on the static g0.25 base.
-BOOST_CACHE_ARMS="${BOOST_CACHE_ARMS:-0.5:2048 0.5:8192 0.5:32768}"
+# ${VAR-...} (no colon), NOT ${VAR:-...}: an explicitly exported empty
+# value disables the bc pass; :- treats empty as unset and runs the
+# default grid (job 6164 ran 3 dead bc cells on an ada-only resubmit).
+BOOST_CACHE_ARMS="${BOOST_CACHE_ARMS-0.5:2048 0.5:8192 0.5:32768}"
 SEEDS_LIST="${SEEDS_LIST:-77188}"  # one seed per job; 42302 + later seeds via --export=ALL,SEEDS_LIST=<seed>
 N_RUNS="${N_RUNS:-1}"              # target completed runs/cell; same-seed passes: --export=ALL,N_RUNS=2,3,...
 CONCS="${CONCS:-64}"       # c48 only if time permits (--export=ALL,CONCS="48 64")
