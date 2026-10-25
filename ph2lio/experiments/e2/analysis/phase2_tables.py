@@ -31,6 +31,14 @@ ARM_ORDER = [
     "boost g0.25",
     "boost ada j50",
 ]
+# Boost-cache fusion arms (2026-10-25): optional until their cells land -- a
+# manifest without them still tables (classic arms stay required), so the
+# pre-bc interim tables run without --allow-partial.
+BC_ARM_ORDER = [
+    "bc l0.5 m2048",
+    "bc l0.5 m8192",
+    "bc l0.5 m32768",
+]
 BASELINE = "dfs-weight"
 SEED_LABEL = {"77188": "overload", "42302": "light"}
 
@@ -45,7 +53,7 @@ def main() -> None:
     if seed not in manifest:
         sys.exit(f"ABORT: seed {seed} not in manifest (have {list(manifest)})")
     arms = {a: ft.load_arm(seed, a, dirs) for a, dirs in manifest[seed].items()}
-    extra = [a for a in arms if a not in ARM_ORDER]
+    extra = [a for a in arms if a not in ARM_ORDER + BC_ARM_ORDER]
     if extra:
         sys.exit(f"ABORT: seed {seed} has arms outside ARM_ORDER: {extra}")
     missing = [a for a in ARM_ORDER if a not in arms]
@@ -53,7 +61,11 @@ def main() -> None:
         sys.exit(f"ABORT: seed {seed} missing arms {missing}")
     if BASELINE not in arms:
         sys.exit(f"ABORT: seed {seed} missing baseline {BASELINE}")
-    order = [BASELINE] + [a for a in ARM_ORDER if a != BASELINE and a in arms]
+    order = (
+        [BASELINE]
+        + [a for a in ARM_ORDER if a != BASELINE and a in arms]
+        + [a for a in BC_ARM_ORDER if a in arms]
+    )
     label = SEED_LABEL.get(seed, seed)
     print(
         f"## Seed {seed} ({label}, c64) -- runs/arm: "

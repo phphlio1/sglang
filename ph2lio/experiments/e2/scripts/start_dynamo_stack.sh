@@ -51,6 +51,11 @@ BOOST_BIN_SIZE="${BOOST_BIN_SIZE:-256}"
 BOOST_ADAPTIVE_GAMMA="${BOOST_ADAPTIVE_GAMMA:-0}"
 BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-60}"
 BOOST_CLOCK="${BOOST_CLOCK:-wall}"
+# Boost-cache arm (e2A port): bounded lpm fusion knobs -- lambda weight and
+# the matched-token cap M (phi' = phi - lambda*min(matched, M) on top of the
+# boost newcomer-jump bound).
+BOOST_CACHE_LAMBDA="${BOOST_CACHE_LAMBDA:-0.5}"
+BOOST_CACHE_CAP="${BOOST_CACHE_CAP:-8192}"
 IN_BATCH_PREFIX_CACHING_MAX_PIN_S="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S:-60}"
 LOG_SCHEDULE_EVAL_PATH="${LOG_SCHEDULE_EVAL_PATH:-}"
 
@@ -69,15 +74,18 @@ fi
 
 POLICY="${1:?usage: start_dynamo_stack.sh <policy> | --stop}"
 case "$POLICY" in
-  fcfs|fcfs-match|lpm|hrrn|dfs-weight|lof|shortest-prefill-first|boost) ;;
+  fcfs|fcfs-match|lpm|hrrn|dfs-weight|lof|shortest-prefill-first|boost|boost-cache) ;;
   *) echo "ERROR: unknown policy '$POLICY'" >&2; exit 2 ;;
 esac
 
 POLICY_FLAGS=()
-if [[ "${POLICY}" == "boost" ]]; then
+if [[ "${POLICY}" == "boost" || "${POLICY}" == "boost-cache" ]]; then
   [[ -n "${BOOST_GAMMA}" ]] && POLICY_FLAGS+=(--boost-gamma="${BOOST_GAMMA}")
   POLICY_FLAGS+=(--boost-bin-size="${BOOST_BIN_SIZE}" --boost-clock="${BOOST_CLOCK}")
   [[ "${BOOST_ADAPTIVE_GAMMA}" == "1" ]] && POLICY_FLAGS+=(--boost-adaptive-gamma --boost-adaptive-max-jump-s "${BOOST_ADAPTIVE_MAX_JUMP_S}")
+fi
+if [[ "${POLICY}" == "boost-cache" ]]; then
+  POLICY_FLAGS+=(--boost-cache-lambda="${BOOST_CACHE_LAMBDA}" --boost-cache-cap-tokens="${BOOST_CACHE_CAP}")
 fi
 POLICY_FLAGS+=(--in-batch-prefix-caching-max-pin-s="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S}")
 [[ -n "${LOG_SCHEDULE_EVAL_PATH}" ]] && POLICY_FLAGS+=(--log-schedule-eval-path="${LOG_SCHEDULE_EVAL_PATH}")
@@ -135,6 +143,9 @@ rm -rf "${DYN_FILE_KV}"
 mkdir -p "${DYN_FILE_KV}"
 
 echo "=== dynamo stack: nats + frontend(:${FRONTEND_PORT}) + engine(policy=${POLICY}) ==="
+if [[ "${POLICY}" == "boost-cache" ]]; then
+  echo "boost-cache: lambda=${BOOST_CACHE_LAMBDA}  cap=${BOOST_CACHE_CAP}"
+fi
 echo "logs: ${NATS_LOG} / ${FRONTEND_LOG} / ${ENGINE_LOG}"
 
 # 1. NATS — dynamo's discovery/event plane backend (static go binary).

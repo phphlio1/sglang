@@ -7,6 +7,10 @@
 #   hrrn, boost static gamma=0.25 (RTX 10-arm sweep representative: top-2 in
 #   both regimes, best light-regime arm), boost adaptive (gamma-Ada Eq. 9
 #   fit, jump floor J=BOOST_ADAPTIVE_MAX_JUMP_S).
+#   Plus (2026-10-25) boost-cache fusion arms -- phi' = A - b_gamma(q) -
+#   lambda*min(matched, M) on boost g0.25, the e2A RTX port -- sweeping M at
+#   lambda=0.5 (BOOST_CACHE_ARMS), run after the boost arms under the same
+#   N_RUNS resume rule.
 #
 # J derivation (2026-10-23, 5 valid phase-1 cells, n=419 cold giants >=50k
 # tok with matched<=10%): prefill p50=19.8 p95=46.3 p99=65.7 s at ~4.9-5.3k
@@ -74,6 +78,10 @@ BENCH="${BENCH:-/shared/loipp}"
 E2_DIR="${BENCH}/sglang/ph2lio/experiments/e2"
 BOOST_SWEEP_GAMMA="${BOOST_SWEEP_GAMMA:-0.25}"  # RTX representative static gamma
 BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-50}"  # 1.08x p95 giant prefill (header)
+# Boost-cache fusion arms ("lambda:cap" pairs): the e2A c16 sweep showed M
+# dominates lambda (m2048 best at light, m32768 best at overload), so the
+# H200 pass sweeps M at the mid lambda 0.5 on the static g0.25 base.
+BOOST_CACHE_ARMS="${BOOST_CACHE_ARMS:-0.5:2048 0.5:8192 0.5:32768}"
 SEEDS_LIST="${SEEDS_LIST:-77188}"  # one seed per job; 42302 + later seeds via --export=ALL,SEEDS_LIST=<seed>
 N_RUNS="${N_RUNS:-1}"              # target completed runs/cell; same-seed passes: --export=ALL,N_RUNS=2,3,...
 CONCS="${CONCS:-64}"       # c48 only if time permits (--export=ALL,CONCS="48 64")
@@ -205,6 +213,27 @@ run_cell() {  # $1 = policy, $2 = conc, $3 = boost mode ("" | static gamma | "ad
   done
 }
 
+run_bc_cell() {  # $1 = conc, $2 = lambda, $3 = cap tokens, $4 = seed
+  local c="$1" lam="$2" cap="$3" seed="$4" label n
+  label="c${c}_g${BOOST_SWEEP_GAMMA}_${BOOST_CLOCK}_k${BOOST_BIN_SIZE}_l${lam}_m${cap}"
+  n="$(runs_done boost-cache "${label}" "${seed}")"
+  if [[ "${n}" -ge "${N_RUNS}" ]]; then
+    echo "=== E2 resume: skip boost-cache ${label} seed=${seed} (${n}/${N_RUNS} runs done) ==="
+    return 0
+  fi
+  if [[ "${n}" -gt 0 ]]; then
+    echo "=== E2 repeat pass ${n} -> ${N_RUNS}: boost-cache ${label} seed=${seed} ==="
+  fi
+  echo "=== E2 phase2 cell: policy=boost-cache c=${c} l=${lam} m=${cap} seed=${seed} ==="
+  BOOST_GAMMA="${BOOST_SWEEP_GAMMA}" BOOST_CACHE_LAMBDA="${lam}" BOOST_CACHE_CAP="${cap}" \
+    SEED="${seed}" bash scripts/run_e2.sh policy boost-cache "${c}" \
+    || echo "=== E2 cell failed: boost-cache ${label} seed=${seed} (will retry on resubmit) ==="
+  find "${OUTPUT_DIR}" -name e2_metrics.json | while read -r m; do
+    d="$(dirname "${m}")"
+    if [[ -f "${d}/server_metrics_export.jsonl" ]]; then gzip -f "${d}/server_metrics_export.jsonl"; fi
+  done
+}
+
 # Seed-major (paired): seed 77188 block first. dfs-weight first within each
 # seed (prod baseline), classic policies next, boost arms last.
 read -ra SEEDS <<< "${SEEDS_LIST}"
@@ -216,5 +245,10 @@ for seed in "${SEEDS[@]}"; do
   done
   for c in "${CONC_LIST[@]}"; do run_cell boost "${c}" "${BOOST_SWEEP_GAMMA}" "${seed}"; done
   for c in "${CONC_LIST[@]}"; do run_cell boost "${c}" "ada" "${seed}"; done
+  for c in "${CONC_LIST[@]}"; do
+    for bc in ${BOOST_CACHE_ARMS}; do
+      run_bc_cell "${c}" "${bc%%:*}" "${bc##*:}" "${seed}"
+    done
+  done
 done
 echo "=== PHASE2 DONE ==="
