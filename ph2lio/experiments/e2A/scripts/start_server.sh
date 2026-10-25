@@ -56,10 +56,10 @@ BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-60}"
 # effective gamma / adaptive fixed point independent of cache state;
 # tokens is the paper-exact counted-token clock.
 BOOST_CLOCK="${BOOST_CLOCK:-wall}"
-# boost-cache arm (e2A): bounded lpm fusion. phi' = phi - lambda*min(matched,
-# M); the newcomer jump bound grows from b_gamma(k) to b_gamma(k) + lambda*M.
-BOOST_CACHE_LAMBDA="${BOOST_CACHE_LAMBDA:-0.5}"
-BOOST_CACHE_CAP="${BOOST_CACHE_CAP:-8192}"
+# boost-cache arm (e2A v2): cache-hit aging. phi' = phi - alpha*m_hat*age,
+# m_hat = matched/(input+output) in [0,1]; a cache hit ages at up to
+# (1+alpha) times the cold rate, credit zero at arrival.
+BOOST_CACHE_ALPHA="${BOOST_CACHE_ALPHA:-0.5}"
 # In-batch dedup follower-pin hold bound (seconds), shared by every
 # cache-aware policy; 0 disables (pre-fix unbounded behavior).
 IN_BATCH_PREFIX_CACHING_MAX_PIN_S="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S:-60}"
@@ -113,7 +113,7 @@ if [[ "${POLICY}" == "boost" || "${POLICY}" == "boost-cache" ]]; then
   [[ "${BOOST_ADAPTIVE_GAMMA}" == "1" ]] && POLICY_FLAGS+=(--boost-adaptive-gamma --boost-adaptive-max-jump-s "${BOOST_ADAPTIVE_MAX_JUMP_S}")
 fi
 if [[ "${POLICY}" == "boost-cache" ]]; then
-  POLICY_FLAGS+=(--boost-cache-lambda "${BOOST_CACHE_LAMBDA}" --boost-cache-cap-tokens "${BOOST_CACHE_CAP}")
+  POLICY_FLAGS+=(--boost-cache-alpha "${BOOST_CACHE_ALPHA}")
 fi
 # Follower-pin hold bound: applies to every cache-aware policy.
 POLICY_FLAGS+=(--in-batch-prefix-caching-max-pin-s "${IN_BATCH_PREFIX_CACHING_MAX_PIN_S}")
@@ -144,7 +144,7 @@ if [[ "${POLICY}" == "boost" || "${POLICY}" == "boost-cache" ]]; then
   echo "boost: gamma=${BOOST_GAMMA:-<clock default>}  bin_size=${BOOST_BIN_SIZE}  clock=${BOOST_CLOCK}  adaptive=${BOOST_ADAPTIVE_GAMMA}"
 fi
 if [[ "${POLICY}" == "boost-cache" ]]; then
-  echo "boost-cache: lambda=${BOOST_CACHE_LAMBDA}  cap=${BOOST_CACHE_CAP}"
+  echo "boost-cache: alpha=${BOOST_CACHE_ALPHA}"
 fi
 echo "in-batch dedup pin bound: ${IN_BATCH_PREFIX_CACHING_MAX_PIN_S}s"
 if [[ -n "${LOG_SCHEDULE_EVAL_PATH}" ]]; then

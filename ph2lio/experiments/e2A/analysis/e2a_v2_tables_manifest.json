@@ -1,0 +1,24 @@
+{
+  "77188": {
+    "dfs-weight": [
+      "results/1x-rtx6000pro/agentx/dfs-weight/c16_20261024_200208"
+    ],
+    "lpm": [
+      "results/1x-rtx6000pro/agentx/lpm/c16_20261024_190744"
+    ],
+    "boost g0.25": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261024_124610"
+    ]
+  },
+  "42302": {
+    "dfs-weight": [
+      "results/1x-rtx6000pro/agentx/dfs-weight/c16_20261025_040703"
+    ],
+    "lpm": [
+      "results/1x-rtx6000pro/agentx/lpm/c16_20261025_031320"
+    ],
+    "boost g0.25": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261024_205637"
+    ]
+  }
+}

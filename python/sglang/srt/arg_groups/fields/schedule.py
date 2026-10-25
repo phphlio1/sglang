@@ -163,35 +163,23 @@ class Schedule(msgspec.Struct):
             choices=["tokens", "wall"],
         ),
     ] = "tokens"
-    boost_cache_lambda: A[
+    boost_cache_alpha: A[
         float,
         Arg(
             help=(
-                "Cache-affinity weight for the boost-cache policy: "
-                "phi'(r) = A(r) - b_gamma(q(u(r))) - lambda * min(matched, M) "
-                "pulls requests with a hot radix-tree prefix (the signal lpm "
-                "sorts on) ahead of equal-bin cold ones, recovering lpm-style "
-                "cache reuse. The bonus is bounded, so the newcomer jump bound "
-                "grows from b_gamma(bin_size) to b_gamma(bin_size) + lambda*M "
-                "clock-tokens (wall: lambda*M/rate seconds) -- anti-starvation "
-                "degrades gracefully, unlike lpm's unbounded cache dominance. "
-                "0 is bit-identical to boost; 1 trades one matched token for "
-                "one clock-token of seniority. Only used with "
-                "--schedule-policy boost-cache."
+                "Cache-aging weight for the boost-cache policy: "
+                "phi'(r) = A(r) - b_gamma(q(u(r))) - alpha*m_hat*age, where "
+                "m_hat is the cached fraction of the request's prompt, so a "
+                "cache-hit request ages up to (1 + alpha) times faster than "
+                "a cold one. The credit is earned by waiting (zero at "
+                "arrival), so the newcomer jump bound stays b_gamma(bin_size) "
+                "and the cached/uncached cohort delay ratio stays <= 1 + "
+                "alpha, unlike lpm's unbounded cache dominance. 0 is "
+                "bit-identical to boost. Only used with --schedule-policy "
+                "boost-cache."
             ),
         ),
     ] = 0.5
-    boost_cache_cap_tokens: A[
-        int,
-        Arg(
-            help=(
-                "Cap M on the matched-prefix tokens that earn the boost-cache "
-                "bonus (the lambda*min(matched, M) term); matched tokens beyond "
-                "M add nothing. Power of two recommended. Only used with "
-                "--schedule-policy boost-cache."
-            ),
-        ),
-    ] = 8192
     in_batch_prefix_caching_max_pin_s: A[
         float,
         Arg(

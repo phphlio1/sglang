@@ -201,10 +201,7 @@ def check_server_args(server_args: Any):
         assert cfg.boost_gamma > 0, "boost_gamma must be > 0"
         assert cfg.boost_bin_size >= 1, "boost_bin_size must be >= 1"
     if cfg.schedule_policy == "boost-cache":
-        assert 0.0 <= cfg.boost_cache_lambda <= 1.0, (
-            "boost_cache_lambda must be within [0, 1]"
-        )
-        assert cfg.boost_cache_cap_tokens >= 1, "boost_cache_cap_tokens must be >= 1"
+        assert cfg.boost_cache_alpha >= 0, "boost_cache_alpha must be >= 0"
     if cfg.boost_adaptive_gamma:
         assert cfg.schedule_policy in ("boost", "boost-cache"), (
             "--boost-adaptive-gamma requires --schedule-policy boost or boost-cache"

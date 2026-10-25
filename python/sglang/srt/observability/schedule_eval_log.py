@@ -66,16 +66,14 @@ class ScheduleEvalLogger:
         boost_gamma: float,
         boost_bin_size: int,
         boost_clock: str,
-        boost_cache_lambda: float,
-        boost_cache_cap_tokens: int,
+        boost_cache_alpha: float,
     ) -> None:
         self.path = path
         self.policy = policy
         self.boost_gamma = boost_gamma
         self.boost_bin_size = boost_bin_size
         self.boost_clock = boost_clock
-        self.boost_cache_lambda = boost_cache_lambda
-        self.boost_cache_cap_tokens = boost_cache_cap_tokens
+        self.boost_cache_alpha = boost_cache_alpha
         self._seen_rids: Set[str] = set()
         self._file: Optional[TextIO] = None
         try:
@@ -145,8 +143,7 @@ class ScheduleEvalLogger:
             "boost_clock": self.boost_clock,
             "bin_size": self.boost_bin_size,
             # boost-cache arm identity (inert under every other policy).
-            "cache_lambda": self.boost_cache_lambda,
-            "cache_cap_tokens": self.boost_cache_cap_tokens,
+            "cache_alpha": self.boost_cache_alpha,
             "arrival_wall_s": arrival_wall_s,
             "queue_wait_s": queue_wait_s,
             "ttft_s": ttft_s,

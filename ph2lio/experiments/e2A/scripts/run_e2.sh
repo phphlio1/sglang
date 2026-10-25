@@ -18,7 +18,7 @@
 # user-maintained scripts/start_server.sh (all serving config lives there;
 # policy is its $1). A running server is reused only when its FULL policy
 # spec matches -- schedule_policy, and for boost/boost-cache also
-# boost_gamma / boost_bin_size (/ boost_cache_lambda / boost_cache_cap_tokens),
+# boost_gamma / boost_bin_size (/ boost_cache_alpha),
 # plus the schedule-eval log path; anything else is
 # restarted. A server this script started is stopped when the run finishes
 # (STOP_SERVER=never to keep it, always to stop any).
@@ -82,16 +82,17 @@ BOOST_ADAPTIVE_MAX_JUMP_S="${BOOST_ADAPTIVE_MAX_JUMP_S:-60}"
 # paper-exact counted-token clock (the pre-fix behavior). gamma-Ada requires
 # wall (the Eq. 9 fit is wall seconds).
 BOOST_CLOCK="${BOOST_CLOCK:-wall}"
-# boost-cache arm (e2A): bounded lpm fusion. phi' = phi - lambda*min(matched,
-# M); the newcomer jump bound grows from b_gamma(k) to b_gamma(k) + lambda*M
-# (wall: lambda*M/rate s), so anti-starvation degrades by a fixed amount.
-BOOST_CACHE_LAMBDA="${BOOST_CACHE_LAMBDA:-0.5}"
-BOOST_CACHE_CAP="${BOOST_CACHE_CAP:-8192}"
+# boost-cache arm (e2A v2): cache-hit aging. phi' = phi - alpha*m_hat*age,
+# m_hat = matched/(input+output) in [0,1]; a cache hit ages at up to
+# (1+alpha) times the cold rate, the credit is zero at arrival (the
+# newcomer jump bound stays b_gamma(k)), and the cached/uncached cohort
+# delay ratio stays <= 1+alpha.
+BOOST_CACHE_ALPHA="${BOOST_CACHE_ALPHA:-0.5}"
 # In-batch dedup follower-pin hold bound (seconds), every cache-aware policy.
 IN_BATCH_PREFIX_CACHING_MAX_PIN_S="${IN_BATCH_PREFIX_CACHING_MAX_PIN_S:-60}"
 # Exported so start_server.sh sees the resolved values (not just inherited
 # ones), keeping the two scripts' defaults from drifting apart.
-export BOOST_GAMMA BOOST_BIN_SIZE BOOST_ADAPTIVE_GAMMA BOOST_ADAPTIVE_MAX_JUMP_S BOOST_CLOCK BOOST_CACHE_LAMBDA BOOST_CACHE_CAP IN_BATCH_PREFIX_CACHING_MAX_PIN_S
+export BOOST_GAMMA BOOST_BIN_SIZE BOOST_ADAPTIVE_GAMMA BOOST_ADAPTIVE_MAX_JUMP_S BOOST_CLOCK BOOST_CACHE_ALPHA IN_BATCH_PREFIX_CACHING_MAX_PIN_S
 # Exported so the run_meta python block records the resolved values.
 export GRACE_PERIOD FORCE_RESTART
 # Dataset subsetting for policy mode (Task-4 targeted regime): empty = the
@@ -151,9 +152,9 @@ server_policy() {
 # a gamma value means different things under tokens vs wall.
 requested_eval_path() {  # $1 = policy
   if [[ "$1" == "boost-cache" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
-    printf '%s/schedule_eval_bcada_%s_k%s_j%s_l%s_m%s.jsonl' "${OUTPUT_DIR}/boost-cache" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_ADAPTIVE_MAX_JUMP_S}" "${BOOST_CACHE_LAMBDA}" "${BOOST_CACHE_CAP}"
+    printf '%s/schedule_eval_bcada_%s_k%s_j%s_a%s.jsonl' "${OUTPUT_DIR}/boost-cache" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_ADAPTIVE_MAX_JUMP_S}" "${BOOST_CACHE_ALPHA}"
   elif [[ "$1" == "boost-cache" ]]; then
-    printf '%s/schedule_eval_bc_%s_g%s_k%s_l%s_m%s.jsonl' "${OUTPUT_DIR}/boost-cache" "${BOOST_CLOCK}" "${BOOST_GAMMA:-def}" "${BOOST_BIN_SIZE}" "${BOOST_CACHE_LAMBDA}" "${BOOST_CACHE_CAP}"
+    printf '%s/schedule_eval_bc_%s_g%s_k%s_a%s.jsonl' "${OUTPUT_DIR}/boost-cache" "${BOOST_CLOCK}" "${BOOST_GAMMA:-def}" "${BOOST_BIN_SIZE}" "${BOOST_CACHE_ALPHA}"
   elif [[ "$1" == "boost" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
     printf '%s/schedule_eval_ada_%s_k%s_j%s.jsonl' "${OUTPUT_DIR}/boost" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_ADAPTIVE_MAX_JUMP_S}"
   elif [[ "$1" == "boost" ]]; then
@@ -166,10 +167,10 @@ requested_eval_path() {  # $1 = policy
 policy_params_match() {  # $1 = policy; 0 when the running server's full spec matches
   local info
   info="$(server_info_json)" || return 1
-  python3 - "$1" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}" "${BOOST_CLOCK}" "${BOOST_ADAPTIVE_GAMMA}" "${BOOST_ADAPTIVE_MAX_JUMP_S}" "${BOOST_CACHE_LAMBDA}" "${BOOST_CACHE_CAP}" "$(requested_eval_path "$1")" "${info}" <<'PY'
+  python3 - "$1" "${BOOST_GAMMA}" "${BOOST_BIN_SIZE}" "${BOOST_CLOCK}" "${BOOST_ADAPTIVE_GAMMA}" "${BOOST_ADAPTIVE_MAX_JUMP_S}" "${BOOST_CACHE_ALPHA}" "$(requested_eval_path "$1")" "${info}" <<'PY'
 import json, sys
 
-policy, gamma_s, k_s, clock, ada_s, jump_s, lam_s, cap_s, want_path, info_s = sys.argv[1:11]
+policy, gamma_s, k_s, clock, ada_s, jump_s, alpha_s, want_path, info_s = sys.argv[1:10]
 srv = json.loads(info_s)
 ok = (
     srv.get("schedule_policy") == policy
@@ -193,14 +194,12 @@ if policy in ("boost", "boost-cache"):
         and float(srv["boost_adaptive_max_jump_s"]) == float(jump_s)
     )
 if policy == "boost-cache":
-    # The fusion knobs extend the reuse key: a different (lambda, cap) is a
+    # The cache-aging knob extends the reuse key: a different alpha is a
     # different arm even at the same gamma.
     ok = (
         ok
-        and srv.get("boost_cache_lambda") is not None
-        and float(srv["boost_cache_lambda"]) == float(lam_s)
-        and srv.get("boost_cache_cap_tokens") is not None
-        and int(srv["boost_cache_cap_tokens"]) == int(cap_s)
+        and srv.get("boost_cache_alpha") is not None
+        and float(srv["boost_cache_alpha"]) == float(alpha_s)
     )
 sys.exit(0 if ok else 1)
 PY
@@ -381,13 +380,10 @@ meta = {
     # Boost clock: 'wall' (arrival in seconds, cache-state-pinned gamma) or
     # 'tokens' (paper-exact counted-token clock, the pre-fix behavior).
     "boost_clock": __import__("os").environ.get("BOOST_CLOCK", "wall"),
-    # boost-cache arm (e2A): bounded lpm fusion knobs; the newcomer jump
-    # bound grows from b_gamma(k) to b_gamma(k) + lambda*M.
-    "boost_cache_lambda": float(
-        __import__("os").environ.get("BOOST_CACHE_LAMBDA", "0.5")
-    ),
-    "boost_cache_cap_tokens": int(
-        __import__("os").environ.get("BOOST_CACHE_CAP", "8192")
+    # boost-cache arm (e2A v2): cache-aging weight; a cache hit ages at up
+    # to (1 + alpha) times the cold rate (credit zero at arrival).
+    "boost_cache_alpha": float(
+        __import__("os").environ.get("BOOST_CACHE_ALPHA", "0.5")
     ),
     # In-batch dedup follower-pin hold bound (seconds); 0 = unbounded (pre-fix).
     "in_batch_prefix_caching_max_pin_s": float(
@@ -463,9 +459,9 @@ mode_smoke() {
 
 run_label() {  # $1 = policy, $2 = concurrency; boost arms carry clock/gamma/k
   if [[ "$1" == "boost-cache" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
-    printf 'c%s_gada_%s_k%s_j%s_l%s_m%s' "$2" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_ADAPTIVE_MAX_JUMP_S}" "${BOOST_CACHE_LAMBDA}" "${BOOST_CACHE_CAP}"
+    printf 'c%s_gada_%s_k%s_j%s_a%s' "$2" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_ADAPTIVE_MAX_JUMP_S}" "${BOOST_CACHE_ALPHA}"
   elif [[ "$1" == "boost-cache" ]]; then
-    printf 'c%s_g%s_%s_k%s_l%s_m%s' "$2" "${BOOST_GAMMA:-def}" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_CACHE_LAMBDA}" "${BOOST_CACHE_CAP}"
+    printf 'c%s_g%s_%s_k%s_a%s' "$2" "${BOOST_GAMMA:-def}" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_CACHE_ALPHA}"
   elif [[ "$1" == "boost" && "${BOOST_ADAPTIVE_GAMMA}" == "1" ]]; then
     printf 'c%s_gada_%s_k%s_j%s' "$2" "${BOOST_CLOCK}" "${BOOST_BIN_SIZE}" "${BOOST_ADAPTIVE_MAX_JUMP_S}"
   elif [[ "$1" == "boost" ]]; then
@@ -541,7 +537,7 @@ Usage: $0 <mode> [args]
 Env knobs: SGLANG_URL MODEL TOKENIZER CONCURRENCY DURATION SEED OUTPUT_DIR
            SMOKE_POLICY SMOKE_DURATION NUM_ENTRIES HEALTH_TIMEOUT STOP_SERVER
            BOOST_GAMMA BOOST_BIN_SIZE BOOST_ADAPTIVE_GAMMA BOOST_ADAPTIVE_MAX_JUMP_S
-           BOOST_CLOCK IN_BATCH_PREFIX_CACHING_MAX_PIN_S
+           BOOST_CLOCK BOOST_CACHE_ALPHA IN_BATCH_PREFIX_CACHING_MAX_PIN_S
            NUM_DATASET_ENTRIES GRACE_PERIOD FORCE_RESTART
            TRAJECTORY_START_MIN_RATIO TRAJECTORY_START_MAX_RATIO
 EOF
