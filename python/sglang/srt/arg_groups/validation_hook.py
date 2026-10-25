@@ -197,12 +197,17 @@ def check_server_args(server_args: Any):
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
     # Check scheduling policy
-    if cfg.schedule_policy == "boost":
+    if cfg.schedule_policy in ("boost", "boost-cache"):
         assert cfg.boost_gamma > 0, "boost_gamma must be > 0"
         assert cfg.boost_bin_size >= 1, "boost_bin_size must be >= 1"
+    if cfg.schedule_policy == "boost-cache":
+        assert 0.0 <= cfg.boost_cache_lambda <= 1.0, (
+            "boost_cache_lambda must be within [0, 1]"
+        )
+        assert cfg.boost_cache_cap_tokens >= 1, "boost_cache_cap_tokens must be >= 1"
     if cfg.boost_adaptive_gamma:
-        assert cfg.schedule_policy == "boost", (
-            "--boost-adaptive-gamma requires --schedule-policy boost"
+        assert cfg.schedule_policy in ("boost", "boost-cache"), (
+            "--boost-adaptive-gamma requires --schedule-policy boost or boost-cache"
         )
         assert cfg.boost_clock == "wall", (
             "--boost-adaptive-gamma requires --boost-clock wall "
@@ -212,8 +217,8 @@ def check_server_args(server_args: Any):
             "boost_adaptive_max_jump_s must be > 0"
         )
     if cfg.boost_clock == "wall":
-        assert cfg.schedule_policy == "boost", (
-            "--boost-clock wall requires --schedule-policy boost"
+        assert cfg.schedule_policy in ("boost", "boost-cache"), (
+            "--boost-clock wall requires --schedule-policy boost or boost-cache"
         )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
@@ -221,8 +226,9 @@ def check_server_args(server_args: Any):
             "fcfs-match",
             "lof",
             "boost",
+            "boost-cache",
         ], (
-            f"To use priority scheduling, schedule_policy must be 'fcfs', 'fcfs-match', 'lof', or 'boost'. '{cfg.schedule_policy}' is not supported."
+            f"To use priority scheduling, schedule_policy must be 'fcfs', 'fcfs-match', 'lof', 'boost', or 'boost-cache'. '{cfg.schedule_policy}' is not supported."
         )
         if cfg.default_priority_value is None:
             logger.warning(

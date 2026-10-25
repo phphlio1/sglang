@@ -1,0 +1,830 @@
+# Root cause: boost-arm TTFT tail collapse at seed 77188 (fair sweep, 2026-10-20)
+
+## Symptom
+
+At seed 77188 (c16, pin=0, 30-min arrival window), all three boost arms
+collapse on aiperf TTFT p99 while fcfs/lpm stay flat:
+
+| arm          | TTFT p99 | admitted-side wait p99 | starvers (wait > 1000 s) |
+|--------------|----------|------------------------|--------------------------|
+| fcfs         | 461 s    | 450 s                  | 0                        |
+| lpm          | 716 s    | 785 s                  | 0                        |
+| hrrn         | 893 s    | -                      | -                        |
+| dfs-weight   | 1123 s   | -                      | -                        |
+| boost g5.0   | 1530 s   | 1472 s                 | 5                        |
+| boost g15.0  | 1750 s   | 1646 s                 | 5                        |
+| boost ada-j60| 1511 s   | 1512 s                 | 2                        |
+
+The tail is dominated by a handful of starved requests, and the SAME
+requests (same seed = same mix) starve only under boost:
+
+- tiny `in=514, match=0` request: <= 453 s (fcfs), 693 s (lpm),
+  **1953 s (g5.0)**, 1616 s (g15.0). Admitted t+2964 s, deep in grace,
+  after ~70 later arrivals passed it.
+- giant `in=122858`: 412 s (fcfs) vs **1472 s** (g5.0); sibling giants
+  `in=148967/134881` wait 1790/1450 s under g5.0.
+
+## Mechanism (all three links code-confirmed)
+
+1. **Demotion to group 1.** `_compute_prefix_matches`
+   (schedule_policy.py:799) classifies every waiting request each sort
+   pass: a request whose cached match is <= 32 tokens
+   (IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD) that shares >= 32 tokens of
+   prefix (DEPRIORITIZE_THRESHOLD) with an already-inserted queued
+   request is added to `temporary_deprioritized`. All cache-aware sorts
+   (lpm, hrrn, boost, spf) put this group AFTER every group-0 request
+   (schedule_policy.py:880) - i.e. behind every future arrival. Under
+   the agentx multi-turn mix, later turns of a session share the whole
+   prior history with an earlier queued turn, so later turns (tiny
+   continuations AND sequential giants) are demoted; fcfs never runs
+   the classification (agnostic path clears the flags).
+
+2. **No time bound.** `_pin_hold_expired` (schedule_policy.py:858)
+   returns False when `in_batch_prefix_caching_max_pin_s <= 0`, and the
+   campaign runs pin=0, so a demoted follower is never released. The
+   60 s default is exactly the anti-starvation valve this campaign
+   disabled (chosen to keep arms comparable; it made every cache-aware
+   arm's tail measure the starvation mechanism instead of the ranking).
+
+3. **The admission scan never reaches group 1.** `get_new_batch_prefill`
+   (scheduler.py:4027-4110) scans the sorted queue front-to-back, admits
+   while the budget fits, and BREAKS at the first misfit. The queue was
+   giant-logged the whole window (11-18 queued, 1.0-1.8 M pending
+   tokens for ~36 min, pending never shrinking), so group 0 kept
+   budget-consuming requests ahead and the scan broke long before the
+   group-1 tail. A demoted request is only reached when group 0 fully
+   drains - end of window + backlog, hence waits ~1500-1950 s.
+
+Under boost, group-0 order is ~arrival order (b <= 0.8 s at g5.0,
+rate ~ 66 k tok/s), so the demoting leaders (first-turn giants) sit at
+the front chunk-draining for the whole window while their later turns
+stay unreachable behind every new arrival. Under lpm the sort is
+longest-match-first, which puts the leaders at the very front: the
+leader is admitted, the dedup pair dissolves, and followers re-enter
+group 0 within minutes (4 recorded followers, worst 785 s). fcfs has
+no demotion at all.
+
+Adaptive gamma is orthogonal to all three links, which is why ada-j60
+collapses like the static arms (2 starvers vs 5 only because its live
+gamma ~ 0.10-0.25 helps the non-demoted smalls). No gamma setting can
+fix this tail.
+
+Note: `in_batch_dedup_follower_first_admission` only records the
+verdict at the admission pass. T was admitted after its last demoter
+had drained, so the flag reads False - the eval records hide the 1950 s
+of demotion. The flag-True followers under lpm (62/164/687/785 s) are
+the direct evidence the mechanism fires in this workload.
+
+## Implications
+
+- The g5.0-vs-fcfs TTFT p99 gap at this seed is NOT the boost ranking;
+  the ranking behaved exactly as designed (verified: all records
+  gamma=5.0, bin=256, wall clock; phi-order would put `in=514` ~14th).
+  The gap is the in-batch dedup demotion interacting with a
+  giant-logged overloaded queue and pin=0.
+- Old single-seed verdicts ("boost g5.0 best") came from regimes where
+  leaders drained fast; under sustained overload the demotion
+  assumption (leader admitted promptly) breaks. Regime-dependent, not
+  a property of gamma.
+- Cheap validation cell: rerun boost g5.0 seed 77188 with
+  IN_BATCH_PREFIX_CACHING_MAX_PIN_S=60 (the default). Prediction: the
+  1500-1950 s starvers disappear, TTFT p99 drops toward the lpm/hrrn
+  band while keeping the higher cache hit (28.7% vs fcfs 16.1%).
+- Policy-code fix candidate for the H200 deployment: bound the
+  demotion by sorting followers just behind their leader (phi_leader -
+  epsilon) instead of a global group-1 tail, preserving the dedup hit
+  without starvation behind future arrivals.
+
+## Fix (branch boost-audit-fixes, 2026-10-20)
+
+Implemented the fix candidate: `_compute_prefix_matches` returns
+(followers, follower -> leader) -- simulated-tree insert values are now
+per-insert sequence numbers, so the deepest matched node identifies the
+leader -- and `_sort_by_boost` places a follower at phi(leader) + eps,
+group 0: behind its leader (dedup win preserved), ahead of every later
+arrival (starvation gone; worst case a follower waits for one leader).
+lpm/hrrn/shortest-prefill keep the frozen group-1 behavior so the
+campaign arms stay comparable.
+
+Validation: scripts/boost_jgrid.sh runs boost-g5.0 and ada J in
+{60, 15, 5} at seed 77188, c16, pin=0, all with the fix -- the g5.0 and
+ada-j60 cells pair 1:1 against the no-fix campaign cells at the same
+seed. Prediction: the 1500-1950 s starvers disappear (TTFT p99 drops
+toward the fcfs/lpm band) while the cache hit stays near 28.7%.
+
+### Validation result (J-grid, 2026-10-20 evening, commit 8d3823e95f)
+
+| arm            | TTFT p99 | TTFT mean | starvers >1k s | hit % | tok/s | Jain  |
+|----------------|----------|-----------|----------------|-------|-------|-------|
+| fcfs (ref)     | 461 s    | 310 s     | 0              | 16.1  | 64.6  | -     |
+| lpm (ref)      | 716 s    | 107 s     | 0              | 74.5  | 75.7  | -     |
+| g5.0 no-fix    | 1530 s   | 306 s     | 5              | 28.7  | 34.8  | 0.500 |
+| g5.0 fix       | 1699 s   | 261 s     | 3              | 31.2  | 36.3  | 0.437 |
+| ada-j60 no-fix | 1511 s   | 249 s     | 2              | 41.4  | 41.2  | 0.452 |
+| ada-j60 fix    | 1186 s   | 227 s     | 4              | 35.9  | 40.9  | 0.412 |
+| ada-j15 fix    | 964 s    | 259 s     | 1              | 38.8  | 38.5  | 0.537 |
+| ada-j5 fix     | 1500 s   | 317 s     | 7              | 31.6  | 37.3  | 0.436 |
+
+- The follower class left the tail. The no-fix starvers were the
+  follower class: the tiny continuation (in=514, match=0 after its
+  demoter drained) and match-rich later-turn giants (in=134881
+  match=123518, in=111697 match=43478). With the fix, the g5.0 tail is
+  match=0 fresh giants only (in=101426/41062/52049); ada-j60 keeps two
+  match=23076 siblings that queue behind their own session's giant
+  leader (bounded displacement: a follower waits for its leader, no
+  longer for the whole group-0 prefix). rids are not stable across
+  runs, so the pairing is by class, not by rid.
+- The tail that remains is still demotion, through a different door: the
+  fix bounds a follower behind one leader per pass, but the next leader is
+  the min-rid family member, not the earliest arrival (see the rid tie-break
+  section below). Class-level, boost-fix beats fcfs at p50/p90 in every size
+  class (giants >= 100k: p50 115-136 s vs 190 s, p90 278-310 s vs 370 s);
+  the tail is 1-3 rid-unlucky outliers per cell, not a fresh-giant class
+  effect.
+- J under overload: j15 is the best boost arm (p99 964 s, 1 starver,
+  best Jain 0.537). Live floors matched the computed ones (j60
+  0.116-0.122, j15 0.27-0.40, j5 0.62-1.05) and pinned=55-100% in the
+  trajectory logs confirms J, not the tail fit, governed throughout --
+  finding 2 of the paper audit, now measured.
+
+### Reading the numbers (closed-loop load, distribution view)
+
+aiperf holds 16 requests in flight and issues a new one per freed slot,
+so per-arm request counts are goodput, not a fixed arrival set
+(client-side request_count: fcfs 84, g5.0-fix 96, ada-j60-fix 110,
+ada-j15-fix 113, lpm 180). Every arm completed all the requests it took
+(0 null-ttft records at this seed); fcfs's 461 s p99 is over the ~99 it
+served while lpm served ~194 with p99 716 s -- under saturation the
+arms differ in what they sacrifice (fcfs: goodput, hit 16%; lpm: tail
+spread, Jain 0.25), not only in tail latency.
+
+The fix improved or held every body percentile of both paired arms
+(scheduler-side, warmup-excluded): g5.0 mean 290->236 s, p50 202->166,
+p90 515->406, p95 897->616, >600 s count 9->6; ada-j60 mean 229->209,
+p90 582->310, >300 s count 26->13, >600 s 12->7. The apparent g5.0 p99
+regression in the aiperf export (1530->1699 s) does not survive the
+scheduler-side recomputation (1807->1671 s) -- at n~100 the p99 is a
+worst-2 statistic. Costs of the fix: ada-j60 p10 19->35 s (fastest
+small requests wait behind freed followers) and TTFT Jain -0.03
+(0.434->0.407 g5.0, 0.427->0.390 ada-j60); mechanism not pinned down.
+
+### Root cause of the remaining tail: rid tie-break head rotation (2026-10-20 night)
+
+The fix's "worst case a follower waits for one leader" holds per pass but
+not across head rotations. Elimination ladder on the g5.0-fix cell (seed
+77188), every step measured on existing data:
+
+- Retraction: the three worst outliers (waits 1870/1680/1483 s,
+  in=101426/41062/52049, all match=0, follower=False) record
+  num_retractions=0; queue_wait stamps survive retraction by definition
+  (first admission minus first entry, stamped once).
+- Chunk-limit: engaged in only 13% of prefill steps while the queue was
+  non-empty (781 steps, new-token p50 = 8192, 103 capped) -- minor at most.
+- Budget misfit / scan break: 77 requests arrived after the worst outlier
+  and were admitted before it, 55 of them with uncached > 8192 (a fresh
+  122366-token request waited 131 s) -- large fresh requests fit
+  throughout.
+- Sort displacement at gamma=5: b <= 0.64 s per jump -> ~50 s cumulative
+  over ~75 later arrivals vs ~1400 s measured excess.
+- Stuck earlier leader: every pre-873 s arrival drained by 963 s while the
+  outlier waited to 2743 s -- no earlier leader to inherit the wait from.
+
+Mechanism (code path: scheduler.py calc_priority at the top of every
+get_new_batch_prefill pass -> schedule_policy.py):
+
+1. calc_priority sorts waiting_queue in place each pass; followers of a
+   shared-prefix family all tie at phi(leader)+eps, broken by rid
+   (_sort_by_boost key = (group, phi, rid)).
+2. Next pass, _compute_prefix_matches iterates that order: the first free
+   family member -- once the head drains, the min-rid follower -- inserts
+   and becomes the new leader; the family now sorts at phi(new leader) =
+   the ARRIVAL of whichever member holds the smallest rid.
+3. Under continuous same-prefix arrivals an early member with an unlucky
+   rid never wins headship: every later arrival with a smaller rid passes
+   it, for as long as arrivals continue. pin=0 (campaign) disables the
+   only other escape (_pin_hold_expired).
+
+Record-level fingerprint (no other mechanism produces it): the final drain
+of the g5.0-fix cell admits the last five requests in exact rid-lexicographic
+order while ignoring arrival -- 97fd(arr 2406) 2711 s, bdd1(arr 2417)
+2730 s, ea93(arr 873) 2743 s, f8ee(arr 1287) 2770 s, fd3b(arr 1099)
+2779 s. The stuck trio are all e/f-prefixed rids (bottom of the rid space)
+and drain only after arrivals stop (window end 2475 s + backlog).
+
+This supersedes the j5-open-question reading in boost_paper_fidelity
+finding 2: the mechanism is gamma-independent (it lives in the dedup
+tie-break layer, not the ranking), so j5's 7 starvers and ada-j15's single
+starver (a tiny in=513 that waited 1510 s) are the same signature, not
+chunk-limit effects.
+
+Pre-registered validation, written before any code change: tie-break
+followers by arrival stamp (first_queue_entry_time wall /
+boost_arrival_tokens tokens) instead of rid in _sort_by_boost.
+Predictions for one g5.0 seed-77188 cell:
+
+- starvers (>1000 s) -> 0; TTFT p99 -> the fcfs/lpm band (<= ~700 s); the
+  ex-trio waits -> the 43-160 s cohort band (the pre-873 s family drained
+  by 963 s).
+- body percentiles (mean/p50/p90/p95) unchanged within noise; cache hit
+  stays ~31% (one head at a time is preserved).
+- any residual late tie admits in ARRIVAL order, not rid order.
+
+Kill criteria: starvers persist -> mechanism incomplete, next suspect is
+the chunk-limit interaction (one g5.0 cell with the limit disabled);
+starvers gone but a body percentile regresses >10% -> trade-off rejected,
+redesign before adopting.
+
+### Validation result (arrival tie-break, 2026-10-21 04:17, commit 413514ef3d)
+
+Cell c16_g5.0_wall_k256_20261021_032242 (run_meta sglang_commit
+413514ef3d; warm-cache parity restored after the ENOSPC night: fresh
+FP8 + workload-dataset download, 0 dangling links; log
+logs/boost_arrival_tiebreak_g5.0_77188_retry.log). Scheduler-side
+warmup-excluded, n=104, vs the g5.0-fix pair 20261020_181256 (n=110),
+same recipe both cells.
+
+| prediction                           | verdict  | numbers |
+|--------------------------------------|----------|---------|
+| starvers (>1000 s) -> 0              | PASS     | 0 starvers, 0 >600 s, max wait 457 s (old: 3 at 1483-1870 s) |
+| TTFT p99 -> <= ~700 s                | PASS     | aiperf 1699 -> 474 s (scheduler p99 469, max 501); fcfs 461 / lpm 716 |
+| ex-trio waits -> 43-160 s            | PARTIAL  | same-class waits 160/284/298 s (old 1870/1680/1483); nothing >600 s anywhere, but 2 of 3 sit above the band -- they arrive later (1260/1287 s) into a deeper queue |
+| body (mean/p50/p90/p95) unchanged    | FAIL     | mean 214->244 (+14%), p50 144->297 (+106%), p90 379->407 (+7%), p95 590->422 (-28%); same-arrival-band medians 114->189 / 218->368 / 306->386 s -- real, not mix |
+| cache hit stays ~31%                 | FAIL     | 31.2 -> 22.3% scheduler-side (aiperf first-attempt 37.3 -> 26.9%); not a top-2 artifact (excl top-2: 26.6 -> 17.7%) |
+| residual ties admit in arrival order | PASS     | last 8 admits strictly arrival-monotone; the rid-order drain fingerprint is gone |
+
+Kill criterion fired (p50 +106%, mean +14%): per pre-registration the
+trade-off is rejected as-is -- redesign before adopting. What the cell
+does settle: the rid tie-break mechanism is dead (starvers, p99 and the
+drain fingerprint all cleared, Jain 0.437 -> 0.843), and part of the old
+cell's speed was the bug itself -- the stuck families' prefill work was
+deferred past the window edge, and their end-drain bursts (9 siblings x
+22,622 matched tokens admitted 2711-2779 s) inflated the old hit rate.
+
+Open, and what blocks adoption: the in-window hit gap (31.6% old vs
+22.1% new, drain admits excluded) is NOT explained by the drain bursts
+alone; old cells show same-match fan-out clusters of 8-9 members, new
+cells 3-5. Near the saturation knee a 9-pp hit drop (-6% total
+throughput, 3565 -> 3360 tok/s) roughly doubles the median wait. n=1
+per arm, so before redesigning: (a) one repeat cell of this exact
+config to bound run variance, and/or (b) trace one fan-out family
+through both cells' server_metrics_export.jsonl to pin the
+cluster-shrink mechanism. Campaign view on the clean base: boost g5.0
+p99 474 s ~ fcfs 461, < lpm 716 << dfs-weight 1123, 0 starvation, best
+Jain -- the e2 tail goal is met; the open question is the body cost.
+
+### H200 phase-1 contamination scan (2026-10-21, server HEAD a9d2b9ecd8)
+
+Question: the H200 phase-1 gamma sweep ran on a base WITHOUT the arrival
+tie-break fix (a9d2b9ecd8 has the leader-relative fix but not 413514ef3d)
+-- does the rid bug contaminate those cells? Verdict: the bug is INERT in
+that regime; the gamma-flat conclusion is usable, not reference-only. Scan
+of all 6 cells' schedule_eval.jsonl (warmup-excluded, same recipe as above;
+server path results/glm53/agentx_dynamo/policies_v2/phase1_gamma/boost/):
+
+| cell            | n    | >1k s | >600 s | max qw | qw p99 | hit % |
+|-----------------|------|-------|--------|--------|--------|-------|
+| g1.0            | 1212 | 0     | 0      | 305 s  | 81 s   | 87.7  |
+| g3.0            | 1155 | 0     | 0      | 190 s  | 120 s  | 87.2  |
+| g5.0            | 1211 | 0     | 0      | 315 s  | 85 s   | 87.7  |
+| g7.0            | 1239 | 0     | 0      | 467 s  | 101 s  | 84.3  |
+| g10.0           | 1176 | 0     | 0      | 208 s  | 80 s   | 87.9  |
+| g15.0 (crashed) | 420  | 0     | 0      | 131 s  | 53 s   | 77.5  |
+
+Scheduler-side max waits (305/190/315/467/208) match the aiperf warm-max
+column exactly; p99 ordering matches (g3.0 worst, g1.0/g10.0 best). The
+g15.0 row is the survivor subset (420 of ~1210 served before the crash) --
+invalid as a policy cell, scanned only for completeness.
+
+Why inert, three independent reasons:
+
+1. pin=60 on the H200 cells (run_meta in_batch_prefix_caching_max_pin_s
+   =60.0), not the local campaign's pin=0: the 60 s valve bounds any
+   head-rotation wait even if the mechanism engaged.
+2. The regime never builds the giant-logged queue the mechanism needs: qw
+   p50=1 s, p90=8-13 s, hit 87-88% -- 8xH200 drains the queue in seconds
+   (the local RTX c16 cell held 1.0-1.8 M pending tokens for 36 min). The
+   workload's fan-out families exist (same-match clusters of 6-9 members,
+   matched 28k-108k) but arrive against a warm cache -- the leader drained
+   long before -- so the in-batch dedup classification never binds: 0
+   follower records in every cell (local cells record them routinely).
+3. Fingerprints absent: 0 starvers, 0 waits >600 s, and the final drain is
+   neither rid-lexicographic (the bug) nor otherwise anomalous.
+
+Cross-rig consistency: gamma-flat on H200 matches the local validation --
+the tail lives in the dedup layer, not the ranking; gamma is not the tail
+knob on either rig. Known config delta for any cross-rig read: local
+campaign pin=0, H200 pin=60. The g15.0 crash is a separate defect (hard
+pool exhaustion -> OOM backout spin -> CUDA IMA; g15_oom_crash_root_cause.md).
+
+### Variance-bound repeat cell (pre-registered before launch, 2026-10-21)
+
+P4 (qw p50 144 -> 297 s) and P5 (hit 31.2 -> 22.3%) rest on n=1 per arm.
+This cell repeats the 032242 config exactly (seed 77188, gamma 5.0, bin 256,
+wall clock, pin=0, c16, commit 413514ef3d) to bound run-to-run noise before
+any redesign decision. Comparison recipe identical (drop HEALTH, drop the
+first 60 s of arrivals).
+
+Predictions, written before launch:
+- R1 starvers stay 0, max wait < 600 s.
+- R2 qw p50 in [223, 371] s (297 +/- 25%), p90 in [305, 509] s (407 +/- 25%).
+- R3 scheduler-side hit in [17, 28]% (22.3 +/- 5pp).
+- R4 final drain admits arrival-monotone.
+
+Decision rule, pre-registered:
+- Inside R2/R3 and outside the old bands (p50 ~144, hit ~31): the body/hit
+  costs are real on n=2 -> the redesign gate opens (split family admission
+  per pass).
+- Back in the old bands (p50 <= 190 s or hit >= 29%): the 032242 regressions
+  were run-to-run noise -> P4/P5 reopen, no redesign.
+- Otherwise mixed: one more seed before deciding.
+
+Parallel analysis while the cell runs (no new run needed): trace one
+fan-out family through both cells (181256 vs 032242) to pin the
+cluster-shrink mechanism -- hypothesis: with arrival tie-break the family
+admits spread out in arrival order, and members admitted while the head is
+still chunk-prefilling match only the committed prefix (partial, differing
+values), while the old rid-order drain admitted the whole family at once
+after the head finished (uniform full match).
+
+### Fan-out family trace (2026-10-21, passes 1-4, before the repeat cell completed)
+
+schedule_eval per-request pairing (same seed, same inputs) plus the
+server_metrics series. Two results: a correction to the P5 reading, and
+the cluster-shrink mechanism.
+
+Correction: the "9 siblings x 22,622 admitted 2711-2779 s" drain-burst
+claim above is wrong for this cell. The >2500 s drain admits are all
+match=0 (the stuck trio plus two fresh); the 22,622 cluster is 8 members
+admitted IN-WINDOW at 1575-2514 s with full matches and 113-371 s waits.
+The old cell's hit advantage is real in-window dedup efficiency, not a
+drain artifact. (The other half of "old speed was the bug" still holds:
+the trio's ~195k of fresh prefill was deferred past the window edge.)
+
+Mechanism, evidence per link:
+
+1. Trunk timing seeds everything. Session trunk in=30569 admits 923 (OLD)
+   vs 1037 (NEW) -- 114 s apart with the pool at usage 0.97-0.99 (first
+   giant phase). The trunk is a head (match=0, no dedup): its sort position
+   is identical in both cells, so the gap is admission-budget jitter at
+   the knee, not the tie-break. Its early followers then straddle the
+   trunk's prefill: the in=30186 twins admit 964/964 (OLD -- trunk
+   committed, full match 27373 x2) vs 1041/1044 (NEW -- trunk mid-flight,
+   partial 23431 and 27685 three seconds apart: progressive page commits).
+2. Partial matches cost real prefill: each early follower pays its
+   unmatched 4-17k tokens fresh instead of hitting cache.
+3. The extra uncached work raises KV pressure and the radix tree evicts
+   idle session prefixes: mid-session continuations that matched 23-25k in
+   OLD match 0 in NEW (in=27268 [OLD 23622], 25773 [24576], 28611 [24673],
+   30476 [24576 -- its own session matched 24-28k at 2300-2400, zero by
+   2629: the prefix was evicted in the ~200 s between turns), and family-B
+   branches lose their 22k matches wholesale (in=93625, 103742, 69877).
+   Retraction is ruled out (OLD 3, NEW 1). Both cells run the same 545k
+   pool at the knee (usage 0.8-0.99, evictable often <50k; NEW touches
+   evictable=0 at t=901/1041/2222).
+4. Totals: NEW prefilled ~7.49M uncached tokens vs OLD ~6.98M (+7%) while
+   serving 0.5M LESS total input -- at the knee that is the -6% throughput,
+   the ~2x median wait (P4) and the -9pp hit (P5).
+
+Reading: the tie-break fix does not CAUSE the body cost -- it removes an
+accidental admission timing that happened to land on the lucky side of a
+noise-seeded cascade (n=1). The old cell's real edge was followers that
+(by that run's budget jitter) admitted just after their trunks committed,
+giving full matches. The systematic fix makes that timing deterministic:
+gate a follower's admission on its leader's KV commit (hold set released
+by the commit event) instead of placing it behind the leader's first
+chunk -- match completeness stops depending on budget jitter, the dedup
+win is recovered by construction, and the displacement bound is one
+leader prefill duration (seconds), with the pin valve bounding the
+hold against later arrivals. This supersedes the "smaller family batches
+per pass" sketch: batch the family at the leader's commit boundary.
+Caveat: eviction severity is rig-config-dependent -- the H200 production
+config has hicache 128G write-back, which would soften link 3 (evicted
+prefixes reload from host instead of missing).
+
+R5 (pre-registered before the repeat cell completes): count same-match
+clusters (m>=16k) and mid-session zero-matches (continuations whose
+session has earlier served turns). Repeat cell materially different from
+032242 (top cluster >=7 or mid-session zeros <=1) -> the cascade seed is
+run-to-run noise; family batching is a robustness fix. Same pattern
+reproduces (top <=5, several mid-session zeros) -> the tie-break
+systematically biases admission toward the cascade; the fix is required
+regardless.
+
+### Variance-bound repeat cell result (2026-10-21, cell 105838, same config as 032242)
+
+Cell c16_g5.0_wall_k256_20261021_105838 (seed 77188, gamma 5.0, bin 256,
+wall clock, pin=0, commit 413514ef3d -- identical to 032242). Same-rule
+recompute over all three cells (schedule_eval per-request; warm records
+input<500 dropped):
+
+| metric            | OLD 181256 | NEW 032242 | RPT 105838 | R-band        | verdict |
+|--------------------|-----------|-----------|-----------|---------------|---------|
+| qw p50 s           | 143       | 296       | 276       | [223, 371]    | inside  |
+| qw p90 s           | 377       | 407       | 400       | [305, 509]    | inside  |
+| qw mean s          | 212       | 242       | 238       | --            |         |
+| qw max s           | 1870      | 457       | 455       | < 600         | inside  |
+| starvers >1500 s   | 2         | 0         | 0         | 0             | inside  |
+| hit all / in-win % | 30.6/31.0 | 21.9/21.6 | 22.7/22.2 | [17, 28]      | inside  |
+| uncached M tok     | 7.15      | 7.67      | 7.53      | --            |         |
+| top m>=16k cluster | x10       | x5        | x4        | >=7 / <=5     | <=5     |
+| retractions        | 3         | 1         | 2         | --            |         |
+| drain arrival-mono | no (rid)  | yes       | tie only  | yes           | pass*   |
+| Jain TTFT          | 0.437     | 0.843     | 0.854     | --            |         |
+| TTFT p99 s         | 1699      | 474       | 466       | fcfs band     |         |
+
+* RPT drain non-decreasing except one simultaneous-arrival tie (two reqs
+  at arr=2270 s) -- not an inversion.
+
+Decision rule (pre-registered): inside R2/R3 AND outside the old bands
+(p50 276 vs 143; hit 22.7 vs 30.6) -> the body costs are REAL on n=2 ->
+the redesign gate OPENS. The tail verdict is stable: 0 starvers, Jain
+0.85, TTFT p99 in the fcfs band.
+
+R5 detail (cross-cell pairing, same input +-5, matched tokens per cell):
+a DETERMINISTIC core loses its matches in BOTH post-fix cells --
+in=27270 [23622/0/0], 25774 [24576/0/0], 111698 [32768/0/0], 69879
+[18729/0/0], 112236 [16384/0/0] -- ~110k matched tokens gone in every
+post-fix run; plus run-to-run sprinkling in BOTH directions (RPT-only
+zeros: 31169, 28924, 31692, 29962, 31766; RPT recoveries vs NEW: 93627
+0->21997, 103744 0->25709, 68991 ->62236). Reading: the post-fix
+admission pattern systematically starves a specific set of continuations
+(the cascade's deterministic core), and noise decides the rest. The
+commit-gate redesign targets both: full matches remove the +0.4M
+uncached delta, and the reduced KV churn keeps the core's session
+prefixes alive.
+
+Task note: the background waiter reported "failed exit 1" -- that was the
+waiter epilogue's own cwd bug (tail/ls from the wrong directory), not the
+cell; the cell itself exited 0 ("RUN DONE" 11:53:22).
+
+### Commit-gate v2: design, smoke evidence, validation-cell pre-registration (2026-10-21, pre-launch)
+
+Design (commit 48ff53383f): batch the family at the extender's commit
+boundary. After the boost sort, a request is marked boost_commit_hold
+while an earlier extender -- the in-flight chunked prefill (calc_priority
+now takes scheduler.chunked_req) or a waiting request that sorts before
+it -- will commit at least one more page (256 tokens) of its matched
+prefix (frontier fingerprint: the 256 tokens just past the current match
+point). The admission scan skips held requests without reordering, so
+displacement is bounded by one extender's prefill and never stacks behind
+later arrivals. Two bounds: the pin valve stays authoritative for pinned
+followers; a 120 s wall cap (BOOST_COMMIT_GATE_MAX_HOLD_S) covers pin=0
+and never binds on legit holds (largest trunks ~60 s).
+
+Smoke (1x RTX6000, 44,992-token shared base, trunk 45,046 + 2 siblings;
+pre-fix both siblings admitted at ~16k random partials): v2 sibling
+sorted first m=40,960 (91% of share, hold 4 passes), sibling sorted
+second m=44,992 FULL match (hold 5 passes, chained behind the first
+sibling's prefill too). Known leak, accepted: a trunk's final chunk
+reaches the radix tree one pass after chunk completion (chunked_req
+clears at the prefill->decode transition; the final insert lags), so the
+FIRST sibling admitted in that gap keeps <= 1 chunk (8,192 tokens) of
+partial match. Bounded per family; later siblings chain to full. Left
+open on purpose: closing it means touching the chunk-completion insert
+path in the scheduler, out of proportion to <= 8k tokens per family.
+
+Validation cell c16_g5.0_wall_k256 seed 77188 pin=0 commit 48ff53383f
+(same config and rule as OLD 181256 / NEW 032242 / RPT 105838). Bands
+registered BEFORE launch:
+
+| band | metric                  | prediction  | basis |
+|------|-------------------------|-------------|-------|
+| V1   | starvers >1500 s        | 0           | a hold ends with one extender's prefill (<=~60 s); tail already clean at 0 |
+| V1   | qw max s                | < 600       | same bound |
+| V1   | Jain TTFT / p99 s       | >=0.8 / fcfs band | holds add bounded wait, no reordering |
+| V2   | qw p50 s                | [150, 280]  | OLD 143 was rid-bug-assisted (195k deferred); post-fix floor 276-296; the gate buys back the median without the bug |
+| V3   | hit all %               | [26, 34]    | OLD 30.6, post-fix 21.9-22.7; deterministic core ~110k tokens + family batching |
+| V4   | hold_passes>0 records   | >= 5        | the gate must fire under campaign load |
+| V4   | top m>=16k cluster      | >= 6        | post-fix x4/x5; OLD x10 partly bug-assisted, >=6 is the honest recovery bar |
+| V4   | deterministic core m>0  | >= 3 of 5   | the 5 core continuations (in 27270, 25774, 111698, 69879, 112236, pairing input +-5) were 0 in BOTH post-fix cells; less churn -> less eviction -> partial recovery |
+| V4   | uncached M tok          | <= 7.35     | post-fix 7.53-7.67, OLD 7.15 |
+| V5   | max hold_passes         | < 3000      | the 120 s cap / ~40 ms pass ~= 3000; at the cap means an extender churned without committing |
+
+Decision rules (pre-registered):
+- V2 AND V3 inside -> commit-gate adopted; boost complete on RTX6000 ->
+  J-grid rerun (j15/j60) next, then H200 phase 2.
+- V2 or V3 missed -> one more seed (42302) to separate noise from
+  systematic before any verdict.
+- Any starver >1500 s OR qw p50 >320 s OR hit <20% -> KILL: the hold
+  regresses under the campaign arrival pattern; revert to tie-break-only
+  and investigate the hold dynamics.
+
+### Commit-gate validation cell result (2026-10-21, cell 124425, seed 77188)
+
+Same-rule recompute (schedule_eval, warm records input<500 dropped; Jain
+from e2_metrics for consistency with prior verdicts):
+
+| metric            | NEW 032242 | RPT 105838 | GATE 124425 | band            | verdict |
+|--------------------|-----------|-----------|-------------|-----------------|---------|
+| qw p50 s           | 296       | 276       | 252         | V2 [150, 280]   | PASS    |
+| qw p90 s           | 407       | 400       | 414         | --              |         |
+| qw max s           | 457       | 455       | 479         | V1 < 600        | PASS    |
+| starvers >1500 s   | 0         | 0         | 0           | V1 0            | PASS    |
+| hit all / in-win % | 21.9/23.3 | 22.7/23.2 | 23.2/24.8   | V3 [26, 34]     | MISS    |
+| uncached M tok     | 7.67      | 7.53      | 7.65        | V4 <= 7.35      | MISS    |
+| top m>=16k cluster | x5        | x4        | x6          | V4 >= 6         | PASS    |
+| hold records       | 0         | 0         | 27          | V4 >= 5         | PASS    |
+| core m>0 (of 5)    | 0         | 0         | 1 (69879:24544) | V4 >= 3     | MISS    |
+| max hold passes    | 0         | 0         | 47          | V5 < 3000       | PASS    |
+| Jain TTFT          | 0.843     | 0.854     | 0.832       | V1 >= 0.8       | PASS    |
+| TTFT p99 s         | 469       | 462       | 482         | V1 fcfs band    | PASS    |
+| retractions        | 1         | 2         | 2           | --              |         |
+
+Kill rule: no starver, p50 252 <= 320, hit 23.2 >= 20 -> NOT killed. V2
+PASS but V3 MISS -> pre-registered rule: one more seed (42302) before any
+verdict; cell launched after this section was committed.
+
+Mechanism (why V3 missed while the gate itself works):
+- The x6 cluster (m=24618) is six DIFFERENT sessions sharing one
+  24618-token base, batched at its commit boundary (5/6 held, 8-47
+  passes) -- the family-batching mechanism fires as designed.
+- Held records: median m/input 0.72, only 2/27 at >=90%. The matchable
+  portion is the shared base; each session's own multi-turn history past
+  it is unique or already evicted, so admission timing cannot recover it.
+- Top-10 uncached contributors are 2.13M of 7.65M: giant (175k-249k)
+  unique first-turn inputs at m=0-1728. Structural -- no policy can match
+  them; they are absent from RPT's finished set (did not finish there),
+  so record sets differ across cells on content, not just count.
+- Deterministic core: 1/5 recovered (69879 -> 24544). The other four were
+  0 again: their session prefixes were evicted before the continuation
+  arrived. The gate removes the churn SOURCE (partial-prefill waste) but
+  cannot resurrect already-evicted KV.
+- Reading: V3's [26, 34] was calibrated against OLD 30.6, which the rid
+  bug inflated (deferred work skews the finished set toward
+  cache-hitters). The same-rule post-fix R-band [17, 28] contains GATE
+  23.2. The gate's true cache effect on this workload looks like +1-2pp
+  plus family-boundary batching, not a return to 30.
+
+Pre-registered bands for the seed 42302 tiebreak cell (same config,
+commit c559363cf9): hit all [21, 27]; qw p50 [150, 290]; starvers 0;
+qw max < 600; hold records [10, 40]; top m>=16k cluster >= 5; max hold
+passes < 3000. Decision: hit >= 26 -> V3 was seed-noise, gate adopted.
+hit in [21, 25] on both seeds -> V3 bar was mis-calibrated against the
+bug-assisted OLD; adopt on V2 + mechanism evidence (bounded holds,
+boundary batching, no tail regression) with the honest cache statement
+(+1-2pp, not +8pp). Any kill-rule trip -> revert to tie-break-only.
+
+### Commit-gate tiebreak cell: regime discovery, adopt decision (2026-10-21, cell 134335, seed 42302)
+
+The pre-registered tiebreak is INAPPLICABLE: the cell never reaches the
+overload regime the bands describe. Same-rule recompute:
+
+| metric              | GATE 77188 (124425) | GATE 42302 (134335) |
+|---------------------|---------------------|---------------------|
+| n                   | 106                 | 233                 |
+| qw p50/p90/max s    | 252/414/479         | 0/15/155            |
+| starvers            | 0                   | 0                   |
+| hit all/in-win %    | 23.2/24.8           | 82.6/80.9           |
+| uncached M tok      | 7.65                | 3.86                |
+| retractions         | 2                   | 7                   |
+| holds n / max pass  | 27 / 47             | 6 / 6               |
+| held median m/input | 0.72                | 0.97                |
+| TTFT p99 s          | 482                 | 137                 |
+
+The regime is seed-intrinsic, not gate-caused. Campaign seeds at c16
+(g15 cells Oct 20, same rule): 77188 p50 177 hit 29.0 (overload);
+42302 p50 0 hit 83.2; 94815 p50 0 hit 77.1. Only seed 77188 saturates
+the server at c16. The tiebreak pre-registration picked a seed that
+never reaches the saturation knee, so neither decision branch (noise vs
+mis-calibration) applies. Kill rule not tripped (0 starvers, p50 0,
+hit 82.6 >= 20).
+
+What the cell does establish: gate safety in the unsaturated regime.
+Six holds, max 6 passes, median held match 97% of input, TTFT p99 137 s,
+no starver -- the gate is quiet when the server is ahead and releases
+followers at full match.
+
+DECISION (criteria stated 2026-10-21: TTFT and starvation primary, a
+small cache/throughput trade acceptable): ADOPT the commit-gate. Basis:
+V1/V2 PASS on the overload seed (p50 252 vs 276/296 no-gate, 0 starvers,
+Jain 0.832, TTFT p99 482), mechanism verified (boundary batching, x6
+cluster, bounded holds), and light-regime safety shown here. Cache
+statement stays honest: +1.3 pp under overload against a no-gate
+same-seed band of 21.9-22.7, zero cost unsaturated; how much of the
++1.3 pp is systematic stays open and does not gate adoption. The J-grid
+rerun below adds two more overload-regime samples with holds.
+
+Boost completeness after adoption: J-grid rerun (bands below) and the
+g15 OOM guard decision remain; baseline reruns and the metrics_v2 sweep
+are deferred per scope.
+
+### J-grid rerun pre-registration (j15/j60, clean base + commit-gate, 2026-10-21 pre-launch)
+
+Cells: c16 seed 77188 pin=0, BOOST_GAMMA=0.09 adaptive, J=15 and J=60,
+HEAD 496efe4c45 (tie-break fix + commit-gate). Prior j-cells (Oct 20,
+pre-fix base): j15 p50 159 / p90 549 / max 1510 / starv 1 / hit 38.2 /
+TTFT p99 953; j60 p50 137 / p90 279 / max 1726 / starv 1 / hit 35.3 /
+TTFT p99 1186 (tail giant-bound: the 175k-249k inputs set the p99).
+
+Bands registered BEFORE launch:
+
+| band | metric        | prediction      | basis |
+|------|---------------|-----------------|-------|
+| W1   | starvers      | <= 1, max < 1800 | pre-fix had 1 each; fix+gate removed them on static |
+| W2   | qw p50 s      | [120, 260]      | adaptive pre-fix 137-159; static post-fix 252-296 |
+| W3   | qw p90 s      | j60 < j15       | pre-fix 279 vs 549, structural (bigger jump caps tail) |
+| W4   | hit all %     | [28, 42]        | adaptive pre-fix 35-38; gate shifts it either way by 1-2 pp |
+| W5   | holds         | n in [5, 40], max passes < 3000 | gate fires under adaptive, stays bounded |
+| W6   | TTFT p99 s    | < 1300          | pre-fix 953-1186, giant-bound |
+
+Decision: no kill trip on either cell -> the better J is the one with
+the lower (starvers, p90, TTFT p99) at p50 within 30 s of the other;
+ties -> keep the prior verdict's j15. Kill trip on j15 only -> adopt
+j60. Kill on both -> adaptive gamma needs the OOM guard work before any
+H200 use; static g5.0 + gate stands as the complete configuration.
+
+### J-grid rerun result (2026-10-21, cells 144214 j15 / 153643 j60)
+
+Same-rule recompute vs the pre-fix j-cells (Oct 20):
+
+| metric        | j15 pre | j15 GATE | j60 pre | j60 GATE | band           | verdict        |
+|---------------|---------|----------|---------|----------|----------------|----------------|
+| qw p50 s      | 159     | 274      | 137     | 248      | W2 [120, 260]  | j60 in, j15 miss (14 s) |
+| qw p90 s      | 549     | 384      | 279     | 375      | W3 j60 < j15   | PASS           |
+| qw max s      | 1510    | 470      | 1726    | 426      | W1 < 1800      | PASS           |
+| starvers      | 1       | 0        | 1       | 0        | W1 <= 1        | PASS           |
+| hit all %     | 38.2    | 24.1     | 35.3    | 25.4     | W4 [28, 42]    | MISS both      |
+| holds n / max | 0 / 0   | 30 / 53  | 0 / 0   | 25 / 52  | W5 [5,40]/<3k  | PASS           |
+| TTFT p99 s    | 953     | 480      | 1186    | 455      | W6 < 1300      | PASS           |
+| Jain (harness)| --      | 0.846    | --      | 0.844    | --             |                |
+
+Kill rule: no trip on either cell. Pre-registered decision rule -> j60
+WINS: p90 375 < 384, TTFT p99 455 < 480, p50 inside the 30 s window
+(248 vs 274, better on all three). ADOPT j60 as the adaptive J.
+
+W4 (and j15's W2) misses repeat the V3 lesson a third time: bands
+calibrated against pre-fix cells are calibrated against bug-flattered
+numbers (rid tie-break: OLD 30.6 hit / 143 p50; pre-fix adaptive 35-38
+hit / 137-159 p50). Post-fix adaptive+gate lands where static+gate lands
+(p50 248-274, hit 24-25), +1-2 pp over static. Standing rule from here:
+only post-fix cells calibrate bands.
+
+Reading: adaptive buys nothing over static g5.0 on this seed at c16
+(p50 248-274 vs 252; TTFT p99 455-480 vs 482). The gate holds under
+adaptive gamma too: 25-30 holds, max 52 passes, and j60's x11 boundary
+cluster (m=25024) is the largest family batch seen in any cell.
+
+Boost completeness on RTX6000 after this verdict: core policy, arrival
+tie-break, commit-gate (adopted), adaptive J=60 -- implemented,
+unit-tested (72/72), and validated on the overload seed across five
+post-fix cells (3 static + 2 adaptive). Remaining optional: the g15 OOM
+guard (A/B/C in the phase-1 doc) if a high-gamma arm is ever run; not
+needed for the validated configurations (g5.0 static, j60 adaptive).
+Baseline reruns and the metrics_v2 sweep stay deferred per scope. H200
+phase 2 is unlocked by the standing sequencing rule; the driver edit and
+submit stay with the user.
+
+### Full-sweep pre-registration: boost vs baselines on metrics v2 (2026-10-21, pre-launch)
+
+User gate for H200: confirm boost beats the baselines on TTFT and
+starvation first (criteria: TTFT/starvation primary, small cache and
+throughput trade acceptable). Sweep: 6 arms -- fcfs, lpm, dfs-weight,
+hrrn, boost-g5.0 static, boost-ada-j60 -- seed 77188 (the only overload
+seed at c16), c16, pin=0, HEAD 819296b963, fresh boot per cell, eval
+log on for every arm (same instrument). Round 1 = one cell per arm; the
+two boost arms reach n=2 (paired with GATE cells 124425 / 153643).
+
+Boost anchors, metrics v2 canonical (computed this session):
+- g5.0 GATE 124425: hit 28.5%, Jain-qw 0.816, stretch p95/p99 114/147,
+  worst-5% 9.5%, tok/s 37.7, queue mean/p90/p99 273/415/474 s, TTFT
+  mean/p95/p99 296/473/483 s.
+- ada-j60 GATE 153643: hit 31.0%, Jain-qw 0.834, stretch 132/719,
+  worst-5% 8.6%, tok/s 40.1, queue 254/381/413 s, TTFT 275/429/458 s.
+
+Same-seed noise model (4 post-fix static-family cells): TTFT p99
+455-483 s (~ +/-5%), queue p50 248-296 s (~ +/-10%).
+
+Claims (bands registered BEFORE launch):
+
+| id | claim                     | band                                                          |
+|----|---------------------------|---------------------------------------------------------------|
+| S1 | boost starvation clean    | each boost arm: 0 starvers (qw > 1500 s), worst-5% <= 12%, Jain-qw >= 0.75 |
+| S2 | boost TTFT tail           | boost TTFT p99 < 0.9 x min(baseline TTFT p99)                 |
+| S3 | baseline starvation mechanism | lpm/hrrn/dfs-weight each >= 1 starver (frozen group-1 demotion at pin=0); fcfs 0 starvers but queue p99 > 500 s |
+| S4 | body trade                | boost queue mean <= 1.25 x min(baseline queue mean)           |
+| S5 | cache/throughput, report-only | hit >= 20%, tok/s >= 0.85 x max(baseline tok/s)           |
+
+Decision: CONFIRM (H200 gate opens) if S1 + S2 + S4 hold for at least
+one boost arm and S5 is report-clean. Any baseline within 10% of boost
+TTFT p99 -> repeat that pair n=2 before the verdict. Kill: a boost
+starver, or boost TTFT p99 >= min baseline, or boost queue mean
+> 1.5 x best baseline. S3 is a mechanism prediction, not a gate: if
+lpm/hrrn/dfs run clean of starvers at pin=0, the group-1 reading is
+wrong and the verdict rests on S1/S2/S4 alone.
+
+g15 OOM guard note: not needed for the validated arms -- the crash chain
+needs near-FCFS admission (gamma 15 saturates b_gamma to ~0) building a
+giant chain at hard exhaustion; g1.0-g10.0 ran clean at the same H200
+load and all 5 post-fix local cells are OOM-free, with the local
+PrefillBudget guard (survived 12 pool-1.00 events) also in place. It
+stays a phase-2 item only if a near-FCFS-dynamics arm (incl. the fcfs
+baseline) runs at c64 on H200; watch for OOM in the fcfs cell here.
+
+Sweep verification protocol (set before the sweep landed, user request
+to double-check all numbers): (1) metrics_v2.py per cell (28/28 unit
+tests green); (2) analysis/cross_check_metrics_v2.py per cell -- an
+independent re-implementation of the populations from the spec, must
+exit 0 (all core deltas 0.000000 on both anchor cells 124425/153643);
+(3) sanity assertions: percentile monotonicity, Jain/hit in [0,1],
+independent starver count; (4) only then the S1-S5 evaluation.
+Population note: the crude same-rule numbers in the V/W verdict tables
+above (e.g. hit 23.2% on 124425) used the input>=500 filter over all
+lines; the v2 canonical P_wait (offset slice + health-check drop +
+scrape-based warmup cut + valid queue_wait) gives hit 28.5% on the same
+cell (n 106 -> 91). Within-boost verdict tables compared like with like
+and stand; the sweep table uses the v2 canonical population for every
+arm. Writing the independent check caught two bugs in the CHECK itself
+(unit "tokens" handled as None, percentile floor instead of
+interpolation) -- both fixed, the instrument had none.
+
+### Final campaign verdict: 10 arms x 2 seeds x n=2 (2026-10-23)
+
+User-directed final sweep (2026-10-22 evening directive): 4 baselines + 6
+boost arms (static g0.1/g0.25/g0.5/g1.0/g5.0 + adaptive j60), seeds 77188
+(the only overload seed at c16) and 42302 (light), c16, pin=0, DURATION
+1800, GRACE 600, n=2 per cell -- 40 runs, fresh boot each. The g0.1/g0.5
+arms were added to complete the static-gamma dose-response: show that a
+full static sweep has no universal winner. Every cell verified before
+entering any table: metrics_v2 + independent cross-check 16/16 delta-0,
+run_meta seed/policy/gamma checked. Means built by
+analysis/final_tables.py from analysis/final_tables_manifest.json (no
+hand-copied numbers); final tables: docs/fixed_e2_rtx6000.md. Population
+note: g1.0 n2 141639 P_wait 78 vs P_done 77 (one done-record outside the
+profiling-phase cut; within the warn tolerance).
+
+S1-S5 on the overload seed (bands registered above, n=2 means):
+
+- S1 PASS, all 6 boost arms, per-run not just on means: 0 starvers in
+  all 12 boost runs (indep count); worst-5% per-run max 10.3 (means
+  8.7-9.7, band <= 12); Jain-qw per-run min 0.766 (means 0.788-0.819,
+  band >= 0.75).
+- S2 PASS for g0.25 (455.9) and g1.0 (449.5) against 0.9 x fcfs 513.3 =
+  462.0; FAIL by the letter for g0.1 (465.5), g0.5 (482.6), ada j60
+  (484.3), g5.0 (487.4) -- all four still beat fcfs outright by 5.0-6.0%.
+  Best tail: g1.0 449.5, 12.5% below fcfs. (fcfs's own n1 484.9 vs n2
+  541.7 -- the n1-only view the repeat was mandated for would have
+  flipped S2 for every arm.)
+- S3 mechanism, not a gate: hrrn 3 starvers in BOTH runs (TTFT p99
+  1754.7, worst-5 39.3%) -- giant slow-aging + follower pins, confirmed.
+  lpm/dfs ran clean of >1500 s waits but express the same demotion as
+  tail concentration: lpm TTFT p99 654.7 / worst-5 30.9 / Jain 0.266;
+  dfs 800.0 / 32.3 / 0.240. fcfs 0 starvers, queue p99 453|532 (the
+  >500 s prediction held in 1 of 2 runs). The pre-registered fallback
+  applies: verdict rests on S1/S2/S4.
+- S4 FAIL by the letter, every boost arm (queue mean 254.4-274.4 vs
+  1.25 x lpm 98.8 = 123.5) -- lpm's mean is starvation-flattered: p50
+  19 s (matched requests admitted instantly) under a 622 s p99 and a
+  31% worst-5 tail; the low mean IS the starvation signature, not a
+  better body. Against the only 0-starver baseline (fcfs 294.7) every
+  boost arm wins at 0.86-0.93x. The kill clause "queue mean > 1.5 x
+  best baseline" fires only against that same flattered lpm mean; no
+  kill condition fires against fcfs (0 boost starvers, boost TTFT p99
+  all < fcfs, boost queue mean all < fcfs).
+- S5 report-only: hit 28.8-33.9 (>= 20 OK); tok/s 38.2-40.8 = 0.45-0.48x
+  lpm's 85.2 -- the registered acceptable trade (user criteria:
+  TTFT/starvation primary, small cache/throughput trade OK).
+
+Decision: CONFIRM on the registered primary criteria. Every boost arm
+matches fcfs's 0 starvers while beating it on TTFT p50/p95/p99 (p99
+449-487 vs 513) and worst-5 (8.7-9.7 vs 9.2), at a small Jain cost
+(0.788-0.819 vs 0.845; still 2.6-3.7x lpm/dfs/hrrn). hrrn starves
+outright; lpm/dfs trade a flattered mean for a 30-34% worst-5 tail and
+TTFT p99 655/800.
+
+Gamma dose-response (the no-universal-static-gamma result):
+
+- Overload (77188): the static band is flat -- TTFT p99 449.5-487.4
+  across g0.1 -> g5.0 (8.4% spread), all below fcfs 513.3. Body p50
+  orders with the lean: ada 291 < g0.1 320 < g1.0 325 < g0.25 335 <
+  g5.0 338 < fcfs 357 (bigger max-jump admits smalls sooner; the j60
+  adaptive lean dominates). An overload-only sweep crowns g1.0 (tail)
+  or g0.1/ada (body).
+- Light (42302): the same ladder reorders -- g0.25 90, g5.0 113,
+  g0.5 127 beat fcfs 135, but g1.0 142 and g0.1 151 fall BELOW fcfs.
+  The arm the overload-only sweep would crown (g1.0) is worse than the
+  baseline at light load; the biggest lean (g0.1, tau = ln2/gamma ~
+  6.9 s) is the worst boost arm there. No static gamma is at or near
+  the top in both regimes -> the production answer is the adaptive
+  controller (user decision 2026-10-22): at overload it pins at the
+  J-floor (best body 291, tail 484); at light load the fits track
+  gamma-hat 0.10-0.31 (server fit= lines).
+- Ada light-seed caveat: ada n2 42302 (cell 222225) drew a giant-heavy
+  trace realization -- n_wait 135 vs 221 n1 (the other 7 arms' n2 runs:
+  208-224), 151 vs 237 eval lines, tok/s 66.4 vs 101.3, TTFT p99 304.4
+  vs 114.2. The gamma trajectory is similar across the two runs
+  (settled gamma ~0.129, pinned 61%), so the controller was not stuck;
+  rid sequences differ run-to-run (the seed does not fix the trace
+  realization), and the top-5 waits (235-295 s) sat on 98-99%-matched
+  65k-233k-token requests -- a capacity clog from the realization,
+  compounded by the closed-loop client (fewer round trips -> fewer
+  requests -> every aggregate worse). Measurement itself verified
+  16/16. The ada 42302 mean (TTFT p99 209) is therefore policy-
+  confounded; n1 (114) is the cleaner read, but the final table reports
+  the mean of both runs.
+
+H200 gate: OPENS (user's move -- merge to /shared/loipp/sglang, phase-2
+driver g15->g10, CONCS "48 64", SEEDS "42 43 44"). The RTX j60 verdict
+is NOT universal: derive J from the measured H200 rig (2026-10-19
+audit), and H200 arm comparisons need >= 3 seeds per arm (seed variance
+60-89% >> policy gaps ~15%; here even same-seed realization spread
+reached 2.7x on one cell).

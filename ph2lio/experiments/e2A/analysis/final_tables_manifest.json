@@ -1,0 +1,86 @@
+{
+  "77188": {
+    "fcfs": [
+      "results/1x-rtx6000pro/agentx/fcfs/c16_20261021_170604",
+      "results/1x-rtx6000pro/agentx/fcfs/c16_20261021_234934"
+    ],
+    "lpm": [
+      "results/1x-rtx6000pro/agentx/lpm/c16_20261021_180031",
+      "results/1x-rtx6000pro/agentx/lpm/c16_20261022_113308"
+    ],
+    "dfs-weight": [
+      "results/1x-rtx6000pro/agentx/dfs-weight/c16_20261021_185500",
+      "results/1x-rtx6000pro/agentx/dfs-weight/c16_20261022_122748"
+    ],
+    "hrrn": [
+      "results/1x-rtx6000pro/agentx/hrrn/c16_20261021_194931",
+      "results/1x-rtx6000pro/agentx/hrrn/c16_20261022_132216"
+    ],
+    "boost g0.1": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.1_wall_k256_20261022_231930",
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.1_wall_k256_20261023_010826"
+    ],
+    "boost g0.5": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.5_wall_k256_20261023_001359",
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.5_wall_k256_20261023_020251"
+    ],
+    "boost g0.25": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261022_032806",
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261022_151121"
+    ],
+    "boost g1.0": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g1.0_wall_k256_20261022_023344",
+      "results/1x-rtx6000pro/agentx/boost/c16_g1.0_wall_k256_20261022_141639"
+    ],
+    "boost g5.0": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g5.0_wall_k256_20261021_215547",
+      "results/1x-rtx6000pro/agentx/boost/c16_g5.0_wall_k256_20261022_004403"
+    ],
+    "boost ada j60": [
+      "results/1x-rtx6000pro/agentx/boost/c16_gada_wall_k256_j60_20261021_225015",
+      "results/1x-rtx6000pro/agentx/boost/c16_gada_wall_k256_j60_20261022_013830"
+    ]
+  },
+  "42302": {
+    "fcfs": [
+      "results/1x-rtx6000pro/agentx/fcfs/c16_20261022_042230",
+      "results/1x-rtx6000pro/agentx/fcfs/c16_20261022_160558"
+    ],
+    "lpm": [
+      "results/1x-rtx6000pro/agentx/lpm/c16_20261022_051616",
+      "results/1x-rtx6000pro/agentx/lpm/c16_20261022_165945"
+    ],
+    "dfs-weight": [
+      "results/1x-rtx6000pro/agentx/dfs-weight/c16_20261022_061003",
+      "results/1x-rtx6000pro/agentx/dfs-weight/c16_20261022_175326"
+    ],
+    "hrrn": [
+      "results/1x-rtx6000pro/agentx/hrrn/c16_20261022_070344",
+      "results/1x-rtx6000pro/agentx/hrrn/c16_20261022_184726"
+    ],
+    "boost g0.1": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.1_wall_k256_20261023_025720",
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.1_wall_k256_20261023_044455"
+    ],
+    "boost g0.5": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.5_wall_k256_20261023_035112",
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.5_wall_k256_20261023_053848"
+    ],
+    "boost g0.25": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261022_075724",
+      "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261022_194104"
+    ],
+    "boost g1.0": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g1.0_wall_k256_20261022_085103",
+      "results/1x-rtx6000pro/agentx/boost/c16_g1.0_wall_k256_20261022_203446"
+    ],
+    "boost g5.0": [
+      "results/1x-rtx6000pro/agentx/boost/c16_g5.0_wall_k256_20261022_094443",
+      "results/1x-rtx6000pro/agentx/boost/c16_g5.0_wall_k256_20261022_212835"
+    ],
+    "boost ada j60": [
+      "results/1x-rtx6000pro/agentx/boost/c16_gada_wall_k256_j60_20261022_103826",
+      "results/1x-rtx6000pro/agentx/boost/c16_gada_wall_k256_j60_20261022_222225"
+    ]
+  }
+}

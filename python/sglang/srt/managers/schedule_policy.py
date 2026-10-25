@@ -352,7 +352,10 @@ class AdaptiveBoostGamma:
 
     The low clip is a max-jump bound, not a raw gamma: gamma is floored so
     the largest boost any newcomer can receive, b_gamma(bin_size / rate),
-    stays <= max_jump_s wall seconds. "How far a newcomer may cut ahead" is
+    stays <= max_jump_s wall seconds. With boost-cache, the lambda*M cache
+    bonus cuts ahead too and shares that budget: gamma's floor bounds
+    b_gamma within max_jump_s - lambda*M/rate. "How far a newcomer may cut
+    ahead" is
     workload- and CCU-independent; a raw gamma floor is not (its starvation
     effect scales with the service rate). Measured basis (E2 c16 sweep,
     2026-10-13): jump ~50 s (gamma 0.09, k 256, ~2k tok/s) holds
@@ -387,11 +390,15 @@ class AdaptiveBoostGamma:
         max_jump_s: float,
         window: int = WINDOW,
         min_samples: int = MIN_SAMPLES,
+        cache_jump_tokens: float = 0.0,
     ) -> None:
         self._samples: deque = deque(maxlen=window)
         self._min_samples = min_samples
         self._bin_size = bin_size
         self._max_jump_s = max_jump_s
+        # boost-cache's lambda*M bonus, in tokens; converted at the measured
+        # rate inside _gamma_floor (the rate moves between updates).
+        self._cache_jump_tokens = cache_jump_tokens
         self._gamma = min(max(gamma0, self.GAMMA_MIN_S), self.GAMMA_MAX_S)
         self._updates_since_log = 0
         self._last_logged_gamma = self._gamma
@@ -497,16 +504,24 @@ class AdaptiveBoostGamma:
 
     def _gamma_floor(self, rate_tokens_per_s: Optional[float]) -> float:
         """Smallest gamma whose max boost b_gamma(bin_size / rate) fits
-        within max_jump_s. b_gamma(tau) = tau * g(gamma * tau) with
+        within max_jump_s minus the boost-cache bonus's share of the jump.
+        b_gamma(tau) = tau * g(gamma * tau) with
         g(u) = -ln(1 - exp(-u)) / u strictly decreasing, so the floor is the
-        root of g(u) = max_jump_s / tau at u = gamma * tau, found by
+        root of g(u) = budget_s / tau at u = gamma * tau, found by
         bisection on u. Rate unmeasured -> the outer floor: the sort gives
         boost 0 (pure arrival order) while the rate is None, so no jump
         exists to bound."""
         if rate_tokens_per_s is None or rate_tokens_per_s <= 0.0:
             return self.GAMMA_MIN_S
         tau_s = self._bin_size / rate_tokens_per_s
-        budget = self._max_jump_s / tau_s
+        # The bonus lambda*M cuts ahead like the work boost, so the J bound
+        # covers both and gamma's share of max_jump_s is the remainder; a
+        # bonus alone at/above the bound leaves gamma no share -- the outer
+        # max is then the least-boost end (b -> 0 as gamma -> GAMMA_MAX_S).
+        budget_s = self._max_jump_s - self._cache_jump_tokens / rate_tokens_per_s
+        if budget_s <= 0.0:
+            return self.GAMMA_MAX_S
+        budget = budget_s / tau_s
         lo, hi = 1e-9, 1e3  # g(1e-9) ~ 2e10 > any budget; g(1e3) ~ 0
         for _ in range(64):
             mid = math.sqrt(lo * hi)
@@ -553,6 +568,9 @@ class CacheAwarePolicy(Enum):
     HRRN = "hrrn"  # highest response ratio next, token-based aging
     SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
     BOOST = "boost"  # gamma-boosted arrival time (anti-starvation)
+    # boost + bounded matched-prefix bonus: the lpm cache-reuse signal folded
+    # into phi without giving up the bounded-displacement anti-starvation.
+    BOOST_CACHE = "boost-cache"
 
 
 class CacheAgnosticPolicy(Enum):
@@ -584,6 +602,8 @@ class SchedulePolicy:
         boost_adaptive_gamma: bool = False,
         boost_adaptive_max_jump_s: float = 60.0,
         boost_clock: str = "tokens",
+        boost_cache_lambda: float = 0.5,
+        boost_cache_cap_tokens: int = 8192,
         in_batch_prefix_caching_max_pin_s: float = 60.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
@@ -595,34 +615,55 @@ class SchedulePolicy:
         self.boost_gamma = boost_gamma
         self.boost_bin_size = boost_bin_size
         self.boost_clock = BoostClock(boost_clock)
+        self.boost_cache_lambda = boost_cache_lambda
+        self.boost_cache_cap_tokens = boost_cache_cap_tokens
+        if self.policy == CacheAwarePolicy.BOOST_CACHE:
+            if not 0.0 <= boost_cache_lambda <= 1.0:
+                raise ValueError(
+                    f"boost_cache_lambda must be within [0, 1], got {boost_cache_lambda}"
+                )
+            if boost_cache_cap_tokens < 1:
+                raise ValueError(
+                    f"boost_cache_cap_tokens must be >= 1, got {boost_cache_cap_tokens}"
+                )
         self.in_batch_prefix_caching_max_pin_s = in_batch_prefix_caching_max_pin_s
         # Wall-mode token-clock rate EMA; None in tokens mode and for
-        # non-boost policies (fixed-gamma tokens path stays bit-identical).
+        # non-boost(-cache) policies (fixed-gamma tokens path stays
+        # bit-identical).
         self.prefill_token_rate: Optional[TokenClockRate] = (
             TokenClockRate()
             if self.boost_clock is BoostClock.WALL
-            and self.policy == CacheAwarePolicy.BOOST
+            and self.policy in (CacheAwarePolicy.BOOST, CacheAwarePolicy.BOOST_CACHE)
             else None
         )
         # gamma-Ada (Eq. 9) fits wall-second E2E latencies, so it is
-        # wall-mode only; None unless boost + --boost-adaptive-gamma (off by
-        # default, so the fixed-gamma path is bit-identical to before).
+        # wall-mode only; None unless boost/boost-cache +
+        # --boost-adaptive-gamma (off by default, so the fixed-gamma path is
+        # bit-identical to before).
         if (
             boost_adaptive_gamma
-            and self.policy == CacheAwarePolicy.BOOST
+            and self.policy in (CacheAwarePolicy.BOOST, CacheAwarePolicy.BOOST_CACHE)
             and self.boost_clock is not BoostClock.WALL
         ):
             raise ValueError(
                 "--boost-adaptive-gamma requires --boost-clock wall "
                 "(the E2E-latency tail fit is wall seconds)"
             )
+        # The cache bonus lambda*min(matched, M) cuts ahead too, so gamma-Ada's
+        # jump budget shares max_jump_s with it (see AdaptiveBoostGamma).
         self.adaptive_gamma: Optional[AdaptiveBoostGamma] = (
             AdaptiveBoostGamma(
                 boost_gamma,
                 boost_bin_size,
                 boost_adaptive_max_jump_s,
+                cache_jump_tokens=(
+                    boost_cache_lambda * boost_cache_cap_tokens
+                    if self.policy == CacheAwarePolicy.BOOST_CACHE
+                    else 0.0
+                ),
             )
-            if boost_adaptive_gamma and self.policy == CacheAwarePolicy.BOOST
+            if boost_adaptive_gamma
+            and self.policy in (CacheAwarePolicy.BOOST, CacheAwarePolicy.BOOST_CACHE)
             else None
         )
         self._shortest_prefill_calls = 0
@@ -694,7 +735,7 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_hrrn(
                     waiting_queue, temporary_deprioritized, processed_tokens
                 )
-            elif policy == CacheAwarePolicy.BOOST:
+            elif policy in (CacheAwarePolicy.BOOST, CacheAwarePolicy.BOOST_CACHE):
                 # Boost places dedup followers just behind their leader;
                 # the frozen baseline sorts below keep the global group-1
                 # tail (comparability with the campaign arms).
@@ -712,6 +753,16 @@ class SchedulePolicy:
                         else None
                     ),
                     leader_of=leader_of,
+                    cache_lambda=(
+                        self.boost_cache_lambda
+                        if policy == CacheAwarePolicy.BOOST_CACHE
+                        else 0.0
+                    ),
+                    cache_cap_tokens=(
+                        self.boost_cache_cap_tokens
+                        if policy == CacheAwarePolicy.BOOST_CACHE
+                        else 0
+                    ),
                 )
                 # After the sort: _mark_commit_holds reads the admission order.
                 self._mark_commit_holds(waiting_queue, chunked_req)
@@ -822,9 +873,12 @@ class SchedulePolicy:
                     raise ValueError(
                         "Experimental shortest-prefill-first requires prefix caching"
                     )
-                if policy_enum == CacheAwarePolicy.BOOST:
+                if policy_enum in (
+                    CacheAwarePolicy.BOOST,
+                    CacheAwarePolicy.BOOST_CACHE,
+                ):
                     logger.warning(
-                        "schedule_policy=boost requires prefix caching; "
+                        "schedule_policy=boost/boost-cache requires prefix caching; "
                         "falling back to fcfs"
                     )
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
@@ -1002,7 +1056,11 @@ class SchedulePolicy:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
             self.policy
-            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.BOOST)
+            not in (
+                CacheAwarePolicy.SHORTEST_PREFILL_FIRST,
+                CacheAwarePolicy.BOOST,
+                CacheAwarePolicy.BOOST_CACHE,
+            )
             or budget < 2 * page_size
         ):
             return None
@@ -1088,6 +1146,8 @@ class SchedulePolicy:
         clock: BoostClock = BoostClock.TOKENS,
         rate_tokens_per_s: Optional[float] = None,
         leader_of: Optional[Dict[str, str]] = None,
+        cache_lambda: float = 0.0,
+        cache_cap_tokens: int = 0,
     ) -> None:
         """Gamma-boosted arrival ordering (UniBoost, Li et al., ICML 2026, Sec. 2).
 
@@ -1104,6 +1164,17 @@ class SchedulePolicy:
         bounded by b_gamma(bin_size) clock-tokens (or b_gamma(bin_size / rate)
         wall seconds); requests older than that are unreachable — bounded
         displacement, converging to FCFS.
+
+        boost-cache (cache_lambda > 0): phi(r) = A(r) - b_gamma(q(u(r))) -
+        lambda*min(matched(r), M) — the bounded lpm fusion. The matched-prefix
+        bonus values the cache reuse itself (matched tokens are already
+        excluded from u(r)), pulling hot-prefix requests ahead of equal-bin
+        cold ones. It is capped at lambda*M clock-tokens (wall: lambda*M/rate
+        seconds), so the newcomer jump bound grows from b_gamma(bin_size) to
+        b_gamma(bin_size) + lambda*M: anti-starvation degrades by a fixed,
+        tunable amount instead of collapsing the way lpm's cache term does
+        (it dominates arrival unboundedly). cache_lambda = 0 is bit-identical
+        to boost.
 
         In-batch dedup followers (leader_of, from _compute_prefix_matches)
         sort just behind their leader — group 0 at phi(leader) + eps — not
@@ -1135,6 +1206,20 @@ class SchedulePolicy:
                 )
             return r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
 
+        def cache_bonus(r: Req) -> float:
+            if cache_lambda <= 0.0 or cache_cap_tokens <= 0:
+                return 0.0
+            matched = min(r.num_matched_prefix_tokens, cache_cap_tokens)
+            if matched <= 0:
+                return 0.0
+            if clock is BoostClock.WALL:
+                return (
+                    cache_lambda * matched / rate_tokens_per_s
+                    if rate_tokens_per_s is not None
+                    else 0.0
+                )
+            return cache_lambda * matched
+
         def base_rank(r: Req) -> float:
             w = geometric_bin(SchedulePolicy._shortest_prefill_work(r), bin_size)
             if clock is BoostClock.WALL:
@@ -1143,8 +1228,8 @@ class SchedulePolicy:
                     if rate_tokens_per_s is not None
                     else 0.0
                 )
-                return arrival_stamp(r) - boost_s
-            return arrival_stamp(r) - gamma_boost(w, gamma)
+                return arrival_stamp(r) - boost_s - cache_bonus(r)
+            return arrival_stamp(r) - gamma_boost(w, gamma) - cache_bonus(r)
 
         def key(r: Req):
             rank = base_rank(r)
