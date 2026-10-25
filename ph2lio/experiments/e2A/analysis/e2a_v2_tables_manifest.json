@@ -8,6 +8,18 @@
     ],
     "boost g0.25": [
       "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261024_124610"
+    ],
+    "ada j50": [
+      "results/1x-rtx6000pro/agentx/boost/c16_gada_wall_k256_j50_20261025_172916"
+    ],
+    "bc ada j50 a0.25": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_gada_wall_k256_j50_a0.25_20261025_182351"
+    ],
+    "bc ada j50 a0.5": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_gada_wall_k256_j50_a0.5_20261025_191830"
+    ],
+    "bc ada j50 a1.0": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_gada_wall_k256_j50_a1.0_20261025_201300"
     ]
   },
   "42302": {
@@ -19,6 +31,18 @@
     ],
     "boost g0.25": [
       "results/1x-rtx6000pro/agentx/boost/c16_g0.25_wall_k256_20261024_205637"
+    ],
+    "ada j50": [
+      "results/1x-rtx6000pro/agentx/boost/c16_gada_wall_k256_j50_20261025_210735"
+    ],
+    "bc ada j50 a0.25": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_gada_wall_k256_j50_a0.25_20261025_220125"
+    ],
+    "bc ada j50 a0.5": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_gada_wall_k256_j50_a0.5_20261025_225519"
+    ],
+    "bc ada j50 a1.0": [
+      "results/1x-rtx6000pro/agentx/boost-cache/c16_gada_wall_k256_j50_a1.0_20261025_234913"
     ]
   }
 }
