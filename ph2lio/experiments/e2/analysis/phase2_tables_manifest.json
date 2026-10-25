@@ -5,8 +5,7 @@
       "results/glm53/agentx_dynamo/policies_v2/phase2_policies/boost/c64_g0.25_wall_k256_20261024_200736"
     ],
     "boost ada j50": [
-      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/boost/c64_gada_wall_k256_j50_20261023_202140",
-      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/boost/c64_gada_wall_k256_j50_20261024_211510"
+      "results/glm53/agentx_dynamo/policies_v2/phase2_policies/boost/c64_gada_wall_k256_j50_20261023_202140"
     ],
     "dfs-weight": [
       "results/glm53/agentx_dynamo/policies_v2/phase2_policies/dfs-weight/c64_20261023_144212",
