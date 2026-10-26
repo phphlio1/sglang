@@ -362,7 +362,7 @@ from sglang.srt.utils import (
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.common import Range, is_npu
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
     get_tokenizer,
@@ -3994,6 +3994,7 @@ class Scheduler(
         # unchanged receipt (a chunk continuation's) marks a lock that
         # predates the pass and must survive the rollback.
         admission_receipts = self._snapshot_admission_lock_receipts()
+        admission_extend_ranges = self._snapshot_admission_extend_ranges()
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -4202,6 +4203,7 @@ class Scheduler(
                 can_run_list=can_run_list,
                 fresh_row_reqs=new_reqs_for_oom_recovery,
                 receipts_before=admission_receipts,
+                extend_ranges_before=admission_extend_ranges,
             )
             logger.warning(
                 "Prefill OOM under overload: skipped this prefill step "
@@ -4278,6 +4280,16 @@ class Scheduler(
             receipts[self.chunked_req.rid] = self.chunked_req.lock_receipt
         return receipts
 
+    def _snapshot_admission_extend_ranges(self) -> Dict[str, Optional[Range]]:
+        """Pre-admission extend_range keyed by rid, for the same req universe
+        as _snapshot_admission_lock_receipts. Admission rebinds extend_range
+        (an immutable Range) before prepare_for_extend runs, so restoring the
+        snapshot object is exact."""
+        ranges = {req.rid: req.extend_range for req in self.waiting_queue}
+        if self.chunked_req is not None:
+            ranges[self.chunked_req.rid] = self.chunked_req.extend_range
+        return ranges
+
     def _rollback_failed_prefill_admission(
         self,
         *,
@@ -4285,16 +4297,20 @@ class Scheduler(
         can_run_list: List[Req],
         fresh_row_reqs: List[Req],
         receipts_before: Dict[str, DecLockRefParams],
+        extend_ranges_before: Dict[str, Optional[Range]],
     ) -> None:
         """Undo an admission whose prepare_for_extend failed on KV allocation.
 
         The adder mutated state beyond the discarded batch: per-req admission
-        locks, req pool rows for reqs without KV, and the chunk bookkeeping.
-        Each must revert or the retry compounds - a leaked lock pins pages
-        until the pool reads evictable=0, an inflated inflight_middle_chunks
-        blocks the req's release forever, and a continuation requeued while
-        self.chunked_req still tracks it is admitted twice in one batch
-        (double KV alloc/free corrupts the allocator).
+        locks, req pool rows for reqs without KV, the chunk bookkeeping, and
+        each admitted req's extend_range. Each must revert or the retry
+        compounds - a leaked lock pins pages until the pool reads evictable=0,
+        an inflated inflight_middle_chunks blocks the req's release forever, a
+        continuation requeued while self.chunked_req still tracks it is
+        admitted twice in one batch (double KV alloc/free corrupts the
+        allocator), and a leftover extend_range makes the next pass's stash
+        gate checkpoint a chunk that was never dispatched, binding unwritten
+        req_to_token rows into prefix_indices and the radix tree.
         """
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks -= 1
@@ -4308,6 +4324,7 @@ class Scheduler(
             if req.lock_receipt is not receipts_before[req.rid]:
                 self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
                 req.lock_receipt = receipts_before[req.rid]
+            req.extend_range = extend_ranges_before[req.rid]
         for req in fresh_row_reqs:
             if req.kv.req_pool_idx is not None:
                 self.req_to_token_pool.free(req)
