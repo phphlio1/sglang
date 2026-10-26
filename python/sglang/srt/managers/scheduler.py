@@ -1457,6 +1457,8 @@ class Scheduler(
                 boost_gamma=get_schedule().boost_gamma,
                 boost_bin_size=get_schedule().boost_bin_size,
                 boost_clock=get_schedule().boost_clock,
+                boost_cache_lambda=get_schedule().boost_cache_lambda,
+                boost_cache_cap_tokens=get_schedule().boost_cache_cap_tokens,
             )
 
         # NOTE: preemption is enabled by default for priority scheduling.
