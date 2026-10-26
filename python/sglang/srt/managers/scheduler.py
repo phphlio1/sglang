@@ -290,7 +290,10 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestOutcome,
+    DecLockRefParams,
+)
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
@@ -3985,6 +3988,13 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        # OOM-rollback anchor: lock receipts as they were before this
+        # admission pass. A receipt object replaced during the pass marks a
+        # lock the pass took and a failed prepare must give back; an
+        # unchanged receipt (a chunk continuation's) marks a lock that
+        # predates the pass and must survive the rollback.
+        admission_receipts = self._snapshot_admission_lock_receipts()
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
@@ -4185,17 +4195,14 @@ class Scheduler(
             if "out of memory" not in str(e).lower():
                 raise
             # The admission budget said this batch fits but the KV pool
-            # disagreed. Back out: free req pool rows just allocated, return
-            # reqs to the waiting queue, skip this prefill step. Running
-            # decodes (if any) free memory naturally; the next step retries.
-            for req in new_reqs_for_oom_recovery:
-                if req.kv.req_pool_idx is not None:
-                    self.req_to_token_pool.free(req)
-            self.waiting_queue = can_run_list + self.waiting_queue
-            if adder.new_chunked_req is not None:
-                self.chunked_req = None
-            if self.chunked_req is not None:
-                self.chunked_req.inflight_middle_chunks -= 1
+            # disagreed. Skip this prefill step; running decodes (if any)
+            # free memory and the next step retries.
+            self._rollback_failed_prefill_admission(
+                adder=adder,
+                can_run_list=can_run_list,
+                fresh_row_reqs=new_reqs_for_oom_recovery,
+                receipts_before=admission_receipts,
+            )
             logger.warning(
                 "Prefill OOM under overload: skipped this prefill step "
                 "(%d reqs returned to queue). Decode will free memory.",
@@ -4259,6 +4266,53 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _snapshot_admission_lock_receipts(self) -> Dict[str, DecLockRefParams]:
+        """Pre-admission lock receipts keyed by rid, for every req the
+        admission pass can touch (the waiting queue plus the tracked chunked
+        req). The rollback compares by object identity: `_req_inc_lock_ref`
+        rebinds `req.lock_receipt`, so a replaced receipt is exactly a lock
+        this pass took."""
+        receipts = {req.rid: req.lock_receipt for req in self.waiting_queue}
+        if self.chunked_req is not None:
+            receipts[self.chunked_req.rid] = self.chunked_req.lock_receipt
+        return receipts
+
+    def _rollback_failed_prefill_admission(
+        self,
+        *,
+        adder: PrefillAdder,
+        can_run_list: List[Req],
+        fresh_row_reqs: List[Req],
+        receipts_before: Dict[str, DecLockRefParams],
+    ) -> None:
+        """Undo an admission whose prepare_for_extend failed on KV allocation.
+
+        The adder mutated state beyond the discarded batch: per-req admission
+        locks, req pool rows for reqs without KV, and the chunk bookkeeping.
+        Each must revert or the retry compounds - a leaked lock pins pages
+        until the pool reads evictable=0, an inflated inflight_middle_chunks
+        blocks the req's release forever, and a continuation requeued while
+        self.chunked_req still tracks it is admitted twice in one batch
+        (double KV alloc/free corrupts the allocator).
+        """
+        if self.chunked_req is not None:
+            self.chunked_req.inflight_middle_chunks -= 1
+        # A first-chunk admission re-homes to the waiting queue; a
+        # continuation stays tracked by self.chunked_req alone, so it must
+        # not also sit in the waiting queue.
+        continuation = self.chunked_req if adder.new_chunked_req is None else None
+        if adder.new_chunked_req is not None:
+            self.chunked_req = None
+        for req in can_run_list:
+            if req.lock_receipt is not receipts_before[req.rid]:
+                self.tree_cache.dec_lock_ref(req.last_node, req.lock_receipt)
+                req.lock_receipt = receipts_before[req.rid]
+        for req in fresh_row_reqs:
+            if req.kv.req_pool_idx is not None:
+                self.req_to_token_pool.free(req)
+        requeue = [req for req in can_run_list if req is not continuation]
+        self.waiting_queue = requeue + self.waiting_queue
 
     def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
