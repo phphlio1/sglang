@@ -118,6 +118,7 @@ class TestScheduleEvalLogger(CustomTestCase):
             boost_clock="tokens",
             boost_cache_lambda=0.0,
             boost_cache_cap_tokens=0,
+            dp_rank=3,
         )
         finished = _finish(_make_req("done"))
         pending = _make_req("pending")  # still running: must not be logged
@@ -130,6 +131,7 @@ class TestScheduleEvalLogger(CustomTestCase):
         self.assertEqual(
             {
                 "rid",
+                "dp_rank",
                 "policy",
                 "gamma",
                 "boost_clock",
@@ -155,6 +157,7 @@ class TestScheduleEvalLogger(CustomTestCase):
             },
             set(rec.keys()),
         )
+        self.assertEqual(rec["dp_rank"], 3)
         self.assertEqual(rec["policy"], "boost")
         self.assertEqual(rec["gamma"], 1e-4)
         # The record's gamma is unit-ambiguous without the clock mode.
@@ -184,6 +187,7 @@ class TestScheduleEvalLogger(CustomTestCase):
             boost_clock="tokens",
             boost_cache_lambda=0.0,
             boost_cache_cap_tokens=0,
+            dp_rank=3,
         )
         logger.log_finished_batch([_finish(_make_req("retracted"), retracted=True)])
         logger.close()
@@ -205,6 +209,7 @@ class TestScheduleEvalLogger(CustomTestCase):
             boost_clock="tokens",
             boost_cache_lambda=0.0,
             boost_cache_cap_tokens=0,
+            dp_rank=3,
         )
         req = _finish(_make_req("done"))
         logger.log_finished_batch([req])
@@ -224,6 +229,7 @@ class TestScheduleEvalLogger(CustomTestCase):
                 boost_clock="tokens",
                 boost_cache_lambda=0.0,
                 boost_cache_cap_tokens=0,
+                dp_rank=0,
             )
         # Disabled, not crashed: logging a finished batch is a no-op.
         logger.log_finished_batch([_finish(_make_req("done"))])

@@ -68,8 +68,10 @@ class ScheduleEvalLogger:
         boost_clock: str,
         boost_cache_lambda: float,
         boost_cache_cap_tokens: int,
+        dp_rank: int,
     ) -> None:
         self.path = path
+        self.dp_rank = dp_rank
         self.policy = policy
         self.boost_gamma = boost_gamma
         self.boost_bin_size = boost_bin_size
@@ -139,6 +141,8 @@ class ScheduleEvalLogger:
         )
         return {
             "rid": req.rid,
+            # Attention-DP rank of this scheduler, for per-rank load breakdowns.
+            "dp_rank": self.dp_rank,
             "policy": self.policy,
             "gamma": self.boost_gamma,
             # A gamma value alone is unit-ambiguous across clock modes.
