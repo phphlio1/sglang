@@ -91,15 +91,166 @@ class Schedule(msgspec.Struct):
                 "lpm",
                 "random",
                 "fcfs",
+                "fcfs-match",
                 "dfs-weight",
                 "lof",
                 "priority",
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "boost",
+                "boost-cache",
             ],
         ),
     ] = "fcfs"
+    boost_gamma: A[
+        Optional[float],
+        Arg(
+            help=(
+                "Gamma for the boost schedule policy. Larger gamma gives stronger "
+                "anti-starvation (more FCFS-like); smaller gamma favors short uncached "
+                "work (more locality-driven). Units follow --boost-clock: per-token "
+                "under 'tokens' (default 1e-4), 1/s under 'wall' (default 0.1). "
+                "Unset uses the clock-mode default."
+            ),
+            resolvable=True,
+        ),
+    ] = None
+    boost_bin_size: A[
+        int,
+        Arg(
+            help="Geometric bin size k for the boost schedule policy's work quantization; the max boost is b_gamma(k), so this bounds how far a newcomer may jump ahead. Power of two recommended.",
+        ),
+    ] = 256
+    boost_adaptive_gamma: A[
+        bool,
+        Arg(
+            help=(
+                "Adapt boost_gamma online from the completed-request response-time "
+                "tail (gamma-Ada, UniBoost Eq. 9): gamma_hat = ln5/(t99-t95) over "
+                "the last 128 E2E latencies (wall seconds), EMA-smoothed (beta 0.2) "
+                "and clipped. Fatter tail -> smaller gamma (stronger locality "
+                "bias); thinner tail -> larger gamma (more FCFS-like). The low clip "
+                "is a max-jump bound (--boost-adaptive-max-jump-s), not a raw "
+                "gamma. Requires --schedule-policy boost and --boost-clock wall; "
+                "off by default."
+            ),
+        ),
+    ] = False
+    boost_adaptive_max_jump_s: A[
+        float,
+        Arg(
+            help=(
+                "gamma-Ada max-jump bound in wall seconds: gamma is floored so the "
+                "largest boost any newcomer can receive, b_gamma(bin_size / "
+                "token_rate), stays within this. Bounds cold-request starvation "
+                "independently of workload and concurrency (unlike a raw gamma "
+                "floor, whose effect scales with the service rate). Only used "
+                "with --boost-adaptive-gamma."
+            ),
+        ),
+    ] = 60.0
+    boost_clock: A[
+        str,
+        Arg(
+            help=(
+                "Clock for the boost schedule policy's arrival and work axes. "
+                "'tokens' (default) is the paper-exact counted-token clock "
+                "(includes linear replay of matched prefixes, so the wall-time "
+                "meaning of boost_gamma varies with cache state). 'wall' stamps "
+                "arrival in wall seconds and converts uncached work to "
+                "seconds-of-service via a measured token-clock rate, pinning the "
+                "effective gamma and the adaptive estimator's fixed point "
+                "independent of cache state; boost_gamma is then in 1/s. Requires "
+                "--schedule-policy boost."
+            ),
+            choices=["tokens", "wall"],
+        ),
+    ] = "tokens"
+    boost_cache_lambda: A[
+        float,
+        Arg(
+            help=(
+                "Cache-affinity weight for the boost-cache policy: "
+                "phi'(r) = A(r) - b_gamma(q(u(r))) - lambda * min(matched, M) "
+                "pulls requests with a hot radix-tree prefix (the signal lpm "
+                "sorts on) ahead of equal-bin cold ones, recovering lpm-style "
+                "cache reuse. The bonus is bounded, so the newcomer jump bound "
+                "grows from b_gamma(bin_size) to b_gamma(bin_size) + lambda*M "
+                "clock-tokens (wall: lambda*M/rate seconds) -- anti-starvation "
+                "degrades gracefully, unlike lpm's unbounded cache dominance. "
+                "0 is bit-identical to boost; 1 trades one matched token for "
+                "one clock-token of seniority. Only used with "
+                "--schedule-policy boost-cache."
+            ),
+        ),
+    ] = 0.5
+    boost_cache_cap_tokens: A[
+        int,
+        Arg(
+            help=(
+                "Cap M on the matched-prefix tokens that earn the boost-cache "
+                "bonus (the lambda*min(matched, M) term); matched tokens beyond "
+                "M add nothing. Power of two recommended. Only used with "
+                "--schedule-policy boost-cache."
+            ),
+        ),
+    ] = 8192
+    boost_preempt_wait_s: A[
+        float,
+        Arg(
+            help=(
+                "Decode time-slicing for the boost policies: when a request still "
+                "waiting for its first token has queued this many wall seconds and "
+                "the KV pool cannot fit it, release the running decodes with the "
+                "most generated tokens into the radix cache (they resume from "
+                "their own cached KV) until it fits, and admit it first. Trades "
+                "a mid-stream stall of long outputs for the queue-wait / TTFT "
+                "tail. 0 disables. Requires --schedule-policy boost or "
+                "boost-cache and a full-attention radix cache."
+            ),
+        ),
+    ] = 0.0
+    boost_preempt_quantum_tokens: A[
+        int,
+        Arg(
+            help=(
+                "Decode tokens a request must generate after each admission before "
+                "--boost-preempt-wait-s may release it; doubles with every release "
+                "of that request."
+            ),
+        ),
+    ] = 512
+    boost_preempt_max_per_req: A[
+        int,
+        Arg(
+            help=(
+                "Maximum --boost-preempt-wait-s releases of one request; it then "
+                "decodes to completion."
+            ),
+        ),
+    ] = 2
+    in_batch_prefix_caching_max_pin_s: A[
+        float,
+        Arg(
+            help=(
+                "Wall-second bound on the in-batch prefix-caching follower pin: a "
+                "waiting request deprioritized as a duplicate-prefix follower "
+                "(shares >= 32 leading tokens with an earlier waiting peer while "
+                "its own radix match is <= 32) is promoted back to normal "
+                "priority once its total queue wait since first entry exceeds "
+                "this. 0 or negative disables the bound (the follower waits for "
+                "its leader unconditionally). Applies to lpm, hrrn, "
+                "shortest-prefill-first and boost. Default 60 s."
+            ),
+        ),
+    ] = 60.0
+    log_schedule_eval_path: A[
+        Optional[str],
+        Arg(
+            help="Absolute path of a .jsonl file to append one per-request schedule-evaluation record per finished request (rid, queue wait, ttft, cache classification, retractions). Off by default.",
+        ),
+    ] = None
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",

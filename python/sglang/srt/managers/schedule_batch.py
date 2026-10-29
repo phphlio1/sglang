@@ -72,6 +72,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    Sequence,
     Set,
     Tuple,
     TypeAlias,
@@ -1232,8 +1233,8 @@ class Req(ReqDllmMixin):
         self.mamba_branching_seqlen: Optional[int] = None
         # Total cached prefix length (on-device prefix_len + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
-        # time and used to estimate uncached tokens / sort by longest prefix for
-        # load reporting.
+        # and admission time and used to estimate uncached tokens / sort by
+        # longest prefix for load reporting.
         self.num_matched_prefix_tokens = 0
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
@@ -1459,6 +1460,54 @@ class Req(ReqDllmMixin):
 
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
+
+        # Token-clock stamp at FIRST waiting_queue entry. Stamped once and never
+        # re-stamped on retraction re-adds (unlike arrival_processed_tokens above),
+        # so boost seniority survives retract -> requeue cycles.
+        self.boost_arrival_tokens: Optional[int] = None
+
+        # Schedule-eval log bookkeeping (--log-schedule-eval-path): first entry
+        # and first admission are stamp-once (they must survive retraction),
+        # last admission is last-write-wins. See observability/schedule_eval_log.py.
+        # first_queue_entry_time is also the boost wall-clock arrival axis
+        # (--boost-clock wall); same stamp-once coverage as boost_arrival_tokens.
+        self.first_queue_entry_time: Optional[float] = None
+        self.matched_prefix_tokens_first_admission: Optional[int] = None
+        self.matched_prefix_tokens_last_admission: Optional[int] = None
+
+        # In-batch dedup classification from the most recent sort
+        # (_compute_prefix_matches): True while the request is a deprioritized
+        # follower. Last-write-wins per sort; the *_first_admission copy below
+        # freezes the verdict at first admission for the eval log.
+        self.in_batch_dedup_pending: bool = False
+        self.in_batch_dedup_follower_first_admission: Optional[bool] = None
+        # Device/host split of matched_prefix_tokens_first_admission: prefix
+        # tokens served from KV pages vs re-loaded from a host/hierarchical tier.
+        self.device_matched_prefix_tokens_first_admission: Optional[int] = None
+        self.host_hit_prefix_tokens_first_admission: Optional[int] = None
+
+        # Boost commit-gate: True while admission is held because the in-flight
+        # chunked prefill (or a waiting request that sorts before this one)
+        # will commit at least one more page of this request's matched prefix
+        # (a later full match instead of an immediate partial re-prefill).
+        # Last-write-wins per sort; the sort position is unchanged, so the hold
+        # is bounded by that one extender, not by later arrivals.
+        self.boost_commit_hold: bool = False
+        # Held sort passes (each pass ~ tens of ms); frozen at admission for
+        # the eval log.
+        self.boost_commit_hold_passes: int = 0
+        # perf_counter stamp of the first hold ever (survives pass toggles and
+        # stash windows); the commit-gate wall cap reads it.
+        self.boost_commit_hold_first_s: Optional[float] = None
+
+        # Decode time-slicing (--boost-preempt-wait-s, decode_preemption.py):
+        # releases mid-decode so far, the output length at the latest
+        # admission (decode progress is measured from it), and the
+        # perf_counter stall spent re-queued after a release.
+        self.num_preemptions: int = 0
+        self.preempt_resume_output_len: int = 0
+        self.preempt_stall_start_s: Optional[float] = None
+        self.preempt_stall_s: float = 0.0
 
     def get_mm_token_counts(self) -> Tuple[int, int, int]:
         """Return per-modality prompt counts, scanning media at most once."""
@@ -2393,6 +2442,21 @@ def release_req(
 
     req.reset_for_retract()
     return backup_saved
+
+
+def preempt_req(
+    *,
+    req: Req,
+    tree_cache: BasePrefixCache,
+    hisparse_coordinator: Optional[HiSparseCoordinator],
+) -> None:
+    """Release a decoding request into the radix tree (the finished-request
+    lifecycle) so it resumes from its own cached KV; release_req instead
+    drops the uncached tail because OOM retraction needs the space now."""
+    if hisparse_coordinator is not None:
+        hisparse_coordinator.retract_req(req)
+    release_kv_cache(req, tree_cache, checkpoint=True)
+    req.reset_for_retract()
 
 
 def retract_all(
@@ -3594,6 +3658,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             hisparse_coordinator=self.hisparse_coordinator,
             offload_kv=offload_kv,
         )
+
+    def preempt_decode(self, indices: Sequence[int]) -> List[Req]:
+        """Release the requests at ``indices`` into the radix tree (see
+        preempt_req) and drop them from the batch; returns them in index order."""
+        drop = set(indices)
+        preempted = [self.reqs[i] for i in sorted(drop)]
+        for req in preempted:
+            preempt_req(
+                req=req,
+                tree_cache=self.tree_cache,
+                hisparse_coordinator=self.hisparse_coordinator,
+            )
+        self.filter_batch(
+            keep_indices=[i for i in range(len(self.reqs)) if i not in drop]
+        )
+        return preempted
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status

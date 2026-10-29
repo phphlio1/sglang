@@ -79,6 +79,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_offload_compatibility, server_args)
     from sglang.srt.arg_groups.validation_hook import (
+        default_unset_boost_gamma,
         default_unset_prefill_decode_interval,
         handle_aux_hidden_state_capture,
         validate_experimental_sgl_marlin,
@@ -87,6 +88,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_sampling_mask_max_tokens,
     )
 
+    run_hook(default_unset_boost_gamma, server_args)
     run_hook(validate_prefill_decode_interval, server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)

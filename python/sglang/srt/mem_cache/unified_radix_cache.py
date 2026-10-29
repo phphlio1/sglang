@@ -3861,6 +3861,17 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         return "\n".join(lines) + "\n"
 
+    def available_and_evictable_size(self) -> int:
+        # Numeric counterpart of available_and_evictable_str's FULL line —
+        # the pool the scheduler's prefill-OOM hold gates on.
+        if self.supports_swa():
+            full_available_size = self.token_to_kv_pool_allocator.full_available_size()
+        else:
+            full_available_size = self.token_to_kv_pool_allocator.available_size()
+        return full_available_size + self.tree_core.component_evictable_size(
+            BASE_COMPONENT_TYPE
+        )
+
     def sanity_check(self):
         """Verify tree invariants.
 

@@ -278,12 +278,49 @@ def check_server_args(server_args: Any):
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
     # Check scheduling policy
+    if cfg.schedule_policy in ("boost", "boost-cache"):
+        assert cfg.boost_gamma > 0, "boost_gamma must be > 0"
+        assert cfg.boost_bin_size >= 1, "boost_bin_size must be >= 1"
+    if cfg.schedule_policy == "boost-cache":
+        assert 0.0 <= cfg.boost_cache_lambda <= 1.0, (
+            "boost_cache_lambda must be within [0, 1]"
+        )
+        assert cfg.boost_cache_cap_tokens >= 1, "boost_cache_cap_tokens must be >= 1"
+    assert cfg.boost_preempt_wait_s >= 0, "boost_preempt_wait_s must be >= 0"
+    if cfg.boost_preempt_wait_s > 0:
+        assert cfg.schedule_policy in ("boost", "boost-cache"), (
+            "--boost-preempt-wait-s requires --schedule-policy boost or boost-cache"
+        )
+        assert cfg.boost_preempt_quantum_tokens >= 1, (
+            "boost_preempt_quantum_tokens must be >= 1"
+        )
+        assert cfg.boost_preempt_max_per_req >= 1, (
+            "boost_preempt_max_per_req must be >= 1"
+        )
+    if cfg.boost_adaptive_gamma:
+        assert cfg.schedule_policy in ("boost", "boost-cache"), (
+            "--boost-adaptive-gamma requires --schedule-policy boost or boost-cache"
+        )
+        assert cfg.boost_clock == "wall", (
+            "--boost-adaptive-gamma requires --boost-clock wall "
+            "(the E2E-latency tail fit is wall seconds)"
+        )
+        assert cfg.boost_adaptive_max_jump_s > 0, (
+            "boost_adaptive_max_jump_s must be > 0"
+        )
+    if cfg.boost_clock == "wall":
+        assert cfg.schedule_policy in ("boost", "boost-cache"), (
+            "--boost-clock wall requires --schedule-policy boost or boost-cache"
+        )
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [
             "fcfs",
+            "fcfs-match",
             "lof",
+            "boost",
+            "boost-cache",
         ], (
-            f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
+            f"To use priority scheduling, schedule_policy must be 'fcfs', 'fcfs-match', 'lof', 'boost', or 'boost-cache'. '{cfg.schedule_policy}' is not supported."
         )
         if cfg.default_priority_value is None:
             logger.warning(
@@ -672,6 +709,21 @@ def default_unset_prefill_decode_interval(server_args: Any):
             server_args,
             "prefill_decode_interval_default",
             prefill_decode_interval=0,
+        )
+
+
+def default_unset_boost_gamma(server_args: Any):
+    """Unset --boost-gamma takes the clock-mode default (see --boost-clock)."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    cfg = resolving_view(server_args)
+    if cfg.boost_gamma is None:
+        # Wall default 0.1 1/s: geometric center of the measured c4-c16
+        # adaptive fixed points (ln5 / wall tail width, in [0.017, 0.62] 1/s).
+        declare_resolution(
+            server_args,
+            "boost_gamma_default",
+            boost_gamma=(0.1 if cfg.boost_clock == "wall" else 1e-4),
         )
 
 

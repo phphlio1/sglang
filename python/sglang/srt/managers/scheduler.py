@@ -117,6 +117,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.decode_preemption import DecodePreemptor
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -311,6 +312,10 @@ from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
     set_schedule_time_batch,
     set_time_batch,
+)
+from sglang.srt.observability.schedule_eval_log import (
+    ScheduleEvalLogger,
+    stamp_admission_prefix_matches,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_GET_NEXT_BATCH,
@@ -669,6 +674,10 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.maybe_init_decode_preemptor()
+
+        # Opt-in per-request schedule eval log (--log-schedule-eval-path)
+        self.maybe_init_schedule_eval_logger()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1441,7 +1450,39 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            boost_gamma=get_schedule().boost_gamma,
+            boost_bin_size=get_schedule().boost_bin_size,
+            boost_adaptive_gamma=get_schedule().boost_adaptive_gamma,
+            boost_adaptive_max_jump_s=get_schedule().boost_adaptive_max_jump_s,
+            boost_clock=get_schedule().boost_clock,
+            boost_cache_lambda=get_schedule().boost_cache_lambda,
+            boost_cache_cap_tokens=get_schedule().boost_cache_cap_tokens,
+            in_batch_prefix_caching_max_pin_s=(
+                get_schedule().in_batch_prefix_caching_max_pin_s
+            ),
         )
+
+    def maybe_init_decode_preemptor(self):
+        """Decode time-slicing for first-token-starved waiters; None when off."""
+        self.decode_preemptor = DecodePreemptor.maybe_create(
+            wait_s=get_schedule().boost_preempt_wait_s,
+            quantum_tokens=get_schedule().boost_preempt_quantum_tokens,
+            max_per_req=get_schedule().boost_preempt_max_per_req,
+            dp_rank=get_parallel().dp_rank or 0,
+            tree_supports_mamba=self.tree_cache.supports_mamba(),
+            tree_supports_swa=self.tree_cache.supports_swa(),
+            disaggregation_mode=get_disagg().disaggregation_mode,
+        )
+
+    def maybe_init_schedule_eval_logger(self):
+        """Opt-in per-request schedule eval log; None (zero cost) when off.
+
+        Everything in here runs unconditionally except the logger itself:
+        prefill_delayer/enable_priority_preemption/new_token_ratio_tracker
+        init used to sit below the eval-log early return, so launching
+        without --log-schedule-eval-path left them unset and the scheduler
+        loop crashed with AttributeError (dynamo smokes 3183/3185).
+        """
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
             window_size=envs.SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE.get()
@@ -1464,6 +1505,23 @@ class Scheduler(
                     token_usage_low_watermark=get_schedule().prefill_delayer_token_usage_low_watermark,
                     debug_log_enabled=get_parallel().attn_tp_rank == 0,
                 )
+
+        # Opt-in per-request eval log; None (zero cost) when off. Everything
+        # below this must run unconditionally — an early return here used to
+        # skip enable_priority_preemption/new_token_ratio_tracker init and
+        # crash the scheduler loop (dynamo smokes 3183/3185).
+        path = get_schedule().log_schedule_eval_path
+        self.schedule_eval_logger: Optional[ScheduleEvalLogger] = None
+        if path is not None:
+            self.schedule_eval_logger = ScheduleEvalLogger(
+                path=path,
+                policy=self.schedule_policy,
+                boost_gamma=get_schedule().boost_gamma,
+                boost_bin_size=get_schedule().boost_bin_size,
+                boost_clock=get_schedule().boost_clock,
+                boost_cache_lambda=get_schedule().boost_cache_lambda,
+                boost_cache_cap_tokens=get_schedule().boost_cache_cap_tokens,
+            )
 
         # NOTE: preemption is enabled by default for priority scheduling.
         self.enable_priority_preemption = (
@@ -3493,6 +3551,12 @@ class Scheduler(
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
+            # Boost seniority stamps once; retract -> requeue keeps the original.
+            if req.boost_arrival_tokens is None:
+                req.boost_arrival_tokens = self.processed_tokens_counter
+            # First queue entry for the schedule-eval log; survives retraction.
+            if req.first_queue_entry_time is None:
+                req.first_queue_entry_time = req.time_stats.wait_queue_entry_time
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
             self._prefetch_kvcache(req)
             self.disagg_prefill_bootstrap_queue.add(
@@ -4130,7 +4194,10 @@ class Scheduler(
             self.waiting_queue,
             running_batch,
             processed_tokens=self.processed_tokens_counter,
+            chunked_req=self.chunked_req,
         )
+        if self.decode_preemptor is not None:
+            self.decode_preemptor.promote_target(self.waiting_queue)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4207,6 +4274,13 @@ class Scheduler(
             if adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                continue
+
+            # Boost commit-gate: skip admission while the in-flight chunked
+            # prefill is still committing this request's matched prefix. The
+            # sort order is untouched, so the hold ends with that one prefill
+            # (it does not stack behind later arrivals).
+            if req.boost_commit_hold:
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4330,6 +4404,7 @@ class Scheduler(
             self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
+        stamp_admission_prefix_matches(can_run_list)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -4355,6 +4430,9 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+
+        if self.decode_preemptor is not None:
+            self.decode_preemptor.on_admitted(can_run_list, time.perf_counter())
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -4456,6 +4534,28 @@ class Scheduler(
             and req.next_output_finishes_by_length()
         ]
 
+    def _preempt_for_starving_waiters(self, batch: ScheduleBatch) -> None:
+        # Runs at the OOM-retraction point: the in-flight step's tokens of a
+        # released request are skipped by the result processor (is_retracted).
+        now_s = time.perf_counter()
+        plan = self.decode_preemptor.maybe_plan(
+            now_s=now_s,
+            waiting_queue=self.waiting_queue,
+            running_reqs=batch.reqs,
+            have_tokens=self.tree_cache.available_and_evictable_size(),
+            new_token_ratio=self.new_token_ratio_tracker.current,
+            page_size=self.page_size,
+        )
+        if plan is None:
+            return
+        if self.decode_offload_manager is not None:
+            # Pending offload copies may still read the device KV being released.
+            self.decode_offload_manager.drain_before_retraction()
+        preempted = batch.preempt_decode(plan.victim_indices)
+        self.decode_preemptor.on_preempted(plan, preempted, now_s)
+        for req in preempted:
+            self._add_request_to_queue(req, is_retracted=True)
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
@@ -4540,6 +4640,9 @@ class Scheduler(
                 self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
+
+        if self.decode_preemptor is not None and not kv_full_retract_flag:
+            self._preempt_for_starving_waiters(batch)
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
@@ -5101,6 +5204,17 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+
+        # Opt-in schedule eval log: one line per req finished in this batch.
+        if self.schedule_eval_logger is not None:
+            self.schedule_eval_logger.log_finished_batch(batch.reqs)
+
+        # gamma-Ada (Eq. 9): the finished reqs' E2E latencies feed the
+        # response-tail fit; a moved gamma rides the eval log's per-record
+        # gamma field from the next finished record on.
+        gamma = self.policy.record_completed_latencies(batch.reqs)
+        if gamma is not None and self.schedule_eval_logger is not None:
+            self.schedule_eval_logger.boost_gamma = gamma
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -6321,6 +6435,18 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # Opt-in ptrace permission for py-spy sampling on restricted-ptrace
+    # nodes (yama ptrace_scope=1: only an ancestor may trace, so a sibling
+    # py-spy attach is denied — this killed every flame capture in profile
+    # cell 3065). PR_SET_PTRACER_ANY lets any same-uid process attach to
+    # THIS process only; enabled per-run via SGLANG_ALLOW_PTRACE=1 in the
+    # profiling cell's env (never in benchmark sweeps — sampling perturbs
+    # the measured process). Validated on hgx-h200-01 (ptrace_scope=1,
+    # py-spy dump on a sibling succeeds after this prctl).
+    if os.environ.get("SGLANG_ALLOW_PTRACE") == "1":
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(0x59616D61, ctypes.c_ulong(-1), 0, 0, 0)  # PR_SET_PTRACER, PR_SET_PTRACER_ANY
     dp_rank = resolve_spawn_dp_rank(dp_rank)
     # Placement is needed before publish(): TP/PP select a WORLD rank;
     # ordinary DP replicas have separate WORLDs and need an explicit DP rank.
@@ -6387,6 +6513,8 @@ def run_scheduler_process(
             if scheduler.async_d2h_worker is not None:
                 scheduler.async_d2h_worker.shutdown()
                 scheduler.async_d2h_worker = None
+            if scheduler.schedule_eval_logger is not None:
+                scheduler.schedule_eval_logger.close()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:

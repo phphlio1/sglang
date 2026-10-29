@@ -739,3 +739,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+    def available_and_evictable_size(self) -> int:
+        """Numeric counterpart of available_and_evictable_str (base pool)."""
+        available_size = self.token_to_kv_pool_allocator.available_size()
+        return available_size + self.evictable_size()
