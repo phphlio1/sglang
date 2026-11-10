@@ -311,7 +311,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertEqual(adder.can_run_list, [continuation])
         self.assertIsNone(adder.new_chunked_req)
-        big.set_extend_range.assert_not_called()
+        self.assertIsNone(big.extend_end)
 
     def test_shortest_prefill_rechecks_chunk_limit_after_host_miss(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)

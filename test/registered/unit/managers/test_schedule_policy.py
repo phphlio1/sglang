@@ -6,6 +6,7 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.managers.schedule_policy import (
     BOOST_COMMIT_GATE_MAX_HOLD_S,
@@ -1139,7 +1140,10 @@ class TestInBatchDedupStamping(CustomTestCase):
         )
         queue = [_make_boost_req(f"r{i}", 256, arrival=0) for i in range(129)]
         queue[0].in_batch_dedup_pending = True  # stale from an earlier sort
-        policy.calc_priority(queue)
+        # The agnostic path's waiting-prefix refresh reads the disagg config,
+        # which this unit test does not publish.
+        with envs.SGLANG_ENABLE_WAITING_PREFIX_REFRESH.override(False):
+            policy.calc_priority(queue)
         self.assertFalse(any(r.in_batch_dedup_pending for r in queue))
 
 

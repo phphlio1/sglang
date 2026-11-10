@@ -7,7 +7,6 @@ import unittest
 from array import array
 from pathlib import Path
 
-import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.observability.schedule_eval_log import (
@@ -59,18 +58,18 @@ class TestStampAdmissionPrefixMatches(CustomTestCase):
     def test_device_host_split_and_dedup_verdict_freeze_at_first_admission(self):
         # The split and the follower verdict share the first-admission
         # stamp-once contract: after a retraction the admission-time re-match
-        # (init_next_round_input) rewrites prefix_indices/host_hit_length and
+        # (init_next_round_input) rewrites prefix_len/host_hit_length and
         # the next sort rewrites in_batch_dedup_pending, but the frozen values
         # must survive so the invariant check can exempt first-attempt dedup
         # followers only.
         req = _make_req("r")
         req.num_matched_prefix_tokens = 64
-        req.prefix_indices = torch.arange(40, dtype=torch.int64)
+        req.prefix_len = 40
         req.host_hit_length = 24
         req.in_batch_dedup_pending = True
         stamp_admission_prefix_matches([req])
         req.num_matched_prefix_tokens = 0
-        req.prefix_indices = torch.empty((0,), dtype=torch.int64)
+        req.prefix_len = 0
         req.host_hit_length = 0
         req.in_batch_dedup_pending = False
         stamp_admission_prefix_matches([req])

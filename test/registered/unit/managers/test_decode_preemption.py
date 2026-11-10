@@ -5,7 +5,6 @@ from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -37,7 +36,7 @@ def _req(rid, *, input_len, output_len=0, device_prefix=0, queued_at=None):
         SamplingParams(max_new_tokens=MAX_NEW),
     )
     req.output_ids = array("q", [2] * output_len)
-    req.prefix_indices = torch.zeros(device_prefix, dtype=torch.int64)
+    req.prefix_len = device_prefix
     req.first_queue_entry_time = queued_at
     return req
 
@@ -203,7 +202,7 @@ class TestDecodePreemptor(CustomTestCase):
 class TestPreemptDecodeRelease(CustomTestCase):
     def test_release_inserts_into_the_tree_and_keeps_the_output(self):
         # The point of preempting instead of retracting: the KV goes into the
-        # radix tree (release_kv_cache is_insert=True), so the request resumes
+        # radix tree (release_kv_cache checkpoint=True), so the request resumes
         # from its own cache; OOM retraction drops the uncached tail.
         keep = _running("keep", input_len=10, output_len=5)
         victim = _running("victim", input_len=10, output_len=7)
@@ -215,8 +214,8 @@ class TestPreemptDecodeRelease(CustomTestCase):
 
         victim.kv.req_pool_idx = 3  # decoding: holds a KV row
 
-        def _release(req, tree_cache, is_insert=True):
-            self.assertTrue(is_insert)
+        def _release(req, tree_cache, *, checkpoint):
+            self.assertTrue(checkpoint)
             # Mirrors req_to_token_pool.free + mark_kv_released.
             req.kv.req_pool_idx = None
             req.kv.mark_kv_released()
