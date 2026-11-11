@@ -18,6 +18,7 @@ import faulthandler
 import logging
 import math
 import os
+import re
 import signal
 import sys
 import time
@@ -296,7 +297,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome, TreeLock
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
@@ -732,6 +733,8 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
+
+        self.init_prefill_oom_recovery()
 
         self.init_load_publisher()
 
@@ -2598,6 +2601,16 @@ class Scheduler(
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
+    def init_prefill_oom_recovery(self) -> None:
+        """Prefill KV-OOM backout state: invariant grace, chunk shrink, sticky hold."""
+        # The failed alloc evicts tree entries as a side effect, a transient
+        # accounting gap that trips the idle leak invariant for a few steps.
+        self._oom_recovery_grace_steps = 0
+        self._consecutive_oom_count = 0
+        # Tokens the pool must fit before prefill admission resumes; None = no hold.
+        self._prefill_oom_hold_tokens: Optional[int] = None
+        self._prefill_oom_hold_passes = 0
+
     def init_rank_consensus_checker(self) -> None:
         groups = []
         if self.attn_cp_group is not None and self.attn_tp_group is not None:
@@ -4190,6 +4203,11 @@ class Scheduler(
             running_batch.batch_is_full = True
             return None, running_batch
 
+        # Sticky OOM backoff: while the hold is armed and the pool still cannot
+        # fit the alloc that OOM'd, run decode only this pass.
+        if self._prefill_oom_hold_blocks():
+            return None, running_batch
+
         # Get priority queue
         self.policy.calc_priority(
             self.waiting_queue,
@@ -4208,6 +4226,11 @@ class Scheduler(
 
         # Determine chunked_prefill_size for this batch
         chunked_prefill_size = self.chunked_prefill_size
+        if self._consecutive_oom_count >= 3:
+            # OOM backoff: cap the chunk to available memory so a giant makes
+            # progress with smaller chunks instead of spinning on one that never fits.
+            avail = self.tree_cache.token_to_kv_pool_allocator.available_size()
+            chunked_prefill_size = min(chunked_prefill_size, max(avail, self.page_size))
         if self.chunked_req is not None and self.dynamic_chunk_sizer is not None:
             history_len = self.chunked_req.prefix_len
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
@@ -4240,6 +4263,11 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
         )
+
+        # OOM-rollback anchor: a lock object replaced during this pass is one the
+        # pass took; an unchanged one (a chunk continuation's) predates it.
+        admission_locks = self._snapshot_admission_locks()
+        admission_extend_ends = self._snapshot_admission_extend_ends()
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
@@ -4430,7 +4458,32 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        # alloc_req_slots inside prepare_for_extend allocates rows only for reqs
+        # that don't already hold KV; reusing reqs keep their row.
+        fresh_row_reqs = [r for r in can_run_list if not r.kv.holds_kv]
+        try:
+            new_batch.prepare_for_extend()
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            # The admission budget said this batch fits but the KV pool disagreed.
+            self._rollback_failed_prefill_admission(
+                adder=adder,
+                can_run_list=can_run_list,
+                fresh_row_reqs=fresh_row_reqs,
+                locks_before=admission_locks,
+                extend_ends_before=admission_extend_ends,
+            )
+            logger.warning(
+                "Prefill OOM under overload: skipped this prefill step "
+                "(%d reqs returned to queue). Decode will free memory.",
+                len(can_run_list),
+            )
+            self._arm_prefill_oom_hold(e)
+            self._oom_recovery_grace_steps = 10
+            self._consecutive_oom_count += 1
+            return None, running_batch
+        self._consecutive_oom_count = 0
 
         if self.decode_preemptor is not None:
             self.decode_preemptor.on_admitted(can_run_list, time.perf_counter())
@@ -4491,6 +4544,76 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch, running_batch
+
+    def _snapshot_admission_locks(self) -> Dict[str, Optional[TreeLock]]:
+        # Every req the admission pass can touch: the waiting queue plus the
+        # tracked chunked req. Compared by identity in the rollback.
+        locks = {req.rid: req.lock for req in self.waiting_queue}
+        if self.chunked_req is not None:
+            locks[self.chunked_req.rid] = self.chunked_req.lock
+        return locks
+
+    def _snapshot_admission_extend_ends(self) -> Dict[str, Optional[int]]:
+        ends = {req.rid: req.extend_end for req in self.waiting_queue}
+        if self.chunked_req is not None:
+            ends[self.chunked_req.rid] = self.chunked_req.extend_end
+        return ends
+
+    def _arm_prefill_oom_hold(self, error: RuntimeError) -> None:
+        # The allocator's OOM message carries the requested token count; hold
+        # that plus one page of rounding. Without it any existing hold stays armed.
+        match = re.search(r"Try to allocate (\d+) tokens", str(error))
+        if match is not None:
+            self._prefill_oom_hold_tokens = int(match.group(1)) + self.page_size
+            # ~200 passes (~2-8 s under overload): a hold the pool can never
+            # satisfy falls back to the _consecutive_oom_count chunk shrink.
+            self._prefill_oom_hold_passes = 200
+
+    def _prefill_oom_hold_blocks(self) -> bool:
+        if self._prefill_oom_hold_tokens is None:
+            return False
+        self._prefill_oom_hold_passes -= 1
+        if self._prefill_oom_hold_passes <= 0:
+            self._prefill_oom_hold_tokens = None
+            return False
+        if (
+            self.tree_cache.available_and_evictable_size()
+            >= self._prefill_oom_hold_tokens
+        ):
+            self._prefill_oom_hold_tokens = None
+            return False
+        return True
+
+    def _rollback_failed_prefill_admission(
+        self,
+        *,
+        adder: PrefillAdder,
+        can_run_list: List[Req],
+        fresh_row_reqs: List[Req],
+        locks_before: Dict[str, Optional[TreeLock]],
+        extend_ends_before: Dict[str, Optional[int]],
+    ) -> None:
+        # Each piece must revert or the retry compounds: a leaked lock pins pages
+        # until evictable reads 0, an inflated inflight_middle_chunks blocks the
+        # req's release, a continuation also requeued is admitted twice in one
+        # batch, and a stale extend_end makes the next pass stash an undispatched chunk.
+        if self.chunked_req is not None:
+            self.chunked_req.inflight_middle_chunks -= 1
+        # A first-chunk admission re-homes to the waiting queue; a continuation
+        # stays tracked by self.chunked_req alone.
+        continuation = self.chunked_req if adder.new_chunked_req is None else None
+        if adder.new_chunked_req is not None:
+            self.chunked_req = None
+        for req in can_run_list:
+            if req.lock is not locks_before[req.rid]:
+                self.tree_cache.unlock(req.lock)
+                req.lock = locks_before[req.rid]
+            req.extend_end = extend_ends_before[req.rid]
+        for req in fresh_row_reqs:
+            if req.kv.holds_kv:
+                self.req_to_token_pool.free(req)
+        requeue = [req for req in can_run_list if req is not continuation]
+        self.waiting_queue = requeue + self.waiting_queue
 
     def can_schedule_lora_req(
         self, req: Req, running_loras: set[Optional[str]]
@@ -5403,7 +5526,13 @@ class Scheduler(
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
-            if not self.enable_hisparse and not deferred_pending:
+            if self._oom_recovery_grace_steps > 0:
+                self._oom_recovery_grace_steps -= 1
+            if (
+                not self.enable_hisparse
+                and not deferred_pending
+                and self._oom_recovery_grace_steps == 0
+            ):
                 has_leak, messages = self.invariant_checker._check_all_pools(
                     self.pool_stats_observer.get_pool_stats(),
                 )
