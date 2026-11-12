@@ -611,6 +611,9 @@ class SchedulePolicy:
         )
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        # Boost chunk reservation: rid of the continuation whose reservation
+        # admitted no waiting request; it runs full chunks until it finishes.
+        self._chunk_reservation_missed_rid: Optional[str] = None
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -1032,9 +1035,16 @@ class SchedulePolicy:
             or budget < 2 * page_size
         ):
             return None
+        is_boost = self.policy in (CacheAwarePolicy.BOOST, CacheAwarePolicy.BOOST_CACHE)
+        if is_boost and chunked_req.rid == self._chunk_reservation_missed_rid:
+            return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
         for req in waiting_queue:
+            # The admission scan skips a commit-held request this pass, so
+            # budget reserved for it would run the capped chunk alone.
+            if is_boost and req.boost_commit_hold:
+                continue
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
             if work >= remaining or reserved + charge > budget - page_size:
@@ -1044,6 +1054,20 @@ class SchedulePolicy:
             return None
         # Page alignment keeps continuation boundaries allocator-compatible.
         return (budget - reserved) // page_size * page_size
+
+    def record_chunk_reservation(
+        self, *, continuation_rid: str, admitted_waiting: bool
+    ) -> None:
+        """Called after an admission pass that capped the continuation's chunk.
+
+        A reservation that admitted no waiting request only shrank the chunk:
+        under DP attention every rank pays for that partial prefill step. Boost
+        stops reserving for this continuation until it finishes.
+        """
+        if self.policy not in (CacheAwarePolicy.BOOST, CacheAwarePolicy.BOOST_CACHE):
+            return
+        if not admitted_waiting:
+            self._chunk_reservation_missed_rid = continuation_rid
 
     @staticmethod
     def _sort_by_longest_prefix(

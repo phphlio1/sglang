@@ -21,8 +21,12 @@ NUM_ROWS = 4
 
 
 class _Req:
-    def __init__(self, holds_row):
+    def __init__(self, holds_row, rid):
+        self.rid = rid
         self.kv = SimpleNamespace(holds_kv=holds_row)
+        self.lock = None
+        self.extend_end = None
+        self.boost_commit_hold = False
         self.beam_group = None
         self.token_indices_to_pool = None
         self.inflight_middle_chunks = 0
@@ -67,6 +71,8 @@ class TestHeldRowAdmission(CustomTestCase):
         s.min_free_slots_delayer = None
         s.policy = Mock()
         s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.decode_preemptor = None
+        s.init_prefill_oom_recovery()
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
@@ -102,9 +108,9 @@ class TestHeldRowAdmission(CustomTestCase):
         return s
 
     def _admitted(self, disaggregation_mode):
-        running = [_Req(holds_row=True), _Req(holds_row=True)]
-        final_chunk = _Req(holds_row=True)
-        waiting = _Req(holds_row=False)
+        running = [_Req(holds_row=True, rid="r0"), _Req(holds_row=True, rid="r1")]
+        final_chunk = _Req(holds_row=True, rid="final")
+        waiting = _Req(holds_row=False, rid="waiting")
         running_batch = ScheduleBatch(reqs=running)
         s = self._scheduler(disaggregation_mode, running, final_chunk, [waiting])
 
@@ -115,6 +121,7 @@ class TestHeldRowAdmission(CustomTestCase):
             get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
             patch.object(ScheduleBatch, "init_new", side_effect=capture),
             patch("sglang.srt.managers.scheduler.set_time_batch"),
+            patch("sglang.srt.managers.scheduler.stamp_admission_prefix_matches"),
         ):
             with self.assertRaises(_BatchBuilt) as built:
                 s._get_new_batch_prefill_raw(

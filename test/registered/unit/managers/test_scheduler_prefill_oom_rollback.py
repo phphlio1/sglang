@@ -60,10 +60,10 @@ def _admit_fresh(sched: Scheduler, req: Req) -> TreeLock:
 
 
 def _rollback(
-    sched: Scheduler, *, new_chunked_req, can_run_list, receipts, ranges, fresh_rows
+    sched: Scheduler, *, prev_chunked_req, can_run_list, receipts, ranges, fresh_rows
 ):
     sched._rollback_failed_prefill_admission(
-        adder=SimpleNamespace(new_chunked_req=new_chunked_req),
+        prev_chunked_req=prev_chunked_req,
         can_run_list=can_run_list,
         # The scheduler captures this list before prepare_for_extend, i.e.
         # before alloc_req_slots registers the reqs' rows.
@@ -86,7 +86,7 @@ class TestPrefillOomRollback(CustomTestCase):
 
         _rollback(
             sched,
-            new_chunked_req=None,
+            prev_chunked_req=None,
             can_run_list=[req],
             receipts=receipts,
             ranges=ranges,
@@ -115,7 +115,7 @@ class TestPrefillOomRollback(CustomTestCase):
 
         _rollback(
             sched,
-            new_chunked_req=None,
+            prev_chunked_req=cont,
             can_run_list=[cont],
             receipts=receipts,
             ranges=ranges,
@@ -146,7 +146,7 @@ class TestPrefillOomRollback(CustomTestCase):
 
         _rollback(
             sched,
-            new_chunked_req=req,
+            prev_chunked_req=None,
             can_run_list=[req],
             receipts=receipts,
             ranges=ranges,
@@ -180,7 +180,7 @@ class TestPrefillOomRollback(CustomTestCase):
 
         _rollback(
             sched,
-            new_chunked_req=None,
+            prev_chunked_req=cont,
             can_run_list=[cont],
             receipts=receipts,
             ranges=ranges,
@@ -210,7 +210,7 @@ class TestPrefillOomRollback(CustomTestCase):
 
         _rollback(
             sched,
-            new_chunked_req=None,
+            prev_chunked_req=cont,
             can_run_list=[cont, fresh_a, fresh_b],
             receipts=receipts,
             ranges=ranges,
@@ -232,6 +232,65 @@ class TestPrefillOomRollback(CustomTestCase):
         self.assertEqual(cont.inflight_middle_chunks, 0)
         self.assertIs(fresh_a.lock, receipts["a"])
         self.assertIs(fresh_b.lock, receipts["b"])
+
+    def test_final_chunk_continuation_stays_tracked_not_requeued(self):
+        # add_chunked_req returns None for a final chunk, so the pass clears
+        # self.chunked_req before prepare. Requeued, the continuation kept its row
+        # and lock; its next admission overwrote req.lock and the old lock pinned
+        # its prefix forever (protected KV left at idle on the H200 replay).
+        cont = _make_req("cont")
+        cont.kv.req_pool_idx = 5
+        sched = _make_scheduler(waiting_queue=[], chunked_req=cont)
+        receipts = sched._snapshot_admission_locks()
+        ranges = sched._snapshot_admission_extend_ends()
+        receipt_before = cont.lock
+        cont.extend_end = 4096
+        sched.chunked_req = None  # final chunk: add_chunked_req returned None
+
+        _rollback(
+            sched,
+            prev_chunked_req=cont,
+            can_run_list=[cont],
+            receipts=receipts,
+            ranges=ranges,
+            fresh_rows=[],
+        )
+
+        self.assertIs(sched.chunked_req, cont)
+        self.assertNotIn(cont, sched.waiting_queue)
+        self.assertIs(cont.lock, receipt_before)
+        self.assertEqual(cont.inflight_middle_chunks, 0)
+        sched.tree_cache.unlock.assert_not_called()
+        sched.req_to_token_pool.free.assert_not_called()
+
+    def test_final_chunk_with_new_chunked_req_restores_the_continuation(self):
+        cont = _make_req("cont")
+        cont.kv.req_pool_idx = 5
+        giant = _make_req("giant")
+        sched = _make_scheduler(waiting_queue=[giant], chunked_req=cont)
+        receipts = sched._snapshot_admission_locks()
+        ranges = sched._snapshot_admission_extend_ends()
+        # The final chunk cleared self.chunked_req, so a waiting giant became
+        # the new chunked req in the same pass.
+        sched.chunked_req = None
+        admission_receipt = _admit_fresh(sched, giant)
+        sched.chunked_req = giant
+        giant.inflight_middle_chunks += 1
+
+        _rollback(
+            sched,
+            prev_chunked_req=cont,
+            can_run_list=[cont, giant],
+            receipts=receipts,
+            ranges=ranges,
+            fresh_rows=[giant],
+        )
+
+        self.assertIs(sched.chunked_req, cont)
+        self.assertEqual([r.rid for r in sched.waiting_queue], ["giant"])
+        self.assertEqual(giant.inflight_middle_chunks, 0)
+        sched.tree_cache.unlock.assert_called_once_with(admission_receipt)
+        sched.req_to_token_pool.free.assert_called_once_with(giant)
 
 
 class TestPrefillOomHold(CustomTestCase):

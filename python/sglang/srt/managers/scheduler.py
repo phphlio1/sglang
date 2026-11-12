@@ -4269,6 +4269,7 @@ class Scheduler(
         admission_locks = self._snapshot_admission_locks()
         admission_extend_ends = self._snapshot_admission_extend_ends()
 
+        prev_chunked_req = self.chunked_req
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
@@ -4405,6 +4406,14 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
 
+        if adder.chunked_req_limit is not None:
+            self.policy.record_chunk_reservation(
+                continuation_rid=prev_chunked_req.rid,
+                admitted_waiting=any(
+                    r is not prev_chunked_req for r in adder.can_run_list
+                ),
+            )
+
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
@@ -4468,7 +4477,7 @@ class Scheduler(
                 raise
             # The admission budget said this batch fits but the KV pool disagreed.
             self._rollback_failed_prefill_admission(
-                adder=adder,
+                prev_chunked_req=prev_chunked_req,
                 can_run_list=can_run_list,
                 fresh_row_reqs=fresh_row_reqs,
                 locks_before=admission_locks,
@@ -4587,7 +4596,7 @@ class Scheduler(
     def _rollback_failed_prefill_admission(
         self,
         *,
-        adder: PrefillAdder,
+        prev_chunked_req: Optional[Req],
         can_run_list: List[Req],
         fresh_row_reqs: List[Req],
         locks_before: Dict[str, Optional[TreeLock]],
@@ -4599,11 +4608,11 @@ class Scheduler(
         # batch, and a stale extend_end makes the next pass stash an undispatched chunk.
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks -= 1
-        # A first-chunk admission re-homes to the waiting queue; a continuation
-        # stays tracked by self.chunked_req alone.
-        continuation = self.chunked_req if adder.new_chunked_req is None else None
-        if adder.new_chunked_req is not None:
-            self.chunked_req = None
+        # The pass cleared self.chunked_req for a final chunk, or replaced it with a
+        # first-chunk admission. The continuation the pass started with keeps its
+        # row and lock, so it stays tracked here; requeued, its next admission would
+        # overwrite that lock (a pinned prefix the tree can never evict).
+        self.chunked_req = prev_chunked_req
         for req in can_run_list:
             if req.lock is not locks_before[req.rid]:
                 self.tree_cache.unlock(req.lock)
@@ -4612,7 +4621,7 @@ class Scheduler(
         for req in fresh_row_reqs:
             if req.kv.holds_kv:
                 self.req_to_token_pool.free(req)
-        requeue = [req for req in can_run_list if req is not continuation]
+        requeue = [req for req in can_run_list if req is not prev_chunked_req]
         self.waiting_queue = requeue + self.waiting_queue
 
     def can_schedule_lora_req(

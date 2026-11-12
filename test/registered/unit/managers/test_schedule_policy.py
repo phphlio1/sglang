@@ -280,6 +280,54 @@ class TestShortestPrefillFirst(CustomTestCase):
             2560,
         )
 
+    def test_boost_reservation_skips_commit_held_waiters(self):
+        # The admission scan skips a commit-held request, so tokens reserved for
+        # it ran the capped chunk alone (65% of prefill steps on a DPA8 replay).
+        self.policy.policy = CacheAwarePolicy.BOOST
+        continuation = self.make_req("continuation", 16384)
+        held = self.make_req("held", 512)
+        held.boost_commit_hold = True
+        waiting = [held, self.make_req("b", 1024)]
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            3072,
+        )
+
+    def test_boost_stops_reserving_after_a_reservation_admits_nobody(self):
+        self.policy.policy = CacheAwarePolicy.BOOST
+        continuation = self.make_req("continuation", 16384)
+        other = self.make_req("other-continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.policy.record_chunk_reservation(
+            continuation_rid=continuation.rid, admitted_waiting=True
+        )
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            2560,
+        )
+        self.policy.record_chunk_reservation(
+            continuation_rid=continuation.rid, admitted_waiting=False
+        )
+        self.assertIsNone(
+            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256)
+        )
+        # The miss is per continuation: the next giant reserves again.
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(other, waiting, 4096, 256), 2560
+        )
+
+    def test_shortest_prefill_reservation_ignores_missed_reservations(self):
+        # Upstream shortest-prefill-first keeps its reservation unchanged.
+        continuation = self.make_req("continuation", 16384)
+        waiting = [self.make_req("a", 512), self.make_req("b", 1024)]
+        self.policy.record_chunk_reservation(
+            continuation_rid=continuation.rid, admitted_waiting=False
+        )
+        self.assertEqual(
+            self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
+            2560,
+        )
+
 
 class TestGammaBoostMath(CustomTestCase):
     """gamma_boost numerics (UniBoost Eq. 2): the expm1-stable form must stay

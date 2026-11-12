@@ -266,8 +266,8 @@ class TestPrefillAdder(CustomTestCase):
     def test_boost_reservation_leftover_rejects_second_unfinished_chunk(self):
         # Crash regression (sweep cell 20261021_204403, boost policy): the
         # chunk reservation caps the in-flight chunk, and whatever keeps the
-        # reserved budget unspent (e.g. a commit-gate-held request skipped by
-        # the admission scan) leaves room for a waiting request that does
+        # reserved budget unspent (e.g. a memory-gated request the admission
+        # scan never reaches) leaves room for a waiting request that does
         # not fit whole. Starting it as a second tracked chunked prefill
         # kills the scheduler on `assert self.chunked_req is None`.
         override = get_context().override_server_args(schedule_policy="boost")
@@ -294,10 +294,12 @@ class TestPrefillAdder(CustomTestCase):
         held = self.create_shared_req("held")
         held.origin_input_ids = list(range(512))
         held.num_matched_prefix_tokens = 0
+        held.boost_commit_hold = False
         big = self.create_shared_req("big")
         big.origin_input_ids = list(range(16385))
         big.full_untruncated_fill_ids = list(range(16385))
         big.num_matched_prefix_tokens = 0
+        big.boost_commit_hold = False
         adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
             continuation, [held, big], adder.rem_chunk_tokens, adder.page_size
         )
