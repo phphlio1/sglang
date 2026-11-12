@@ -49,6 +49,14 @@ def stamp_admission_prefix_matches(reqs: Iterable[Req]) -> None:
             req.host_hit_prefix_tokens_first_admission = req.host_hit_length
             req.in_batch_dedup_follower_first_admission = req.in_batch_dedup_pending
         req.matched_prefix_tokens_last_admission = req.num_matched_prefix_tokens
+        if req.preempt_stall_start_s is not None:
+            # Resume of a time-sliced decode: device hit, host load-back, the rest
+            # is recomputed (before prepare_for_extend folds host into the prefix).
+            req.preempt_resume_seq_tokens += len(req.origin_input_ids) + len(
+                req.output_ids
+            )
+            req.preempt_resume_device_tokens += len(req.prefix_indices)
+            req.preempt_resume_host_tokens += req.host_hit_length
 
 
 class ScheduleEvalLogger:
@@ -179,4 +187,7 @@ class ScheduleEvalLogger:
             # admission, so the re-queued stall after a release lives here.
             "num_preemptions": req.num_preemptions,
             "preempt_stall_s": req.preempt_stall_s,
+            "preempt_resume_seq_tokens": req.preempt_resume_seq_tokens,
+            "preempt_resume_device_tokens": req.preempt_resume_device_tokens,
+            "preempt_resume_host_tokens": req.preempt_resume_host_tokens,
         }

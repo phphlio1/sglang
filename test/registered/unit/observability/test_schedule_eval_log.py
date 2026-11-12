@@ -153,6 +153,9 @@ class TestScheduleEvalLogger(CustomTestCase):
                 "boost_commit_hold_passes",
                 "num_preemptions",
                 "preempt_stall_s",
+                "preempt_resume_seq_tokens",
+                "preempt_resume_device_tokens",
+                "preempt_resume_host_tokens",
             },
             set(rec.keys()),
         )

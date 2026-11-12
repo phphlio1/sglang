@@ -41,8 +41,13 @@ def _req(rid, *, input_len, output_len=0, device_prefix=0, queued_at=None):
     return req
 
 
-def _running(rid, *, input_len, output_len):
-    return _req(rid, input_len=input_len, output_len=output_len)
+def _running(rid, *, input_len, output_len, protected=0):
+    # A decoding request owns KV for its whole sequence; the tree owns
+    # [0, protected) of it (matched or inserted prefix).
+    req = _req(rid, input_len=input_len, output_len=output_len)
+    req.kv.kv_allocated_len = input_len + output_len
+    req.kv.cache_protected_len = protected
+    return req
 
 
 def _plan(waiting, running, have, **kw):
@@ -95,6 +100,34 @@ class TestPlanDecodePreemption(CustomTestCase):
         # Room for most of the need already: one release suffices.
         plan = _plan([waiter], running, have=120_000)
         self.assertEqual([running[i].rid for i in plan.victim_indices], ["long"])
+
+    def test_a_prefix_another_locker_still_holds_is_not_counted_as_freed(self):
+        # Prod agent sessions share long prefixes across running decodes.
+        # Releasing one of them frees only its unshared tail: the shared
+        # prefix stays locked by the decode that keeps running (or by the
+        # in-flight chunked prefill). The r1 planner counted the victim's
+        # whole sequence, preempted it, and the waiter still did not fit.
+        waiter = _req("w", input_len=80_000, queued_at=0.0)
+
+        def running(stay_protected):
+            victim = _running(
+                "long", input_len=100_000, output_len=5_000, protected=64_000
+            )
+            # Below the quantum, so never a victim itself.
+            stay = _running(
+                "stay", input_len=100_000, output_len=100, protected=stay_protected
+            )
+            return victim, stay
+
+        victim, stay = running(stay_protected=64_000)
+        self.assertIsNone(_plan([waiter], [victim, stay], have=0))
+
+        victim, stay = running(stay_protected=0)
+        plan = _plan([waiter], [victim, stay], have=0)
+        self.assertEqual([("long", "stay")[i] for i in plan.victim_indices], ["long"])
+
+        victim, stay = running(stay_protected=64_000)
+        self.assertIsNone(_plan([waiter], [victim], have=0, chunked_req=stay))
 
     def test_no_plan_when_eligible_releases_cannot_cover_the_deficit(self):
         waiter = _req("w", input_len=250_000, queued_at=0.0)
@@ -247,6 +280,7 @@ class TestSchedulerPreemptGlue(CustomTestCase):
         sched.new_token_ratio_tracker = SimpleNamespace(current=0.5)
         sched.page_size = PAGE
         sched.decode_offload_manager = None
+        sched.chunked_req = None
         requeued = []
         sched._add_request_to_queue = lambda req, is_retracted=False: requeued.append(
             (req, is_retracted)

@@ -1486,15 +1486,10 @@ class Req(ReqDllmMixin):
         self.device_matched_prefix_tokens_first_admission: Optional[int] = None
         self.host_hit_prefix_tokens_first_admission: Optional[int] = None
 
-        # Boost commit-gate: True while admission is held because the in-flight
-        # chunked prefill (or a waiting request that sorts before this one)
-        # will commit at least one more page of this request's matched prefix
-        # (a later full match instead of an immediate partial re-prefill).
-        # Last-write-wins per sort; the sort position is unchanged, so the hold
-        # is bounded by that one extender, not by later arrivals.
-        self.boost_commit_hold: bool = False
-        # Held sort passes (each pass ~ tens of ms); frozen at admission for
-        # the eval log.
+        # Boost commit-gate (SchedulePolicy.commit_held): admission passes this
+        # request sat out because the in-flight chunked prefill or a request
+        # admitted before it will commit more of its matched prefix; frozen at
+        # admission for the eval log.
         self.boost_commit_hold_passes: int = 0
         # perf_counter stamp of the first hold ever (survives pass toggles and
         # stash windows); the commit-gate wall cap reads it.
@@ -1508,6 +1503,9 @@ class Req(ReqDllmMixin):
         self.preempt_resume_output_len: int = 0
         self.preempt_stall_start_s: Optional[float] = None
         self.preempt_stall_s: float = 0.0
+        self.preempt_resume_seq_tokens = 0
+        self.preempt_resume_device_tokens = 0
+        self.preempt_resume_host_tokens = 0
 
     def get_mm_token_counts(self) -> Tuple[int, int, int]:
         """Return per-modality prompt counts, scanning media at most once."""

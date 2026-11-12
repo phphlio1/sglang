@@ -4310,7 +4310,7 @@ class Scheduler(
             # prefill is still committing this request's matched prefix. The
             # sort order is untouched, so the hold ends with that one prefill
             # (it does not stack behind later arrivals).
-            if req.boost_commit_hold:
+            if self.policy.commit_held(req, [self.chunked_req, *adder.can_run_list]):
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4678,6 +4678,7 @@ class Scheduler(
             have_tokens=self.tree_cache.available_and_evictable_size(),
             new_token_ratio=self.new_token_ratio_tracker.current,
             page_size=self.page_size,
+            chunked_req=self.chunked_req,
         )
         if plan is None:
             return

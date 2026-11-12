@@ -26,7 +26,6 @@ class _Req:
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.lock = None
         self.extend_end = None
-        self.boost_commit_hold = False
         self.beam_group = None
         self.token_indices_to_pool = None
         self.inflight_middle_chunks = 0
@@ -71,6 +70,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.min_free_slots_delayer = None
         s.policy = Mock()
         s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.policy.commit_held.return_value = False
         s.decode_preemptor = None
         s.init_prefill_oom_recovery()
         s.processed_tokens_counter = 0

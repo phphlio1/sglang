@@ -294,18 +294,16 @@ class TestPrefillAdder(CustomTestCase):
         held = self.create_shared_req("held")
         held.origin_input_ids = list(range(512))
         held.num_matched_prefix_tokens = 0
-        held.boost_commit_hold = False
         big = self.create_shared_req("big")
         big.origin_input_ids = list(range(16385))
         big.full_untruncated_fill_ids = list(range(16385))
         big.num_matched_prefix_tokens = 0
-        big.boost_commit_hold = False
         adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
             continuation, [held, big], adder.rem_chunk_tokens, adder.page_size
         )
         self.assertIs(adder.add_chunked_req(continuation), continuation)
-        # The held request never reaches the adder, so its reserved tokens
-        # stay unspent when the oversized request is scanned.
+        # The memory-gated request never reaches the adder, so its reserved
+        # tokens stay unspent when the oversized request is scanned.
         self.assertEqual(adder.rem_chunk_tokens, 512)
         self.assertEqual(
             adder.add_one_req(big, has_chunked_req=True, truncation_align_size=None),

@@ -628,12 +628,6 @@ class SchedulePolicy:
         processed_tokens: int = 0,
         chunked_req: Optional[Req] = None,
     ) -> None:
-        # Boost commit-gate flag is last-write-wins per pass; clear before any
-        # branch (early returns and policy fallbacks included) so no stale hold
-        # survives a policy switch or a chunked_req completion.
-        for r in waiting_queue:
-            r.boost_commit_hold = False
-
         # Before _determine_active_policy so the >128-queue FCFS fallback
         # still refreshes the rate between wall-mode sorts.
         if self.prefill_token_rate is not None:
@@ -711,8 +705,6 @@ class SchedulePolicy:
                         else 0
                     ),
                 )
-                # After the sort: _mark_commit_holds reads the admission order.
-                self._mark_commit_holds(waiting_queue, chunked_req)
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                 SchedulePolicy._sort_by_shortest_prefill(
                     waiting_queue, temporary_deprioritized
@@ -955,51 +947,35 @@ class SchedulePolicy:
             return False
         return now_s - r.first_queue_entry_time > self.in_batch_prefix_caching_max_pin_s
 
-    def _mark_commit_holds(
-        self, waiting_queue: List[Req], chunked_req: Optional[Req]
-    ) -> None:
-        # waiting_queue is in admission order (the boost sort already ran).
-        # A request is held while an earlier extender -- the in-flight chunked
-        # prefill or a waiting request that sorts (and admits) before it --
-        # will commit at least one more page of its matched prefix. Holds end
-        # with that one extender; the wall cap below bounds a pathological
-        # extender (retraction churn) that never commits.
+    @staticmethod
+    def _extended_past_match(req: Req, extenders) -> bool:
+        k = req.num_matched_prefix_tokens
+        if k <= 0:
+            return False
         frontier = BOOST_COMMIT_GATE_FRONTIER_TOKENS
-        now_s: Optional[float] = None
+        ids = req.origin_input_ids[k : k + frontier]
+        return any(
+            e is not None
+            and len(e.origin_input_ids) >= k + frontier
+            and e.origin_input_ids[k : k + frontier] == ids
+            for e in extenders
+        )
 
-        def extends_match(extender: Optional[Req], k: int, r_ids) -> bool:
-            if extender is None:
-                return False
-            e_ids = extender.origin_input_ids
-            return (
-                len(e_ids) >= k + frontier
-                and e_ids[k : k + frontier] == r_ids[k : k + frontier]
-            )
-
-        for i, r in enumerate(waiting_queue):
-            k = r.num_matched_prefix_tokens
-            if k <= 0:
-                continue
-            r_ids = r.origin_input_ids
-            held = extends_match(chunked_req, k, r_ids) or any(
-                extends_match(w, k, r_ids) for w in waiting_queue[:i]
-            )
-            if not held:
-                continue
-            if now_s is None:
-                now_s = time.perf_counter()
-            if r.boost_commit_hold_first_s is None:
-                r.boost_commit_hold_first_s = now_s
-            # The pin valve stays authoritative for its own contract (a pinned
-            # follower must not wait past pin); the commit-gate cap covers the
-            # pin=0 case and any non-follower hold.
-            if now_s - r.boost_commit_hold_first_s > BOOST_COMMIT_GATE_MAX_HOLD_S or (
-                self.in_batch_prefix_caching_max_pin_s > 0
-                and self._pin_hold_expired(r, now_s)
-            ):
-                continue
-            r.boost_commit_hold = True
-            r.boost_commit_hold_passes += 1
+    def commit_held(self, req: Req, extenders) -> bool:
+        """Upstream #48078 r2: hold req this pass only while an extender (the
+        in-flight chunked prefill or a request admitted before it this pass)
+        will commit at least one frontier page past its matched prefix."""
+        if self.policy not in (CacheAwarePolicy.BOOST, CacheAwarePolicy.BOOST_CACHE):
+            return False
+        if not self._extended_past_match(req, extenders):
+            return False
+        now_s = time.perf_counter()
+        if req.boost_commit_hold_first_s is None:
+            req.boost_commit_hold_first_s = now_s
+        if now_s - req.boost_commit_hold_first_s > BOOST_COMMIT_GATE_MAX_HOLD_S:
+            return False
+        req.boost_commit_hold_passes += 1
+        return True
 
     @staticmethod
     def _shortest_prefill_work(r: Req) -> int:
@@ -1041,9 +1017,9 @@ class SchedulePolicy:
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
         reserved = 0
         for req in waiting_queue:
-            # The admission scan skips a commit-held request this pass, so
+            # The admission scan holds a waiter the continuation extends, so
             # budget reserved for it would run the capped chunk alone.
-            if is_boost and req.boost_commit_hold:
+            if is_boost and self._extended_past_match(req, [chunked_req]):
                 continue
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size

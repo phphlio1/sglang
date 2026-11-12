@@ -280,13 +280,16 @@ class TestShortestPrefillFirst(CustomTestCase):
             2560,
         )
 
-    def test_boost_reservation_skips_commit_held_waiters(self):
-        # The admission scan skips a commit-held request, so tokens reserved for
-        # it ran the capped chunk alone (65% of prefill steps on a DPA8 replay).
+    def test_boost_reservation_skips_waiters_the_continuation_extends(self):
+        # Admission holds a waiter whose matched prefix the continuation is
+        # still committing, so tokens reserved for it ran the capped chunk
+        # alone (65% of prefill steps on a DPA8 replay).
         self.policy.policy = CacheAwarePolicy.BOOST
         continuation = self.make_req("continuation", 16384)
+        continuation.origin_input_ids = list(range(16384))
         held = self.make_req("held", 512)
-        held.boost_commit_hold = True
+        held.origin_input_ids = list(range(1_512))
+        held.num_matched_prefix_tokens = 1_000
         waiting = [held, self.make_req("b", 1024)]
         self.assertEqual(
             self.policy.shortest_prefill_chunk_limit(continuation, waiting, 4096, 256),
@@ -1196,15 +1199,14 @@ class TestInBatchDedupStamping(CustomTestCase):
 
 
 class TestBoostCommitGate(CustomTestCase):
-    """The boost commit-gate holds a waiting request's admission while an
-    earlier extender -- the in-flight chunked prefill or a waiting request
-    that sorts before it -- is still committing its matched prefix. The
+    """The boost commit-gate holds a waiting request's admission for one pass
+    while an extender -- the in-flight chunked prefill or a request admitted
+    earlier in the same pass -- will commit its matched prefix further. The
     fan-out trace it guards (e2 c16 seed 77188) measured siblings admitted
     during the trunk's chunked prefill re-prefilling the uncommitted tail
-    (+0.4M uncached tokens, -6% throughput at the saturation knee); a later
-    full match is worth one extender's wait. The frontier fingerprint must
-    hold exactly the requests whose match an extender will grow, and the
-    hold must stay bounded (pin valve, wall cap).
+    (+0.4M uncached tokens, -6% throughput at the saturation knee). The
+    frontier fingerprint must hold exactly the requests whose match an
+    extender will grow, and the hold must stay bounded (wall cap).
     """
 
     @staticmethod
@@ -1214,55 +1216,44 @@ class TestBoostCommitGate(CustomTestCase):
         return req
 
     @staticmethod
-    def _boost_policy():
+    def _policy(name="boost"):
         return SchedulePolicy(
-            policy="boost",
+            policy=name,
             tree_cache=RadixCache.create_simulated(),
             enable_hierarchical_cache=True,
             enable_priority_scheduling=False,
             schedule_low_priority_values_first=False,
         )
 
-    def test_holds_sibling_whose_match_the_chunked_prefill_extends(self):
-        # Sibling matched 1000 of a 3000-token shared prefix; the chunked
-        # trunk still has 2000 tokens to commit past that point.
+    def _trunk_and_sibling(self):
+        # Sibling matched 1000 of a 3000-token shared prefix; the trunk still
+        # has 2000 tokens to commit past that point.
         trunk = _make_req("trunk", "", list(range(3_000)))
         sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
-        self._boost_policy()._mark_commit_holds([sibling], trunk)
-        self.assertIs(sibling.boost_commit_hold, True)
+        return trunk, sibling
+
+    def test_holds_sibling_whose_match_an_extender_grows(self):
+        trunk, sibling = self._trunk_and_sibling()
+        self.assertIs(self._policy().commit_held(sibling, [None, trunk]), True)
         self.assertEqual(sibling.boost_commit_hold_passes, 1)
 
-    def test_holds_sibling_behind_a_waiting_extender_that_sorts_first(self):
-        # No chunked req (the trunk was stashed back to the waiting queue
-        # mid-chunk, the smoke-test release hole): the trunk sorts before the
-        # sibling, so the sibling still waits for its commit.
-        trunk = _make_req("trunk", "", list(range(3_000)))
-        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
-        self._boost_policy()._mark_commit_holds([trunk, sibling], None)
-        self.assertIs(trunk.boost_commit_hold, False)
-        self.assertIs(sibling.boost_commit_hold, True)
-
-    def test_no_hold_behind_a_waiting_extender_that_sorts_after(self):
-        # The sibling sorts first; holding it behind a later extender would
-        # invert the admission order the sort just established.
-        trunk = _make_req("trunk", "", list(range(3_000)))
-        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
-        self._boost_policy()._mark_commit_holds([sibling, trunk], None)
-        self.assertIs(sibling.boost_commit_hold, False)
-        self.assertIs(trunk.boost_commit_hold, False)
+    def test_no_hold_behind_a_waiting_extender_that_was_not_admitted(self):
+        # The r1 gate held a sibling behind any trunk that sorted before it,
+        # admitted or not. When the budget refused the trunk, both sat out the
+        # pass and the sibling's cheap prefill was lost. The gate only sees
+        # extenders that will actually run this pass.
+        _, sibling = self._trunk_and_sibling()
+        self.assertIs(self._policy().commit_held(sibling, [None]), False)
+        self.assertEqual(sibling.boost_commit_hold_passes, 0)
 
     def test_wall_cap_releases_a_never_committing_extender(self):
         # An extender stuck in retraction churn never commits; past the wall
         # cap the sibling must admit on its partial match instead of starving.
-        policy = self._boost_policy()
-        trunk = _make_req("trunk", "", list(range(3_000)))
-        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
-        policy._mark_commit_holds([sibling], trunk)
-        self.assertIs(sibling.boost_commit_hold, True)
-        sibling.boost_commit_hold = False  # calc_priority's per-pass clear
+        policy = self._policy()
+        trunk, sibling = self._trunk_and_sibling()
+        self.assertIs(policy.commit_held(sibling, [trunk]), True)
         sibling.boost_commit_hold_first_s -= BOOST_COMMIT_GATE_MAX_HOLD_S + 1.0
-        policy._mark_commit_holds([sibling], trunk)
-        self.assertIs(sibling.boost_commit_hold, False)
+        self.assertIs(policy.commit_held(sibling, [trunk]), False)
 
     def test_no_hold_when_the_prefixes_diverge_at_the_match_point(self):
         # The trunk shares exactly the matched 1000 tokens then diverges;
@@ -1270,51 +1261,31 @@ class TestBoostCommitGate(CustomTestCase):
         # check (trunk longer than the match point) would hold it.
         trunk = _make_req("trunk", "", list(range(1_000)) + list(range(9_000, 12_000)))
         sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
-        self._boost_policy()._mark_commit_holds([sibling], trunk)
-        self.assertIs(sibling.boost_commit_hold, False)
+        self.assertIs(self._policy().commit_held(sibling, [trunk]), False)
 
-    def test_no_hold_without_a_match_or_a_chunked_req(self):
+    def test_no_hold_without_a_match(self):
         trunk = _make_req("trunk", "", list(range(3_000)))
         fresh = self._req_with_match("fresh", list(range(3_000)), 0)
-        self._boost_policy()._mark_commit_holds([fresh], trunk)
-        self.assertIs(fresh.boost_commit_hold, False)
-
-        matched = self._req_with_match("m", list(range(1_500)), 1_000)
-        self._boost_policy()._mark_commit_holds([matched], None)
-        self.assertIs(matched.boost_commit_hold, False)
+        self.assertIs(self._policy().commit_held(fresh, [trunk]), False)
 
     def test_no_hold_when_less_than_a_frontier_page_remains(self):
         # The trunk ends 255 tokens past the match point: below the
         # 256-token frontier the commit buys too little to be worth a hold.
         trunk = _make_req("trunk", "", list(range(1_255)))
         sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
-        self._boost_policy()._mark_commit_holds([sibling], trunk)
-        self.assertIs(sibling.boost_commit_hold, False)
+        self.assertIs(self._policy().commit_held(sibling, [trunk]), False)
 
-    def test_calc_priority_clears_stale_holds(self):
-        # The flag is last-write-wins per pass; a hold left by an earlier pass
-        # (its chunked req since finished) must not keep skipping admission.
-        policy = SchedulePolicy(
-            policy="lpm",
-            tree_cache=RadixCache.create_simulated(),
-            enable_hierarchical_cache=True,
-            enable_priority_scheduling=False,
-            schedule_low_priority_values_first=False,
-        )
-        req = _make_boost_req("r0", 256, arrival=0)
-        req.boost_commit_hold = True  # stale from an earlier sort
-        policy.calc_priority([req])
-        self.assertIs(req.boost_commit_hold, False)
+    def test_non_boost_policies_never_hold(self):
+        trunk, sibling = self._trunk_and_sibling()
+        self.assertIs(self._policy("lpm").commit_held(sibling, [trunk]), False)
 
-    def test_held_passes_accumulate_across_sorts(self):
+    def test_held_passes_accumulate_across_passes(self):
         # The pass counter is the eval log's hold-duration signal; it must
         # accumulate across passes, not reset per pass.
-        policy = self._boost_policy()
-        trunk = _make_req("trunk", "", list(range(3_000)))
-        sibling = self._req_with_match("sib", list(range(1_500)), 1_000)
+        policy = self._policy()
+        trunk, sibling = self._trunk_and_sibling()
         for _ in range(3):
-            policy._mark_commit_holds([sibling], trunk)
-            sibling.boost_commit_hold = False  # calc_priority's per-pass clear
+            policy.commit_held(sibling, [trunk])
         self.assertEqual(sibling.boost_commit_hold_passes, 3)
 
 
