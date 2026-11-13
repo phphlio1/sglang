@@ -169,6 +169,30 @@ class TestDecodePreemptor(CustomTestCase):
             wait_s=30.0, quantum_tokens=512, max_per_req=2, dp_rank=0
         )
 
+    def test_a_search_that_finds_no_covering_set_waits_out_the_cooldown(self):
+        # The scheduler calls maybe_plan every decode step; the pairwise
+        # token-prefix search ran on each one while no release could fit the
+        # waiter (tens of ms per step under DPA lockstep).
+        pre = self._preemptor()
+        kw = dict(
+            waiting_queue=[_req("w", input_len=10_000_000, queued_at=0.0)],
+            running_reqs=[_running("v", input_len=200_000, output_len=6_000)],
+            have_tokens=0,
+            new_token_ratio=0.5,
+            page_size=PAGE,
+        )
+        with patch(
+            "sglang.srt.managers.decode_preemption.plan_decode_preemption",
+            wraps=plan_decode_preemption,
+        ) as planner:
+            self.assertIsNone(pre.maybe_plan(now_s=100.0, **kw))
+            self.assertIsNone(
+                pre.maybe_plan(now_s=100.0 + PREEMPT_COOLDOWN_S / 2, **kw)
+            )
+            self.assertEqual(planner.call_count, 1)
+            self.assertIsNone(pre.maybe_plan(now_s=100.0 + PREEMPT_COOLDOWN_S, **kw))
+            self.assertEqual(planner.call_count, 2)
+
     def test_reserved_waiter_heads_the_queue_until_admitted(self):
         # The released memory must reach the waiter: it heads the sorted queue
         # (the misfit break then stops later arrivals from taking the memory)

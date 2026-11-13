@@ -55,7 +55,7 @@ def stamp_admission_prefix_matches(reqs: Iterable[Req]) -> None:
             req.preempt_resume_seq_tokens += len(req.origin_input_ids) + len(
                 req.output_ids
             )
-            req.preempt_resume_device_tokens += len(req.prefix_indices)
+            req.preempt_resume_device_tokens += req.prefix_len
             req.preempt_resume_host_tokens += req.host_hit_length
 
 

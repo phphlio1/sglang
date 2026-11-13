@@ -26,8 +26,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Arbitrary: one plan per second keeps a released decode's KV from being
-# counted twice before the next admission pass has consumed it.
+# Arbitrary: one planning attempt per second. It keeps a released decode's KV
+# from being counted twice before the next admission pass has consumed it, and
+# bounds the cost of a search that finds no covering set: released_tokens
+# compares token prefixes pairwise (~25 ms at 8 running 100k-token decodes,
+# ~106 ms at 16), and the scheduler calls maybe_plan every decode step.
 PREEMPT_COOLDOWN_S = 1.0
 # Arbitrary bound on the waiter's head-of-queue slot (passes are tens of ms)
 # when the released memory still does not fit it.
@@ -267,6 +270,7 @@ class DecodePreemptor:
     ) -> Optional[DecodePreemptionPlan]:
         if now_s - self._last_plan_s < PREEMPT_COOLDOWN_S:
             return None
+        self._last_plan_s = now_s
         return plan_decode_preemption(
             now_s=now_s,
             waiting_queue=waiting_queue,

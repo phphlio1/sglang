@@ -78,6 +78,24 @@ class TestStampAdmissionPrefixMatches(CustomTestCase):
         self.assertIs(req.in_batch_dedup_follower_first_admission, True)
         self.assertEqual(req.matched_prefix_tokens_last_admission, 0)
 
+    def test_resume_of_a_preempted_decode_accumulates_its_reuse_split(self):
+        # A real Req, not a mock: the resume branch read a field v0.5.23's Req
+        # does not have and crashed the scheduler on the first resume.
+        req = _make_req("r")
+        req.prefix_len = 64
+        stamp_admission_prefix_matches([req])
+        self.assertEqual(req.preempt_resume_seq_tokens, 0)
+        for prefix_len, host_hit_length in ((90, 10), (30, 50)):
+            req.output_ids = list(range(20))
+            req.preempt_stall_start_s = 5.0
+            req.prefix_len = prefix_len
+            req.host_hit_length = host_hit_length
+            stamp_admission_prefix_matches([req])
+        self.assertEqual(req.preempt_resume_seq_tokens, 2 * 120)
+        self.assertEqual(req.preempt_resume_device_tokens, 90 + 30)
+        self.assertEqual(req.preempt_resume_host_tokens, 10 + 50)
+        self.assertEqual(req.device_matched_prefix_tokens_first_admission, 64)
+
     def test_retraction_reset_keeps_the_bookkeeping(self):
         # reset_for_retract clears the cache-match state but must keep the
         # first-admission stamp (it is the first-attempt hit rate) and the
