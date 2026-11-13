@@ -7,7 +7,6 @@ import unittest
 from array import array
 from pathlib import Path
 
-
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
 from sglang.srt.observability.schedule_eval_log import (
     ScheduleEvalLogger,
@@ -22,6 +21,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 def _make_req(rid):
     return Req(rid, "", array("q", list(range(100))), SamplingParams())
+
+
+def _admit(req, *, device, host_hit=0, host_loaded=0):
+    """The match fields as PrefillAdder leaves them for the admission stamp:
+    only a host hit runs the load-back, which rewrites host_loaded_length and
+    adds it to prefix_len."""
+    req.host_hit_length = host_hit
+    req.prefix_len = device
+    if host_hit:
+        req.host_loaded_length = host_loaded
+        req.prefix_len += host_loaded
 
 
 def _finish(req, *, retracted=False):
@@ -64,13 +74,11 @@ class TestStampAdmissionPrefixMatches(CustomTestCase):
         # followers only.
         req = _make_req("r")
         req.num_matched_prefix_tokens = 64
-        req.prefix_len = 40
-        req.host_hit_length = 24
+        _admit(req, device=40, host_hit=24, host_loaded=24)
         req.in_batch_dedup_pending = True
         stamp_admission_prefix_matches([req])
         req.num_matched_prefix_tokens = 0
-        req.prefix_len = 0
-        req.host_hit_length = 0
+        _admit(req, device=0)
         req.in_batch_dedup_pending = False
         stamp_admission_prefix_matches([req])
         self.assertEqual(req.device_matched_prefix_tokens_first_admission, 40)
@@ -78,18 +86,42 @@ class TestStampAdmissionPrefixMatches(CustomTestCase):
         self.assertIs(req.in_batch_dedup_follower_first_admission, True)
         self.assertEqual(req.matched_prefix_tokens_last_admission, 0)
 
+    def test_split_takes_the_loaded_host_tokens_back_out_of_prefix_len(self):
+        # PrefillAdder adds the loaded host tokens to prefix_len before the
+        # stamp, so prefix_len alone counted them as device hits too.
+        cases = {
+            "loaded": ((40, 24, 24), (40, 24)),
+            # A declined load-back is re-prefilled: no host reuse.
+            "declined": ((40, 24, 0), (40, 0)),
+            # host_loaded_length is only rewritten by a load-back, so a value
+            # left from an earlier admission must not count.
+            "stale load length": ((64, 0, 0), (64, 0)),
+        }
+        for name, ((device, host_hit, host_loaded), expected) in cases.items():
+            with self.subTest(name):
+                req = _make_req(name)
+                req.host_loaded_length = 24
+                _admit(req, device=device, host_hit=host_hit, host_loaded=host_loaded)
+                stamp_admission_prefix_matches([req])
+                self.assertEqual(
+                    (
+                        req.device_matched_prefix_tokens_first_admission,
+                        req.host_hit_prefix_tokens_first_admission,
+                    ),
+                    expected,
+                )
+
     def test_resume_of_a_preempted_decode_accumulates_its_reuse_split(self):
         # A real Req, not a mock: the resume branch read a field v0.5.23's Req
         # does not have and crashed the scheduler on the first resume.
         req = _make_req("r")
-        req.prefix_len = 64
+        _admit(req, device=64)
         stamp_admission_prefix_matches([req])
         self.assertEqual(req.preempt_resume_seq_tokens, 0)
-        for prefix_len, host_hit_length in ((90, 10), (30, 50)):
+        for device, host in ((90, 10), (30, 50)):
             req.output_ids = list(range(20))
             req.preempt_stall_start_s = 5.0
-            req.prefix_len = prefix_len
-            req.host_hit_length = host_hit_length
+            _admit(req, device=device, host_hit=host, host_loaded=host)
             stamp_admission_prefix_matches([req])
         self.assertEqual(req.preempt_resume_seq_tokens, 2 * 120)
         self.assertEqual(req.preempt_resume_device_tokens, 90 + 30)

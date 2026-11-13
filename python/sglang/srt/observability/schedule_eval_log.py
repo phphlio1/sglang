@@ -36,27 +36,30 @@ def stamp_admission_prefix_matches(reqs: Iterable[Req]) -> None:
     First admission is stamp-once (a first-attempt hit rate; the client-side
     cache-read metric conflates re-processed hits after retraction); the last
     admission is refreshed on every one. The device/host split and the
-    in-batch-dedup follower verdict freeze with the first admission too:
-    ``prefix_len``/``host_hit_length`` at this point come from
-    ``init_next_round_input``'s re-match (policy-independent), so the split
-    shows the real reuse even under policies that leave
+    in-batch-dedup follower verdict freeze with the first admission too. The
+    split comes from ``init_next_round_input``'s re-match (policy-independent),
+    so it shows the real reuse even under policies that leave
     ``num_matched_prefix_tokens`` at zero.
+
+    Called after ``PrefillAdder``: its load-back has already added the loaded
+    host tokens to ``prefix_len``, and a declined load-back is re-prefilled.
     """
     for req in reqs:
+        host = req.materialized_host_hit_len()
+        device = req.prefix_len - host
         if req.matched_prefix_tokens_first_admission is None:
             req.matched_prefix_tokens_first_admission = req.num_matched_prefix_tokens
-            req.device_matched_prefix_tokens_first_admission = req.prefix_len
-            req.host_hit_prefix_tokens_first_admission = req.host_hit_length
+            req.device_matched_prefix_tokens_first_admission = device
+            req.host_hit_prefix_tokens_first_admission = host
             req.in_batch_dedup_follower_first_admission = req.in_batch_dedup_pending
         req.matched_prefix_tokens_last_admission = req.num_matched_prefix_tokens
         if req.preempt_stall_start_s is not None:
-            # Resume of a time-sliced decode: device hit, host load-back, the rest
-            # is recomputed (before prepare_for_extend folds host into the prefix).
+            # Resume of a time-sliced decode: the rest of the sequence is recomputed.
             req.preempt_resume_seq_tokens += len(req.origin_input_ids) + len(
                 req.output_ids
             )
-            req.preempt_resume_device_tokens += req.prefix_len
-            req.preempt_resume_host_tokens += req.host_hit_length
+            req.preempt_resume_device_tokens += device
+            req.preempt_resume_host_tokens += host
 
 
 class ScheduleEvalLogger:
