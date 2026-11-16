@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import heapq
 import logging
 import math
 import time
@@ -610,6 +611,7 @@ class SchedulePolicy:
             else None
         )
         self._shortest_prefill_calls = 0
+        self._boost_split_calls = 0
         self._waiting_prefix_refresh_calls = 0
         # Boost chunk reservation: rid of the continuation whose reservation
         # admitted no waiting request; it runs full chunks until it finishes.
@@ -661,11 +663,20 @@ class SchedulePolicy:
             return
 
         if isinstance(policy, CacheAwarePolicy):
+            # Boost matches and sorts only the requests its bounded jump can
+            # bring to the head; the rest stays behind them in arrival order.
+            sort_queue, unreachable = waiting_queue, []
+            if policy in (CacheAwarePolicy.BOOST, CacheAwarePolicy.BOOST_CACHE):
+                sort_queue, unreachable = self._split_boost_reachable(
+                    waiting_queue, policy
+                )
             temporary_deprioritized, leader_of = self._compute_prefix_matches(
-                waiting_queue, policy
+                sort_queue, policy
             )
-            for r in waiting_queue:
+            for r in sort_queue:
                 r.in_batch_dedup_pending = r.rid in temporary_deprioritized
+            for r in unreachable:
+                r.in_batch_dedup_pending = False
             if policy == CacheAwarePolicy.LPM:
                 SchedulePolicy._sort_by_longest_prefix(
                     waiting_queue, temporary_deprioritized
@@ -681,7 +692,7 @@ class SchedulePolicy:
                 # the frozen baseline sorts below keep the global group-1
                 # tail (comparability with the campaign arms).
                 SchedulePolicy._sort_by_boost(
-                    waiting_queue,
+                    sort_queue,
                     temporary_deprioritized,
                     self.boost_gamma,
                     self.boost_bin_size,
@@ -705,6 +716,8 @@ class SchedulePolicy:
                         else 0
                     ),
                 )
+                if unreachable:
+                    waiting_queue[:] = sort_queue + unreachable
             elif policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                 SchedulePolicy._sort_by_shortest_prefill(
                     waiting_queue, temporary_deprioritized
@@ -937,6 +950,78 @@ class SchedulePolicy:
                     )
         return temporary_deprioritized, leader_of
 
+    def _split_boost_reachable(
+        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+    ) -> tuple[List[Req], List[Req]]:
+        """Split the queue into (reachable, unreachable) for the boost sort.
+
+        phi(r) lies in [A(r) - B, A(r)], B = the largest boost any request can
+        get (b_gamma at the smallest bin, plus the boost-cache bonus cap). With
+        A_M the M-th smallest arrival stamp (M = WAITING_QUEUE_PREFIX_MATCH_MAX),
+        every request with A > A_M + B has phi > A_M, so it ranks behind at
+        least the M oldest requests. Sorting only A <= A_M + B gives the exact
+        full-sort order for every entry with phi <= A_M (dedup followers rank
+        at their leader's phi), at a cost set by B times the arrival rate
+        instead of the queue length. Unreachable requests keep arrival order
+        and stale prefix matches; admission rematches every request it takes.
+        """
+        if (
+            len(waiting_queue) <= WAITING_QUEUE_PREFIX_MATCH_MAX
+            or self.enable_priority_scheduling
+        ):
+            return waiting_queue, []
+        lam = self.boost_cache_lambda if policy == CacheAwarePolicy.BOOST_CACHE else 0.0
+        cap = (
+            self.boost_cache_cap_tokens
+            if policy == CacheAwarePolicy.BOOST_CACHE
+            else 0
+        )
+        if self.boost_clock is BoostClock.WALL:
+            rate = (
+                self.prefill_token_rate.tokens_per_s
+                if self.prefill_token_rate is not None
+                else None
+            )
+            # Unmeasured rate: _sort_by_boost gives boost 0 (pure arrival).
+            max_boost = (
+                gamma_boost(self.boost_bin_size / rate, self.boost_gamma)
+                + lam * cap / rate
+                if rate is not None
+                else 0.0
+            )
+        else:
+            max_boost = gamma_boost(self.boost_bin_size, self.boost_gamma) + lam * cap
+        stamps = [
+            SchedulePolicy._boost_arrival_stamp(r, self.boost_clock)
+            for r in waiting_queue
+        ]
+        horizon = heapq.nsmallest(WAITING_QUEUE_PREFIX_MATCH_MAX, stamps)[-1] + max_boost
+        reachable, unreachable = [], []
+        for r, a in zip(waiting_queue, stamps):
+            (reachable if a <= horizon else unreachable).append(r)
+        unreachable.sort(
+            key=lambda r: (
+                SchedulePolicy._boost_arrival_stamp(r, self.boost_clock),
+                r.rid,
+            )
+        )
+        self._boost_split_calls += 1
+        if self._boost_split_calls % 256 == 1:
+            logger.info(
+                "boost reachable window: queue=%d sorted=%d max_boost=%.3g",
+                len(waiting_queue),
+                len(reachable),
+                max_boost,
+            )
+        return reachable, unreachable
+
+    @staticmethod
+    def _boost_arrival_stamp(r: Req, clock: BoostClock) -> float:
+        # None = never stamped (synthetic reqs); treat as oldest.
+        if clock is BoostClock.WALL:
+            return r.first_queue_entry_time if r.first_queue_entry_time is not None else 0.0
+        return r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
+
     def _pin_hold_expired(self, r: Req, now_s: float) -> bool:
         """Whether the follower pin's wall-second hold bound has released r
         (total queue wait since first entry; --in-batch-prefix-caching-max-pin-s)."""
@@ -1163,14 +1248,7 @@ class SchedulePolicy:
         req_by_rid = {r.rid: r for r in waiting_queue} if leader_of else {}
 
         def arrival_stamp(r: Req) -> float:
-            # None = never stamped (synthetic reqs); treat as oldest.
-            if clock is BoostClock.WALL:
-                return (
-                    r.first_queue_entry_time
-                    if r.first_queue_entry_time is not None
-                    else 0.0
-                )
-            return r.boost_arrival_tokens if r.boost_arrival_tokens is not None else 0
+            return SchedulePolicy._boost_arrival_stamp(r, clock)
 
         def cache_bonus(r: Req) -> float:
             if cache_lambda <= 0.0 or cache_cap_tokens <= 0:

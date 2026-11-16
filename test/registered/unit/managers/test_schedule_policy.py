@@ -1,4 +1,5 @@
 import math
+import random
 import re
 import time
 import unittest
@@ -991,6 +992,100 @@ class TestBoostWallSort(CustomTestCase):
         # Measured 30k tok/s, gamma_s=0.01: hot's boost is ~937 s against a
         # 100 s arrival lag, so hot now leads.
         self.assertEqual([r.rid for r in queue], ["hot", "cold"])
+
+
+class TestBoostReachableWindow(CustomTestCase):
+    """A long boost queue is matched and sorted only where the bounded jump
+    reaches; the head it hands admission must equal the full sort's head."""
+
+    RATE = 20_000.0  # tok/s
+
+    def _policy(self, name, clock, cache):
+        policy = SchedulePolicy(
+            policy=name,
+            tree_cache=cache,
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+            boost_gamma=0.02 if clock == "wall" else 2e-6,
+            boost_bin_size=256,
+            boost_clock=clock,
+            boost_cache_lambda=0.5,
+            boost_cache_cap_tokens=8192,
+        )
+        if policy.prefill_token_rate is not None:
+            policy.prefill_token_rate.observe(0, 0.0)
+            policy.prefill_token_rate.observe(int(self.RATE), 1.0)
+        return policy
+
+    def _queue(self, seed, clock):
+        # Distinct token ranges (no in-batch dedup); every third request
+        # extends one of 8 cached 4096-token prefixes so boost-cache bonuses
+        # and matched work vary. Arrivals spread over ~3000 s / 3e7 tokens.
+        rng = random.Random(seed)
+        cached = [list(range(10**8 + p * 4096, 10**8 + (p + 1) * 4096)) for p in range(8)]
+        reqs, base = [], 0
+        for i in range(600):
+            n = rng.choice([200, 3000, 30_000, 150_000])
+            ids = list(range(base, base + n))
+            base += n
+            if i % 3 == 0:
+                ids = cached[i % 8] + ids
+            r = _make_req(f"r{i}", "", ids)
+            if clock == "wall":
+                r.first_queue_entry_time = rng.uniform(0.0, 3000.0)
+            else:
+                r.boost_arrival_tokens = rng.randrange(0, 30_000_000)
+            reqs.append(r)
+        return reqs, cached
+
+    def _check(self, name, clock):
+        for seed in range(3):
+            heads = []
+            for windowed in (True, False):
+                cache = RadixCache.create_simulated()
+                queue, cached = self._queue(seed, clock)
+                for ids in cached:
+                    cache.insert(InsertParams(key=RadixKey(token_ids=array("q", ids))))
+                policy = self._policy(name, clock, cache)
+                if windowed:
+                    reachable, _ = policy._split_boost_reachable(
+                        list(queue), CacheAwarePolicy(name)
+                    )
+                    reachable = {r.rid for r in reachable}
+                    self.assertLess(len(reachable), len(queue))
+                    policy.calc_priority(queue, processed_tokens=int(self.RATE))
+                else:
+                    with patch.object(
+                        policy,
+                        "_split_boost_reachable",
+                        side_effect=lambda q, p: (q, []),
+                    ):
+                        policy.calc_priority(queue, processed_tokens=int(self.RATE))
+                heads.append([r.rid for r in queue])
+            # Bound: the full sort ranks every one of the 128 oldest arrivals
+            # ahead of every excluded request (phi(excluded) > A_128 >= phi of
+            # the oldest), and the window reproduces the full order up to the
+            # first excluded one.
+            ref = self._queue(seed, clock)[0]
+            ref.sort(key=lambda r: SchedulePolicy._boost_arrival_stamp(r, BoostClock(clock)))
+            oldest = {r.rid for r in ref[:128]}
+            pos = {rid: i for i, rid in enumerate(heads[1])}
+            self.assertLess(
+                max(pos[rid] for rid in oldest),
+                min(pos[rid] for rid in pos if rid not in reachable),
+            )
+            k = next(i for i, rid in enumerate(heads[1]) if rid not in reachable)
+            self.assertEqual(heads[0][:k], heads[1][:k])
+
+    def test_wall_boost_head_matches_full_sort(self):
+        self._check("boost", "wall")
+
+    def test_wall_boost_cache_head_matches_full_sort(self):
+        self._check("boost-cache", "wall")
+
+    def test_tokens_boost_cache_head_matches_full_sort(self):
+        self._check("boost-cache", "tokens")
 
 
 class TestFcfsMatch(CustomTestCase):
